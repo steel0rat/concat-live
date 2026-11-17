@@ -118,9 +118,9 @@ SHA-256 и содержимого архива приложение перекл
 для первой версии форка:
 
 ```sh
-git tag v0.3.0
+git tag v0.3.1
 git push origin master
-git push origin v0.3.0
+git push origin v0.3.1
 ```
 
 Workflow Release проверяет код, собирает оба macOS-пакета и создаёт черновик
