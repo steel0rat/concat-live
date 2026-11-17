@@ -362,7 +362,8 @@ jobs:
       # second.
       - name: Check
         if: runner.os != 'Windows'
-        timeout-minutes: 30
+        # The generated window exceeded 30 minutes on the hosted macOS runner.
+        timeout-minutes: 45
         working-directory: src
         run: |
           set -o pipefail
