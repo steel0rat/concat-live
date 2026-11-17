@@ -111,9 +111,9 @@ env:
   ORT_INTEL_MAC_VERSION: 1.23.2
   # WiX for the Windows .msi, as a dotnet tool, pinned by version.
   WIX_VERSION: 6.0.2
-  # Oldest macOS the bundles run on. Apple silicon Macs all run newer than
-  # this; it is the Intel floor. scripts/ci/check-min-os.sh lists every
-  # bundled library built for a newer one.
+  # Engine compilation floor. The packaged app requires macOS 26 because
+  # the codec bottles on these runners require it; Info.plist and the
+  # enforced bundle check below use that actual package minimum.
   MACOSX_DEPLOYMENT_TARGET: "12.0"
   # ggml (whisper.cpp's kernels) tunes itself to the machine it is built
   # on unless told otherwise, and these bundles run on other machines: a
@@ -525,7 +525,7 @@ jobs:
             <key>CFBundleExecutable</key><string>concat</string>
             <key>CFBundleIconFile</key><string>Concat</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>LSMinimumSystemVersion</key><string>${MACOSX_DEPLOYMENT_TARGET}</string>
+            <key>LSMinimumSystemVersion</key><string>26.0</string>
             <key>NSHighResolutionCapable</key><true/>
             <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
             <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
@@ -564,13 +564,9 @@ jobs:
             lazy=(--lazy Contents/Frameworks/libonnxruntime.dylib)
           fi
 
-          # Every library in the bundle against the floor it declares. A
-          # warning for now: FFmpeg is built here for the floor, but the
-          # codec libraries it links are Homebrew's, built for the runner's
-          # macOS. ONNX Runtime is listed apart, with the macOS it
-          # needs: the app reads that same field before loading it, and on
-          # an older one the AI features say so instead.
-          scripts/ci/check-min-os.sh "$app" "$MACOSX_DEPLOYMENT_TARGET" ${lazy[@]+"${lazy[@]}"}
+          # Enforce the package's declared minimum against every eagerly
+          # loaded library. The optional Intel ONNX runtime stays lazy.
+          scripts/ci/check-min-os.sh "$app" 26.0 --enforce ${lazy[@]+"${lazy[@]}"}
 
       # Signed with the repository's Developer ID when it has one, and
       # notarised so Gatekeeper opens it without a warning; ad-hoc signed

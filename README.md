@@ -11,6 +11,12 @@ live-режим. `--mcp window` подключается к нему; `--mcp hea
 Codex и явный `--live` там не поддерживаются. Новые функции проверяются
 на macOS Apple Silicon; Windows и Linux требуют отдельной проверки.
 
+Пакеты форка для Apple Silicon и Intel публикуются в
+[GitHub Releases](https://github.com/steel0rat/concat-live/releases).
+Пакеты CI требуют macOS 26 или новее: эта версия нужна библиотекам кодеков,
+которые входят в сборку. Пакеты без Developer ID подписываются ad-hoc
+и не проходят нотаризацию Apple.
+
 Для сборки нужны закреплённый Rust 1.93.1, CMake, компилятор C++ и библиотеки
 разработки FFmpeg 7+ (общие инструкции ниже). Для сборки на macOS также нужны
 Swift 6.2+ и SDK macOS 26+ из Xcode или Command Line Tools. Из корня репозитория:
@@ -118,9 +124,9 @@ SHA-256 и содержимого архива приложение перекл
 для первой версии форка:
 
 ```sh
-git tag v0.3.3
+git tag v0.3.4
 git push origin master
-git push origin v0.3.3
+git push origin v0.3.4
 ```
 
 Workflow Release проверяет код, собирает оба macOS-пакета и создаёт черновик
@@ -224,7 +230,7 @@ The editor's media processing runs on your machine. The models for captions, voi
 
 ## Download
 
-The links in this section download the upstream editor; they do not include this fork's live mode or Codex panel. Build Concat Live from this repository using the instructions above. Upstream downloads:
+The links in this section download the upstream editor; they do not include this fork's live mode or Codex panel. Concat Live packages are published in [this fork's Releases](https://github.com/steel0rat/concat-live/releases), or you can build from this repository using the instructions above. Upstream downloads:
 
 1. **[The website](https://concat.standalones.org/#download)** hands you the right build for your machine. Start here.
 2. **[GitHub Releases](https://github.com/jub0t/Concat/releases)** has every build for every platform, with installers, packages and checksums. For when you want to pick.
@@ -263,7 +269,7 @@ cargo run -p concat          # the editor window
 Other useful commands:
 
 ```sh
-cargo build --profile app -p concat   # the shipping binary (fat LTO, stripped)
+cargo build --profile app -p concat   # shipping: UI opt0, engine opt3, stripped
 cargo test                            # run the test suite
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # what CI checks
 ```

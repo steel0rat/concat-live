@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.93"
 license = "AGPL-3.0-or-later"
@@ -84,21 +84,18 @@ incremental = true
 # the profile's level 3: decoding and compositing are theirs, and they
 # only rebuild when they change. What this crate does itself - publish the
 # lanes, run the panes, format a waveform - is light enough that nothing
-# on screen tells the difference; if something ever does, the shipping
-# build is `--profile app`.
+# on screen tells the difference. The shipping profile uses the same
+# settings for this crate below.
 [profile.quick.package.concat]
 opt-level = 0
 codegen-units = 256
 
 # The shipping build of the editor window: `cargo build --profile app -p concat`.
 #
-# Every knob here is set for the fastest possible binary, and each one costs
-# build time. It is a separate profile rather than settings on `release`
-# because two of them are wrong for the rest of the workspace: `panic =
-# "abort"` breaks `cargo test --release`, and stripping symbols is only
-# harmless for a binary nobody profiles. Measured on the R&D tree it came
-# from, on an M5: clean build 3m18s, binary 22MB, of which about 1.7MB is
-# the fonts and effect previews the build script embeds.
+# The engine and dependencies keep release optimisation. The generated UI
+# uses its own override below, shared with the quick profile.
+# A separate profile keeps panic=abort and stripped symbols out of tests
+# and profiling builds.
 #
 # What is deliberately not done, so nobody goes looking for it twice:
 #
@@ -128,6 +125,12 @@ panic = "abort"
 # Symbols are worth nothing in a release binary that is not being profiled.
 # Build with `--profile release` instead before running Instruments or perf.
 strip = "symbols"
+
+# LLVM optimisation of the generated Slint UI exceeded both hosted Mac
+# build budgets. The engine crates retain release opt-level 3.
+[profile.app.package.concat]
+opt-level = 0
+codegen-units = 256
 
 # Decoding and compositing are unusably slow in an unoptimised build, even when
 # the rest of the engine is being debugged.
