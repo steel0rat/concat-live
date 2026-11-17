@@ -904,6 +904,7 @@ mod tests {
         validate_skill_document(&path).expect("our document");
     }
 
+    #[cfg(target_os = "macos")]
     fn prepared(dirs: &AppDirs, version: Version) -> InstalledSkill {
         let sha = "a".repeat(64);
         let tree = release_path(dirs, version, &sha);
