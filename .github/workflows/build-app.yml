@@ -45,6 +45,18 @@ name: Build app
 # A caller may restrict the matrix to the two macOS packages. Other callers
 # retain the desktop targets, with fail-fast disabled.
 on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Existing tag or commit to build
+        type: string
+        required: true
+      macos_arch:
+        description: macOS package to build without rebuilding the other architecture
+        type: choice
+        required: true
+        default: arm64
+        options: [arm64, x86_64]
   workflow_call:
     inputs:
       ref:
@@ -118,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.macos_only && '[{"platform":"macos","arch":"arm64","os":"macos-26","target":"aarch64-apple-darwin"},{"platform":"macos","arch":"x86_64","os":"macos-26-intel","target":"x86_64-apple-darwin"}]' || '[{"platform":"macos","arch":"arm64","os":"macos-26","target":"aarch64-apple-darwin"},{"platform":"macos","arch":"x86_64","os":"macos-26-intel","target":"x86_64-apple-darwin"},{"platform":"linux","arch":"x86_64","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","ffmpeg":"linux64","ort":"x64","nfpm":"amd64","appimage":"x86_64","ggml":"variants"},{"platform":"linux","arch":"aarch64","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","ffmpeg":"linuxarm64","ort":"aarch64","nfpm":"arm64","appimage":"aarch64"},{"platform":"windows","arch":"x86_64","os":"windows-2022","target":"x86_64-pc-windows-msvc","ffmpeg":"win64","ort":"win-x64","llvm":"win64","vc":"x64","inno":"x64compatible","wix":"x64","ggml":"variants"}]') }}
+        include: ${{ fromJSON(inputs.macos_arch == 'arm64' && '[{"platform":"macos","arch":"arm64","os":"macos-26","target":"aarch64-apple-darwin"}]' || inputs.macos_arch == 'x86_64' && '[{"platform":"macos","arch":"x86_64","os":"macos-26-intel","target":"x86_64-apple-darwin"}]' || inputs.macos_only && '[{"platform":"macos","arch":"arm64","os":"macos-26","target":"aarch64-apple-darwin"},{"platform":"macos","arch":"x86_64","os":"macos-26-intel","target":"x86_64-apple-darwin"}]' || '[{"platform":"macos","arch":"arm64","os":"macos-26","target":"aarch64-apple-darwin"},{"platform":"macos","arch":"x86_64","os":"macos-26-intel","target":"x86_64-apple-darwin"},{"platform":"linux","arch":"x86_64","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","ffmpeg":"linux64","ort":"x64","nfpm":"amd64","appimage":"x86_64","ggml":"variants"},{"platform":"linux","arch":"aarch64","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","ffmpeg":"linuxarm64","ort":"aarch64","nfpm":"arm64","appimage":"aarch64"},{"platform":"windows","arch":"x86_64","os":"windows-2022","target":"x86_64-pc-windows-msvc","ffmpeg":"win64","ort":"win-x64","llvm":"win64","vc":"x64","inno":"x64compatible","wix":"x64","ggml":"variants"}]') }}
     runs-on: ${{ matrix.os }}
     # The slowest target is Intel macOS, whose build alone ran past an hour
     # in v0.2.7-rc.1. The steps that can hang have timeouts of their own,
@@ -316,17 +328,12 @@ jobs:
           test -f "$stem/lib/libonnxruntime.$ORT_INTEL_MAC_VERSION.dylib"
           echo "ORT_MAC_DYLIB=$PWD/$stem/lib/libonnxruntime.$ORT_INTEL_MAC_VERSION.dylib" >> "$GITHUB_ENV"
 
-      # Thin LTO and sixteen codegen units for the Intel Mac, in place of the
-      # app profile's fat LTO and one unit. The Intel runner is the slowest
-      # target and the one every release waits on: in v0.2.7-rc.4 its
-      # build was 70 minutes, 57 of them after the last dependency compiled -
-      # fat LTO re-optimising the whole program on one thread, which no cache
-      # can skip. Thin LTO does that work in parallel, for a binary a few
-      # per cent slower on the platform with the fewest users. Every other
-      # target keeps the profile as Cargo.toml writes it. Set before the
-      # cache step, so these are part of its key (CARGO is in env-vars).
-      - name: Thin LTO (Intel macOS)
-        if: matrix.platform == 'macos' && matrix.arch == 'x86_64'
+      # Both hosted macOS builds use thin LTO and sixteen codegen units.
+      # ARM also exhausted sixty minutes after its dependencies compiled;
+      # Intel already used this configuration for the same expensive pass.
+      # Set before the cache so the profile overrides are part of its key.
+      - name: Thin LTO (macOS)
+        if: matrix.platform == 'macos'
         run: |
           {
             echo "CARGO_PROFILE_APP_LTO=thin"
@@ -444,17 +451,17 @@ jobs:
           workspaces: src
           key: ${{ matrix.target }}
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST GGML ORT
+          cache-on-failure: true
 
-      # The shipping profile: fat LTO, panic=abort, stripped. See the
-      # workspace Cargo.toml for what each knob costs.
+      # The shipping profile: panic=abort and stripped, with the macOS
+      # LTO overrides above. See Cargo.toml for what each knob costs.
       #
       # Bash on every platform, teed to a log: raw job logs need a login to
       # read, but the step summary is public - so on failure the tail of the
       # build goes there, and a red run explains itself to anyone.
       - name: Build
-        # An Intel Mac runner is the slow one: its release build ran past
-        # sixty minutes in v0.2.7-rc.1.
-        timeout-minutes: ${{ matrix.platform == 'macos' && matrix.arch == 'x86_64' && 100 || 60 }}
+        # Both hosted Mac architectures have exceeded sixty minutes.
+        timeout-minutes: ${{ matrix.platform == 'macos' && 100 || 60 }}
         shell: bash
         working-directory: src
         run: |
