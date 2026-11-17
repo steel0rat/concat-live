@@ -353,29 +353,71 @@ impl Studio {
     }
 
     pub fn apply(&mut self, command: Command) -> Option<String> {
-        // An edit ends whatever burst the view was in.
+        match self.try_apply(command) {
+            Ok(view) => view.created_id,
+            Err(error) => {
+                if self.session.is_some() {
+                    self.notify(&error, true);
+                }
+                None
+            }
+        }
+    }
+
+    /// The common GUI edit path, retaining a refusal for an API caller.
+    pub(crate) fn try_apply(
+        &mut self,
+        command: Command,
+    ) -> Result<concat_host::session::EditorView, String> {
         self.end_burst();
         log::info!("edit: {}", command_name(&command));
         self.flush_commit();
         self.echo = None;
-        // Anything but an inspector commit ends the coalescing window; the
-        // commit path sets `last_commit` again right after calling here.
         self.last_commit = None;
-        let session = self.session.as_mut()?;
+        let session = self.session.as_mut().ok_or("no project is open")?;
         let chosen = matches!(command, Command::SetTimelineVideo { .. });
         let before = session.video().color_space;
-        match session.apply(command) {
-            Ok(view) => {
-                let after = session.video().color_space;
-                self.after_change();
-                if !chosen {
-                    self.tell_of_hdr(before, after);
-                }
-                view.created_id
-            }
+        let view = session.apply(command)?;
+        let after = session.video().color_space;
+        self.after_change();
+        if !chosen {
+            self.tell_of_hdr(before, after);
+        }
+        Ok(view)
+    }
+
+    /// Whether switching the live window would replace unsaved work.
+    pub(crate) fn live_is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Capture an ordered save on the UI thread; its disk write is the caller's.
+    pub(crate) fn live_prepare_save(
+        &mut self,
+        name: Option<&str>,
+    ) -> Result<crate::live::SaveSnapshot, String> {
+        self.flush_commit();
+        self.autosave.stop();
+        let session = self.session.as_mut().ok_or("no project is open")?;
+        let (path, document) = session.prepare_save(name);
+        self.project_name = session.settings().name;
+        Ok(crate::live::SaveSnapshot {
+            path,
+            document,
+            ticket: projects::ticket(),
+            revision: self.revision,
+            epoch: crate::host::project_epoch(),
+        })
+    }
+
+    /// A completed save cannot clear edits made after its captured snapshot.
+    pub(crate) fn live_saved(&mut self, revision: u64, result: Result<(), String>) {
+        match result {
+            Ok(()) if revision == self.revision => self.dirty = false,
+            Ok(()) => {}
             Err(error) => {
-                self.notify(&error, true);
-                None
+                self.dirty = true;
+                self.notify(&tf("studio.couldNotSave", &[&error]), true);
             }
         }
     }

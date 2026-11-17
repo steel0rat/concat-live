@@ -1007,6 +1007,8 @@ const ENHANCE_MARGIN: f64 = 1.0;
 pub struct Studio {
     pub host: Host,
     pub prefs: Preferences,
+    /// This window permits Automation calls against its own editing session.
+    pub(crate) live_enabled: bool,
     /// What each effect library is showing, indexed the way `SHELF_KINDS`
     /// is: 0 filters, 1 effects, 2 audio.
     pub library: [LibraryView; 4],
@@ -2680,18 +2682,39 @@ impl Studio {
     /// A window with nothing open: the launch screen, with the recents list
     /// read off disk.
     pub fn new(host: Host) -> Self {
+        Self::new_with_live(host, false)
+    }
+
+    /// Configures live Automation before the settings restore starts its server.
+    pub(crate) fn new_with_live(host: Host, live_enabled: bool) -> Self {
         let prefs = Preferences::load(&host.dirs);
         // The panels where the last session left them, while Settings says
         // to; a saved dock this build cannot read is the default instead.
         let saved = prefs.layout.as_ref().filter(|_| prefs.remembers_layout());
-        let dock = saved
+        let mut dock = saved
             .and_then(|layout| layout.wide.as_ref())
             .and_then(Dock::from_saved)
+            .filter(|dock| live_enabled || !dock.contains(PaneKind::Agent))
             .unwrap_or_else(default_dock);
-        let dock_aside = saved
+        let mut dock_aside = saved
             .and_then(|layout| layout.compact.as_ref())
             .and_then(Dock::from_saved)
+            .filter(|dock| live_enabled || !dock.contains(PaneKind::Agent))
             .unwrap_or_else(crate::dock::compact_dock);
+        if live_enabled {
+            for (node, columns, ratio) in [(&mut dock, true, 0.72), (&mut dock_aside, false, 0.65)]
+            {
+                if !node.contains(PaneKind::Agent) {
+                    let first = std::mem::replace(node, Dock::Leaf(PaneKind::Agent));
+                    *node = Dock::Split {
+                        columns,
+                        ratio,
+                        first: Box::new(first),
+                        second: Dock::leaf(PaneKind::Agent),
+                    };
+                }
+            }
+        }
         let mut start = crate::panes::start::StartPane::default();
         if let Some(location) = prefs.project_location() {
             start.location = location.to_owned();
@@ -2715,6 +2738,7 @@ impl Studio {
         let text_presets = presets::all(&host.dirs);
         let mut studio = Self {
             prefs,
+            live_enabled,
             library: Default::default(),
             session: None,
             echo: None,
@@ -2744,7 +2768,11 @@ impl Studio {
             clipboard: Vec::new(),
             monitor: crate::panes::monitor::MonitorPane::default(),
             export: Default::default(),
-            settings: crate::panes::settings::SettingsPane::default(),
+            settings: if live_enabled {
+                crate::panes::settings::SettingsPane::for_live()
+            } else {
+                crate::panes::settings::SettingsPane::default()
+            },
             relink: crate::panes::relink::RelinkPane::default(),
             confirm: None,
             transition_selected: None,

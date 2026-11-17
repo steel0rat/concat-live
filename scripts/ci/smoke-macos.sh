@@ -64,9 +64,9 @@ fi
 echo "every load path is the system's or the bundle's"
 
 say "concat --version"
-HOME=$(mktemp -d) expect_ok "concat --version" 60 "$bin" --version
+expect_ok "concat --version" 60 "$bin" --version
 
 say "concat --smoke"
-HOME=$(mktemp -d) expect_ok "concat --smoke" 180 "$bin" --smoke
+expect_ok "concat --smoke" 180 "$bin" --smoke
 
 say "ok"

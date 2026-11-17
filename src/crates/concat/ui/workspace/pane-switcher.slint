@@ -39,9 +39,12 @@ export enum PaneKind {
     timeline,
     /// the selected clip's keys: a dopesheet and a curve editor
     keyframes,
+    /// Codex working on the live window's project
+    agent,
 }
 
 export global Panes {
+    in-out property <bool> agent-enabled;
     /// The window's height, published by the App (app.slint, `changed
     /// height`) because nothing below the Window can read it: a menu hung
     /// under a button measures the room beneath it against this. Zero
@@ -60,6 +63,7 @@ export global Panes {
             : kind == PaneKind.preview ? I18n.t("common.preview")
             : kind == PaneKind.inspector ? I18n.t("paneSwitcher.inspector")
             : kind == PaneKind.keyframes ? I18n.t("common.keyframes")
+            : kind == PaneKind.agent ? "Codex"
             : I18n.t("paneSwitcher.timeline");
     }
 
@@ -71,6 +75,7 @@ export global Panes {
             : kind == PaneKind.preview ? "preview"
             : kind == PaneKind.inspector ? "inspector"
             : kind == PaneKind.keyframes ? "keyframes"
+            : kind == PaneKind.agent ? "agent"
             : "timeline";
     }
 
@@ -83,6 +88,7 @@ export global Panes {
             : kind == PaneKind.preview ? Glyph.image
             : kind == PaneKind.inspector ? Glyph.settings
             : kind == PaneKind.keyframes ? Glyph.keyframe
+            : kind == PaneKind.agent ? Glyph.sparkle
             : Glyph.rows;
     }
 }
@@ -247,14 +253,14 @@ export component PaneSwitcher inherits Rectangle {
         "pane:\{root.seat}:\{Panes.label(root.kind)}:\{Panes.id(root.kind)}";
 
     property <length> menu-w: 168px;
-    /// Five view rows, then the rule and the row that removes the panel, then
+    /// View rows, then the rule and the row that removes the panel, then
     /// the surface's own padding. Summed here because a PopupWindow is sized
     /// by whoever places it — the same rule the context menu follows, and the
     /// same reason: a layout cannot report its height back up before it has
     /// somewhere to be laid out. When the Keyframes row arrived this still
     /// said four, and the row that removes the panel was the one under the
     /// clip.
-    property <length> list-h: 5 * 26px + 9px + 26px + 8px;
+    property <length> list-h: (Panes.agent-enabled ? 6 : 5) * 26px + 9px + 26px + 8px;
     /// The whole list when the window has room for it under the button, and
     /// the room otherwise, with the rest reached by scrolling. Never under
     /// three rows: shorter than that is not a list worth scrolling, and
@@ -370,7 +376,7 @@ export component PaneSwitcher inherits Rectangle {
                     padding: 4px;
                     alignment: start;
 
-                    // Written out rather than looped: five is the whole list,
+                    // Written out rather than looped: this is the whole list,
                     // and a `for` over it would need the array to exist
                     // somewhere the rows could reach, which is more machinery
                     // than the rows.
@@ -399,6 +405,11 @@ export component PaneSwitcher inherits Rectangle {
                         current: root.kind == PaneKind.timeline;
                         chosen => { menu.close(); root.picked(PaneKind.timeline); }
                     }
+                    if Panes.agent-enabled: SwitchRow {
+                        kind: PaneKind.agent;
+                        current: root.kind == PaneKind.agent;
+                        chosen => { menu.close(); root.picked(PaneKind.agent); }
+                    }
 
                     SwitchDivider { }
 
@@ -423,9 +434,9 @@ export component AddPaneButton inherits Rectangle {
     callback added(kind: PaneKind);
 
     property <length> menu-w: 168px;
-    /// Five view rows and the surface's padding; held to the room under the
+    /// View rows and the surface's padding; held to the room under the
     /// button the way the seat's own menu is.
-    property <length> list-h: 5 * 26px + 8px;
+    property <length> list-h: (Panes.agent-enabled ? 6 : 5) * 26px + 8px;
     property <length> menu-h: Math.min(root.list-h, Math.max(3 * 26px + 8px,
         Panes.room-below(root.absolute-position.y + root.height + 4px)));
 
@@ -500,6 +511,10 @@ export component AddPaneButton inherits Rectangle {
                     SwitchRow {
                         kind: PaneKind.timeline;
                         chosen => { menu.close(); root.added(PaneKind.timeline); }
+                    }
+                    if Panes.agent-enabled: SwitchRow {
+                        kind: PaneKind.agent;
+                        chosen => { menu.close(); root.added(PaneKind.agent); }
                     }
                 }
             }

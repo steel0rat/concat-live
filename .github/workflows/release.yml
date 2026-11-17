@@ -1,28 +1,8 @@
 name: Release
 
-# Pushing a tag that starts with v (v0.3.0, v0.3.0-alpha.1, ...) builds the
-# app for every platform and architecture, desktops and phones, and
-# publishes a GitHub release under that tag with one bundle per target and
-# a checksum file. A tag
-# containing a hyphen is a pre-release. The tag must be the workspace's
-# version, alone or with a pre-release suffix: a release whose files say
-# one number and whose tag says another is a release nobody can reason
-# about.
-#
-# The bundles are self-contained: the macOS .dmg carries its FFmpeg dylibs
-# and is notarised when the signing secrets are set; the Linux packages
-# (.deb, .rpm, .AppImage, Arch) and the Windows installers carry the
-# FFmpeg runtime libraries beside the binary; the Android .apk is signed
-# with the repository's key, and the iOS .ipa is signed by the tester on
-# the way onto the phone. Nothing is built until CI has passed on the tag,
-# and nothing is published until every bundle has been launched where it
-# was built: build-app.yml starts each one (`--version`, `--smoke`, and on
-# x86_64 under an emulated Ivy Bridge) before it uploads it, and a bundle
-# that does not start fails its job, which `publish` needs.
-#
-# The release is created as a draft. A person looks it over - the notes,
-# the files - and publishes it from the Releases page; nothing reaches
-# the updater or the downloads page before then.
+# Stable Concat Live releases publish macOS packages from our fork.
+# The original desktop CI remains the gate. A release is a draft until a
+# person reviews and publishes it, when automatic updates can discover it.
 on:
   push:
     tags: ["v*"]
@@ -92,29 +72,18 @@ jobs:
     with:
       ref: ${{ needs.check.outputs.tag }}
 
-  # Both builds are told the tag too. Left to themselves they build the
-  # ref the run started on, and a run started by hand starts on main:
-  # 0.2.6 shipped that way, 35 commits past the tag it was named for.
+  # Build the tag that passed CI, including a manually requested tag.
   build:
     needs: [check, engine]
     uses: ./.github/workflows/build-app.yml
     with:
       ref: ${{ needs.check.outputs.tag }}
-    secrets: inherit
-
-  # `sign` is the one thing that puts the repository's Android key into a
-  # run; a pull request's build of mobile.yml never gets it.
-  phones:
-    needs: [check, engine]
-    uses: ./.github/workflows/mobile.yml
-    with:
-      ref: ${{ needs.check.outputs.tag }}
-      sign: true
+      macos_only: true
     secrets: inherit
 
   publish:
     name: Publish release
-    needs: [check, build, phones]
+    needs: [check, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -167,12 +136,6 @@ jobs:
         id: notes
         env:
           TAG: ${{ needs.check.outputs.tag }}
-          # Whether a certificate signed the Windows bundles: build-app.yml
-          # leaves them unsigned, and says so, when the secret is unset.
-          WINDOWS_SIGNED: ${{ secrets.WINDOWS_CERTIFICATE_PFX != '' }}
-          # No launch check reaches the APK's own code until the emulator
-          # runs a build of it it can execute (see smoke-android.sh).
-          ANDROID_STARTED: "false"
         run: |
           set -euo pipefail
           cd source
@@ -189,7 +152,7 @@ jobs:
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.check.outputs.tag }}
-          name: Concat ${{ needs.check.outputs.tag }}
+          name: Concat Live ${{ needs.check.outputs.tag }}
           draft: true
           prerelease: ${{ contains(needs.check.outputs.tag, '-') }}
           body_path: ${{ runner.temp }}/notes.md

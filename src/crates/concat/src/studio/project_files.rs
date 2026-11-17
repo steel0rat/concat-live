@@ -5,6 +5,31 @@
 use super::*;
 
 impl Studio {
+    /// Work whose unfinished result would be cancelled by a project close.
+    pub(crate) fn busy_for_update(&self) -> bool {
+        self.playing
+            || !matches!(self.gesture, Gesture::None)
+            || self.captions.running
+            || self.speech.running
+            || self.voiceover.recording()
+            || !self.cutout_jobs.is_empty()
+            || !self.stabilize_jobs.is_empty()
+            || !self.enhance_jobs.is_empty()
+            || self.enhance_previewing.is_some()
+            || !self.reverse_jobs.is_empty()
+            || self.merge_job.is_some()
+            || self.region_job.is_some()
+            || !self.voice_jobs.is_empty()
+            || self.host.exporter.is_busy()
+            || self.host.transcriber.is_busy()
+            || self.host.speech.is_busy()
+            || self.host.cutouts.is_busy()
+            || self.host.stabilizers.is_busy()
+            || self.host.enhancers.is_busy()
+            || self.host.reversers.is_busy()
+            || self.host.brushes.is_busy()
+    }
+
     // ── projects ──
 
     /// Opens a project as the session and leaves the launch screen, or
@@ -257,6 +282,17 @@ impl Studio {
         self.save_and_release().inspect_err(|error| {
             self.notify(&tf("studio.couldNotSave", &[error]), true);
         })
+    }
+
+    /// A remote close must acknowledge an ordered save, even during autosave.
+    pub(crate) fn close_live_project(&mut self, save: bool) -> Result<(), String> {
+        if !save {
+            return Err(
+                "live project close requires save: true; the visible session cannot be discarded"
+                    .to_owned(),
+            );
+        }
+        self.close_project()
     }
 
     /// [`Studio::close_project`] without the notice: the project saved, then

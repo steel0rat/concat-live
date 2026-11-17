@@ -6,13 +6,15 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: concat [--project <PROJECT_DIRECTORY> | --software | --mcp [auto|window|headless] | --schema | --version | --smoke | --whisper-cpu]";
+const USAGE: &str = "usage: concat [--project <PROJECT_DIRECTORY> | --live [--project <PROJECT_DIRECTORY>] | --software | --mcp [auto|window|headless] | --schema | --version | --smoke | --whisper-cpu]";
 
 /// What one run of the binary was asked to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Launch {
     /// The window, on the launch screen or on the project it names.
     Normal(Option<PathBuf>),
+    /// The window and its local Automation server, editing one shared session.
+    Live(Option<PathBuf>),
     /// The window on the launch screen, drawn in software from now on: what
     /// the Start menu's "Concat (safe graphics)" runs, for a driver that
     /// draws the window as coloured squares, where Settings' GPU switch
@@ -72,10 +74,22 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
                     .ok_or_else(|| format!("--mcp takes auto, window or headless\n{USAGE}"))?,
             )),
         }
+    } else if option == "--live" {
+        match args.next() {
+            None => Launch::Live(None),
+            Some(option) if option == "--project" => {
+                let path = args
+                    .next()
+                    .filter(|path| !path.is_empty() && !path.to_string_lossy().starts_with("--"))
+                    .ok_or_else(|| "--live --project requires a project directory".to_owned())?;
+                Launch::Live(Some(PathBuf::from(path)))
+            }
+            Some(_) => return Err(USAGE.into()),
+        }
     } else if option == "--project" {
         let path = args
             .next()
-            .filter(|path| !path.is_empty() && path != "--project")
+            .filter(|path| !path.is_empty() && path != "--project" && path != "--live")
             .ok_or_else(|| "--project requires a project directory".to_string())?;
         Launch::Normal(Some(PathBuf::from(path)))
     } else {
@@ -106,6 +120,39 @@ mod tests {
             parse_strs(&["--project", "podcasts/Café com amigos"]).unwrap(),
             Launch::Normal(Some(PathBuf::from("podcasts/Café com amigos")))
         );
+    }
+
+    #[test]
+    fn live_opens_the_window_with_an_optional_project() {
+        assert_eq!(parse_strs(&["--live"]).unwrap(), Launch::Live(None));
+        assert_eq!(
+            parse_strs(&["--live", "--project", "podcasts/Café com amigos"]).unwrap(),
+            Launch::Live(Some(PathBuf::from("podcasts/Café com amigos")))
+        );
+    }
+
+    #[test]
+    fn live_rejects_other_modes_missing_paths_and_extra_arguments() {
+        for args in [
+            vec!["--live", "--project"],
+            vec!["--live", "--project", ""],
+            vec!["--live", "--project", "--live"],
+            vec!["--live", "--project", "one", "--project", "two"],
+            vec!["--live", "--project", "one", "--version"],
+            vec!["--live", "one"],
+            vec!["--live", "--live"],
+            vec!["--live", "--mcp"],
+            vec!["--live", "--software"],
+            vec!["--live", "--smoke"],
+            vec!["--live", "--schema"],
+            vec!["--live", "--version"],
+            vec!["--live", "--whisper-cpu"],
+            vec!["--project", "one", "--live"],
+            vec!["--project", "--live"],
+            vec!["--mcp", "window", "--live"],
+        ] {
+            assert!(parse_strs(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
@@ -174,6 +221,22 @@ mod tests {
         assert_eq!(
             parse([OsString::from("--project"), path.clone()]).unwrap(),
             Launch::Normal(Some(PathBuf::from(path)))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_preserves_non_unicode_project_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = OsString::from_vec(vec![b'/', 0xff]);
+        assert_eq!(
+            parse([
+                OsString::from("--live"),
+                OsString::from("--project"),
+                path.clone()
+            ])
+            .unwrap(),
+            Launch::Live(Some(PathBuf::from(path)))
         );
     }
 }

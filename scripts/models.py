@@ -37,6 +37,7 @@ CRATES = ROOT / "src" / "crates"
 # The repository the mirror lives on, and the engine constant that must
 # agree with this file about which release holds it.
 REPO = "jub0t/Concat"
+APP_REPO = "steel0rat/concat-live"
 HOST_MODELS = CRATES / "concat-host" / "src" / "models.rs"
 
 # Where each family's table lives in the engine, for --check.
@@ -109,8 +110,8 @@ def hf_mirror(url: str) -> str | None:
     return None
 
 
-def asset_url(release: str, file: str) -> str:
-    return f"https://github.com/{REPO}/releases/download/{release}/{file}"
+def asset_url(release: str, file: str, repo: str = REPO) -> str:
+    return f"https://github.com/{repo}/releases/download/{release}/{file}"
 
 
 def engine_id(model: dict) -> str:
@@ -324,6 +325,10 @@ def mirror(out: pathlib.Path, only: list[str]) -> int:
 
 
 def release_manifest(version: str, tag: str, bundles: pathlib.Path | None) -> dict:
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("release version must have the form X.Y.Z")
+    if not re.fullmatch(re.escape("v" + version) + r"(?:-[0-9A-Za-z.]+)?", tag):
+        raise ValueError("release tag does not match the version")
     data = table()
     release = data["release"]
 
@@ -334,10 +339,12 @@ def release_manifest(version: str, tag: str, bundles: pathlib.Path | None) -> di
         file = stem.format(v=version)
         entry = {
             "file": file,
-            "url": asset_url(tag, file),
+            "url": asset_url(tag, file, APP_REPO),
         }
         if bundles is not None:
             path = bundles / file
+            if path.is_symlink():
+                raise ValueError(f"release package must not be a symlink: {file}")
             if path.exists():
                 entry["bytes"] = path.stat().st_size
                 entry["sha256"] = digest(path)
@@ -374,7 +381,8 @@ def release_manifest(version: str, tag: str, bundles: pathlib.Path | None) -> di
     return {
         # 2: a target holds one row per kind of file, not one file.
         "schema": 2,
-        "product": "Concat",
+        "product": "Concat Live",
+        "bundleIdentifier": "ru.steel0rat.concat-live",
         "version": version,
         "tag": tag,
         "models_release": release,

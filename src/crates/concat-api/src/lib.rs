@@ -27,6 +27,8 @@
 //! job on its own thread instead: [`Api::dispatch`] returns its name at
 //! once and the job reports through the [`EventSink`] the API was made
 //! with, from that thread, which is why the sink must be `Send + Sync`.
+//! An embedder can opt into [`LiveHandler`] instead: the window keeps the
+//! only editing session and the API renders detached snapshots of it.
 
 #[cfg(feature = "schema")]
 mod contract;
@@ -226,11 +228,29 @@ impl OpenProjects {
     }
 }
 
+/// The window's sole editing session, reached without opening a second
+/// writer on its project folder. Implementations marshal each call to
+/// the window's event loop and reject a project that is no longer open.
+pub trait LiveHandler: Send + Sync {
+    /// Runs a project request against the window's session and publishes
+    /// the resulting state before returning it.
+    fn call(&self, request: Request) -> Result<Reply, ApiError>;
+
+    /// Captures unsaved state for rendering or saving a template. The
+    /// returned session owns no project claim and no editing history.
+    fn snapshot(&self, path: &str) -> Result<Session, ApiError>;
+}
+
 /// The dispatcher: the open sessions and the services behind them.
 pub struct Api {
     dirs: AppDirs,
     /// Open projects by canonical folder path.
     sessions: BTreeMap<String, Session>,
+    /// The window remains the only writer when live mode is enabled.
+    live: Option<Arc<dyn LiveHandler>>,
+    /// One call's detached read-only state. Kept outside `sessions` so
+    /// dropping it, including after a render panic, releases no claim.
+    snapshot: Option<(String, Session)>,
     /// Where this API may write: a created project, an instantiated
     /// template, an export or a preview file lands under one of these.
     /// Empty means anywhere, for the process's own owner at a terminal.
@@ -303,6 +323,8 @@ impl Api {
             monitor: Monitor::new(),
             exporter: Exporter::new(),
             sessions: BTreeMap::new(),
+            live: None,
+            snapshot: None,
             roots: Vec::new(),
             open: OpenProjects::default(),
             events,
@@ -362,6 +384,14 @@ impl Api {
     /// round.
     pub fn share_open_projects(&mut self, open: OpenProjects) {
         self.open = open;
+    }
+
+    /// Routes project requests from [`Api::dispatch`] to the window's
+    /// existing session. Rendering uses detached snapshots; no API
+    /// session is opened and the window keeps its project claim.
+    pub fn enable_live(&mut self, handler: Arc<dyn LiveHandler>) {
+        self.live = Some(handler);
+        self.add_capability("live");
     }
 
     /// Confines every write to `roots`: from here on a created project, an
@@ -432,8 +462,78 @@ impl Api {
     /// Runs one request. The response is what the request is worth; a job
     /// it begins reports through the sink from then on.
     pub fn dispatch(&mut self, request: Request) -> Response {
+        // A transport may have caught a panic in the previous render.
+        self.snapshot = None;
         self.jobs.reap(&self.book);
-        self.run(request).into()
+        let result = match self.live.clone() {
+            Some(handler) => self.run_live(request, handler.as_ref()),
+            None => self.run(request),
+        };
+        self.snapshot = None;
+        result.into()
+    }
+
+    fn run_live(&mut self, request: Request, handler: &dyn LiveHandler) -> Result<Reply, ApiError> {
+        match request {
+            Request::ProjectCreate {
+                location,
+                name,
+                video,
+            } => {
+                self.writable(&location)?;
+                handler.call(Request::ProjectCreate {
+                    location,
+                    name,
+                    video,
+                })
+            }
+            request @ (Request::ProjectOpen { .. }
+            | Request::ProjectClose { .. }
+            | Request::ProjectGet { .. }
+            | Request::ProjectDocument { .. }
+            | Request::ProjectSave { .. }
+            | Request::ProjectSetVideo { .. }
+            | Request::EditApply { .. }
+            | Request::EditUndo { .. }
+            | Request::EditRedo { .. }) => handler.call(request),
+            Request::MediaImport { path, file } => {
+                let item = media::probe(&file)
+                    .map_err(ApiError::failed)?
+                    .to_new_media();
+                handler.call(Request::EditApply {
+                    path,
+                    command: Box::new(Command::AddMedia { item }),
+                })
+            }
+            Request::TemplateInstantiate {
+                template,
+                location,
+                name,
+                fills,
+            } => {
+                let info = self.instantiate_project(&template, &location, &name, fills)?;
+                handler.call(Request::ProjectOpen { path: info.path })
+            }
+            request @ (Request::PreviewFrame { .. }
+            | Request::ExportRun { .. }
+            | Request::TemplateSave { .. }) => {
+                let path = match &request {
+                    Request::PreviewFrame { path, .. }
+                    | Request::ExportRun { path, .. }
+                    | Request::TemplateSave { path, .. } => path,
+                    _ => unreachable!(),
+                };
+                self.snapshot = Some((key_of(path), handler.snapshot(path)?));
+                self.run(request)
+            }
+            request @ (Request::Version
+            | Request::ProjectList
+            | Request::MediaProbe { .. }
+            | Request::CatalogueList { .. }
+            | Request::TemplateList
+            | Request::ExportCancel { .. }
+            | Request::ExportStatus { .. }) => self.run(request),
+        }
     }
 
     fn run(&mut self, request: Request) -> Result<Reply, ApiError> {
@@ -628,6 +728,17 @@ impl Api {
         name: &str,
         fills: Vec<Fill>,
     ) -> Result<EditorView, ApiError> {
+        let info = self.instantiate_project(template, location, name, fills)?;
+        self.adopt(info)
+    }
+
+    fn instantiate_project(
+        &self,
+        template: &str,
+        location: &str,
+        name: &str,
+        fills: Vec<Fill>,
+    ) -> Result<ProjectInfo, ApiError> {
         self.writable(location)?;
         // Every file is probed before anything is made, so a bad path
         // refuses the whole request rather than leaving a folder behind.
@@ -642,9 +753,7 @@ impl Api {
                 })
             })
             .collect::<Result<Vec<SlotFill>, ApiError>>()?;
-        let info =
-            templates::instantiate(template, location, name, fills).map_err(ApiError::failed)?;
-        self.adopt(info)
+        templates::instantiate(template, location, name, fills).map_err(ApiError::failed)
     }
 
     /// [`Request::TemplateSave`].
@@ -880,6 +989,11 @@ impl Api {
     }
 
     fn session(&self, path: &str) -> Result<&Session, ApiError> {
+        if let Some((key, snapshot)) = &self.snapshot
+            && *key == key_of(path)
+        {
+            return Ok(snapshot);
+        }
         self.sessions
             .get(&key_of(path))
             .ok_or_else(|| not_open(path))
@@ -1263,6 +1377,417 @@ mod tests {
             video: None,
         }));
         scratch.path().join(name).to_string_lossy().into_owned()
+    }
+
+    struct WindowSession {
+        session: Mutex<Session>,
+        calls: Mutex<Vec<Request>>,
+    }
+
+    impl LiveHandler for WindowSession {
+        fn call(&self, request: Request) -> Result<Reply, ApiError> {
+            self.calls.lock().expect("calls").push(request.clone());
+            let mut session = self.session.lock().expect("window session");
+            let path = match &request {
+                Request::ProjectOpen { path }
+                | Request::ProjectGet { path }
+                | Request::ProjectDocument { path }
+                | Request::ProjectSave { path, .. }
+                | Request::ProjectSetVideo { path, .. }
+                | Request::EditApply { path, .. }
+                | Request::EditUndo { path }
+                | Request::EditRedo { path } => path,
+                _ => return Err(ApiError::new(ErrorCode::Refused, "the window refused")),
+            };
+            if key_of(path) != key_of(session.path()) {
+                return Err(not_open(path));
+            }
+            let view = match request {
+                Request::ProjectOpen { .. } | Request::ProjectGet { .. } => session.view(),
+                Request::ProjectDocument { .. } => return Ok(Reply::Document(session.document())),
+                Request::ProjectSave { name, .. } => {
+                    session.save(name.as_deref()).map_err(ApiError::failed)?;
+                    return Ok(Reply::Done(Done {}));
+                }
+                Request::ProjectSetVideo { video, .. } => {
+                    session.set_video(video).map_err(refused)?
+                }
+                Request::EditApply { command, .. } => session.apply(*command).map_err(refused)?,
+                Request::EditUndo { .. } => session.undo(),
+                Request::EditRedo { .. } => session.redo(),
+                _ => unreachable!(),
+            };
+            Ok(Reply::View(Box::new(view)))
+        }
+
+        fn snapshot(&self, path: &str) -> Result<Session, ApiError> {
+            let session = self.session.lock().expect("window session");
+            if key_of(path) != key_of(session.path()) {
+                return Err(not_open(path));
+            }
+            Ok(session.snapshot())
+        }
+    }
+
+    fn live_project(
+        api: &mut Api,
+        scratch: &tempfile::TempDir,
+    ) -> (String, Arc<WindowSession>, OpenProjects) {
+        let path = project(api, scratch, "Live");
+        api.close(&path, false).expect("the API gives it back");
+        let open = OpenProjects::default();
+        open.claim(&path, Holder::Window)
+            .expect("the window owns it");
+        let window = Arc::new(WindowSession {
+            session: Mutex::new(
+                Session::open_info(&projects::open(&path).expect("a project"))
+                    .expect("the sole window session"),
+            ),
+            calls: Mutex::new(Vec::new()),
+        });
+        api.share_open_projects(open.clone());
+        api.enable_live(window.clone());
+        (path, window, open)
+    }
+
+    fn shape() -> Command {
+        Command::AddShapeClip {
+            track_id: None,
+            above: false,
+            start: 0.0,
+            style: None,
+            duration: Some(1.0),
+            name: "Live shape".to_owned(),
+        }
+    }
+
+    #[test]
+    fn live_edits_and_window_edits_share_one_history() {
+        let (mut api, scratch, _) = api();
+        let (path, window, open) = live_project(&mut api, &scratch);
+        window
+            .session
+            .lock()
+            .expect("window session")
+            .apply(Command::AddTrack { bottom: false })
+            .expect("the window's unsaved edit");
+        let original = window.session.lock().expect("window session").document();
+        let opened = view(ok(api.dispatch(Request::ProjectOpen { path: path.clone() })));
+        assert!(opened.can_undo, "open returns the window's unsaved state");
+        let added = view(ok(api.dispatch(Request::EditApply {
+            path: path.clone(),
+            command: Box::new(shape()),
+        })));
+        let id = added.created_id.expect("a clip id");
+        assert_eq!(
+            window
+                .session
+                .lock()
+                .expect("window session")
+                .project()
+                .active()
+                .clips[0]
+                .id,
+            id
+        );
+        window.session.lock().expect("window session").undo();
+        let undone = view(ok(api.dispatch(Request::ProjectGet { path: path.clone() })));
+        assert!(undone.project.active().clips.is_empty());
+        assert!(undone.can_redo);
+        let redone = view(ok(api.dispatch(Request::EditRedo { path: path.clone() })));
+        assert_eq!(redone.project.active().clips[0].id, id);
+        ok(api.dispatch(Request::EditUndo { path: path.clone() }));
+        assert_eq!(
+            window.session.lock().expect("window session").document(),
+            original
+        );
+        window.session.lock().expect("window session").redo();
+        let read = match ok(api.dispatch(Request::ProjectDocument { path: path.clone() })) {
+            Reply::Document(document) => document,
+            _ => panic!("a document"),
+        };
+        assert_eq!(
+            read,
+            window.session.lock().expect("window session").document()
+        );
+        assert!(
+            api.sessions.is_empty(),
+            "the API never becomes another writer"
+        );
+        assert_eq!(open.holder(&path), Some(Holder::Window));
+        assert!(api.version().capabilities.iter().any(|name| name == "live"));
+    }
+
+    #[test]
+    fn live_preview_reads_unsaved_pixels_and_keeps_the_window_claim() {
+        let (mut api, scratch, _) = api();
+        let (path, window, open) = live_project(&mut api, &scratch);
+        let manifest = Path::new(&path).join("concat.json");
+        let saved = std::fs::read(&manifest).expect("the manifest");
+        {
+            let mut session = window.session.lock().expect("window session");
+            let video = session.video();
+            session
+                .set_video(VideoSettings {
+                    width: 16,
+                    height: 9,
+                    canvas: [255, 0, 0, 255],
+                    ..video
+                })
+                .expect("the window's unsaved canvas");
+        }
+        let original = window.session.lock().expect("window session").document();
+        let picture = match ok(api.dispatch(Request::PreviewFrame {
+            path: path.clone(),
+            time: 0.0,
+            output: None,
+            width: None,
+            height: None,
+        })) {
+            Reply::Picture(picture) => picture,
+            _ => panic!("a picture"),
+        };
+        assert_eq!((picture.width, picture.height), (16, 9));
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(picture.png)
+            .expect("base64");
+        let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+            .read_info()
+            .expect("a PNG");
+        let mut pixels = vec![0; reader.output_buffer_size()];
+        let frame = reader.next_frame(&mut pixels).expect("the frame");
+        assert!(
+            pixels[..frame.buffer_size()].chunks_exact(4).all(|pixel| {
+                pixel[0] > 240 && pixel[1] < 10 && pixel[2] < 10 && pixel[3] == 255
+            }),
+            "the preview sees the unsaved red canvas"
+        );
+        assert_eq!(
+            err(api.dispatch(Request::PreviewFrame {
+                path: path.clone(),
+                time: 0.0,
+                output: None,
+                width: Some(0),
+                height: Some(9),
+            }))
+            .code,
+            ErrorCode::Invalid,
+            "a render refusal also releases the temporary snapshot"
+        );
+        assert_eq!(
+            window.session.lock().expect("window session").document(),
+            original
+        );
+        assert_eq!(std::fs::read(&manifest).expect("the manifest"), saved);
+        assert!(api.snapshot.is_none() && api.sessions.is_empty());
+        assert_eq!(open.holder(&path), Some(Holder::Window));
+        drop(api);
+        assert_eq!(
+            open.holder(&path),
+            Some(Holder::Window),
+            "dropping the API releases no GUI claim"
+        );
+
+        let (mut legacy, _legacy_scratch, _) = self::api();
+        legacy.share_open_projects(open);
+        assert_eq!(
+            err(legacy.dispatch(Request::ProjectOpen { path })).code,
+            ErrorCode::Refused,
+            "a non-live API still refuses the window's project"
+        );
+    }
+
+    #[test]
+    fn a_live_snapshot_refusal_never_opens_a_project_from_disk() {
+        let (mut api, scratch, _) = api();
+        let (path, window, open) = live_project(&mut api, &scratch);
+        let other = projects::create(
+            &scratch.path().to_string_lossy(),
+            "Other",
+            16,
+            9,
+            30,
+            1,
+            [0, 0, 0, 255],
+        )
+        .expect("another saved project");
+        let rejected = err(api.dispatch(Request::PreviewFrame {
+            path: other.path.clone(),
+            time: 0.0,
+            output: None,
+            width: Some(16),
+            height: Some(9),
+        }));
+        assert_eq!(rejected, not_open(&other.path));
+        assert!(api.snapshot.is_none() && api.sessions.is_empty());
+        assert!(window.calls.lock().expect("calls").is_empty());
+        assert_eq!(open.holder(&path), Some(Holder::Window));
+        assert_eq!(open.holder(&other.path), None);
+    }
+
+    #[test]
+    fn live_export_checks_the_unsaved_timeline_without_saving_it() {
+        let (mut api, scratch, _) = api();
+        let (path, window, open) = live_project(&mut api, &scratch);
+        let manifest = Path::new(&path).join("concat.json");
+        let saved = std::fs::read(&manifest).expect("the saved project");
+        window
+            .session
+            .lock()
+            .expect("window session")
+            .apply(shape())
+            .expect("an unsaved clip");
+        let output = scratch.path().join("out.mp4");
+        let rejected = err(api.dispatch(Request::ExportRun {
+            path: path.clone(),
+            spec: ExportSpec {
+                output: output.to_string_lossy().into_owned(),
+                crf: Some(MAX_CRF + 1),
+                ..ExportSpec::default()
+            },
+        }));
+        assert_eq!(rejected.code, ErrorCode::Invalid);
+        assert!(
+            rejected.message.contains("crf"),
+            "the unsaved timeline has a clip to export"
+        );
+        assert_eq!(std::fs::read(&manifest).expect("the manifest"), saved);
+        assert!(!output.exists());
+        assert_eq!(api.running(), 0);
+        assert!(api.snapshot.is_none() && api.sessions.is_empty());
+        assert_eq!(open.holder(&path), Some(Holder::Window));
+    }
+
+    #[test]
+    fn live_import_probes_before_handing_an_edit_to_the_window() {
+        let (mut api, scratch, _) = api();
+        let (path, window, _) = live_project(&mut api, &scratch);
+        let file = scratch
+            .path()
+            .join("still.png")
+            .to_string_lossy()
+            .into_owned();
+        write_png(Path::new(&file), 16, 9, &[255; 16 * 9 * 4]).expect("a real image");
+        let imported = view(ok(api.dispatch(Request::MediaImport {
+            path: path.clone(),
+            file: file.clone(),
+        })));
+        assert_eq!(imported.project.media.len(), 1);
+        assert_eq!(imported.project.media[0].path, file);
+        assert!(matches!(
+            window.calls.lock().expect("calls").last(),
+            Some(Request::EditApply { command, .. }) if matches!(command.as_ref(), Command::AddMedia { .. })
+        ));
+        let original = window.session.lock().expect("window session").document();
+        let calls = window.calls.lock().expect("calls").len();
+        let rejected = err(api.dispatch(Request::MediaImport {
+            path,
+            file: scratch
+                .path()
+                .join("missing.mp4")
+                .to_string_lossy()
+                .into_owned(),
+        }));
+        assert_eq!(rejected.code, ErrorCode::Failed);
+        assert_eq!(window.calls.lock().expect("calls").len(), calls);
+        assert_eq!(
+            window.session.lock().expect("window session").document(),
+            original
+        );
+    }
+
+    #[test]
+    fn live_template_save_captures_unsaved_state_and_instantiation_hands_off_the_new_project() {
+        let (mut api, scratch, _) = api();
+        let (path, window, open) = live_project(&mut api, &scratch);
+        window
+            .session
+            .lock()
+            .expect("window session")
+            .apply(shape())
+            .expect("an unsaved shape");
+        let manifest = Path::new(&path).join("concat.json");
+        let saved = std::fs::read(&manifest).expect("the saved project");
+        let template = match ok(api.dispatch(Request::TemplateSave {
+            path: path.clone(),
+            name: "Unsaved template".to_owned(),
+        })) {
+            Reply::Template(template) => template,
+            _ => panic!("a template"),
+        };
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(Path::new(&template.path).join("template.json")).expect("the template"),
+        )
+        .expect("a document");
+        let project = concat_project::from_document(&document).expect("a project");
+        assert_eq!(
+            project.active().clips.len(),
+            1,
+            "the saved project has no clips yet"
+        );
+        assert_eq!(
+            std::fs::read(&manifest).expect("the project remains unsaved"),
+            saved
+        );
+        assert_eq!(open.holder(&path), Some(Holder::Window));
+
+        let new_path = scratch
+            .path()
+            .join("Instantiated")
+            .to_string_lossy()
+            .into_owned();
+        let rejected = err(api.dispatch(Request::TemplateInstantiate {
+            template: template.path,
+            location: scratch.path().to_string_lossy().into_owned(),
+            name: "Instantiated".to_owned(),
+            fills: Vec::new(),
+        }));
+        assert_eq!(
+            rejected,
+            not_open(&new_path),
+            "the window's refusal is returned unchanged"
+        );
+        assert!(projects::is_project(Path::new(&new_path)));
+        assert_eq!(
+            window.calls.lock().expect("calls").last(),
+            Some(&Request::ProjectOpen {
+                path: new_path.clone()
+            }),
+            "only opening the fully instantiated project reaches the GUI"
+        );
+        assert!(api.sessions.is_empty());
+        assert_eq!(open.holder(&new_path), None);
+    }
+
+    #[test]
+    fn live_creation_keeps_the_api_write_roots_and_global_methods() {
+        let (mut api, scratch, _) = api();
+        let (_, window, _) = live_project(&mut api, &scratch);
+        let allowed = scratch.path().join("allowed");
+        std::fs::create_dir_all(&allowed).expect("allowed");
+        api.restrict_writes_to(vec![allowed]);
+        let rejected = err(api.dispatch(Request::ProjectCreate {
+            location: scratch.path().to_string_lossy().into_owned(),
+            name: "Outside".to_owned(),
+            video: None,
+        }));
+        assert_eq!(rejected.code, ErrorCode::Refused);
+        let rejected = err(api.dispatch(Request::TemplateInstantiate {
+            template: "/missing-template".to_owned(),
+            location: scratch.path().to_string_lossy().into_owned(),
+            name: "Outside".to_owned(),
+            fills: Vec::new(),
+        }));
+        assert_eq!(rejected.code, ErrorCode::Refused);
+        assert!(!scratch.path().join("Outside").exists());
+        for request in [
+            Request::Version,
+            Request::ProjectList,
+            Request::TemplateList,
+        ] {
+            ok(api.dispatch(request));
+        }
+        assert!(window.calls.lock().expect("calls").is_empty());
     }
 
     #[test]

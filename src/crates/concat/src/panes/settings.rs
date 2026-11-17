@@ -13,9 +13,11 @@
 //! on disk after anything that could have changed it.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use concat_host::models::SourcePreference;
 use concat_host::updates::{self, Fixed, Installed, Release, Standing, Version};
@@ -68,6 +70,8 @@ pub enum SettingsMsg {
     DownloadSourceChanged(i32),
     DownloadBaseEdited(String),
     ServerEnabledChanged(bool),
+    /// The chosen workspace applies only to this live launch.
+    LiveWorkspaceChanged(PathBuf),
     /// The address half of where the server listens; the port is its own
     /// field, so a person types "127.0.0.1" and "7420" and never a colon.
     ServerHostEdited(String),
@@ -105,6 +109,19 @@ pub enum SettingsMsg {
     },
     /// The Version page asks GitHub for the releases.
     CheckUpdates,
+    /// The launch's periodic check and application of prepared updates.
+    AutoTick,
+    /// A verified app waits for an idle editor before it replaces the bundle.
+    AppPrepared {
+        version: Version,
+        result: Result<updates::PreparedApp, String>,
+    },
+    /// A verified skill waits until the current chat request has finished.
+    SkillPrepared(Result<Option<updates::skill::InstalledSkill>, String>),
+    SkillActivated {
+        version: Version,
+        result: Result<(), String>,
+    },
     /// The releases, newest first, or why they could not be had.
     UpdatesFetched(Result<Vec<Release>, String>),
     /// A release picked from the Version page's list.
@@ -126,6 +143,7 @@ pub enum SettingsMsg {
 
 /// The Version page's index in the column of pages.
 const VERSION_PAGE: i32 = 6;
+const AUTO_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// The Shortcuts page's index, which the launch screen's Keyboard
 /// shortcuts card opens the sheet on.
 pub const SHORTCUTS_PAGE: i32 = 7;
@@ -243,6 +261,10 @@ pub struct SettingsPane {
     pub download_source: usize,
     /// The base URL of a custom download source.
     pub download_base: String,
+    /// Launch-only Automation settings, excluded from every preferences save.
+    live_server: Option<prefs::ServerPrefs>,
+    /// An explicit folder replaces the default write roots for this live launch.
+    live_workspace: Option<PathBuf>,
     /// Why the server is not running when the switch is on: the bind that
     /// failed. Empty while it runs, or is off.
     pub server_error: String,
@@ -268,9 +290,85 @@ pub struct SettingsPane {
     install: Option<(f32, f32)>,
     /// The running switch's stop flag.
     install_cancel: Arc<AtomicBool>,
+    auto_timer: slint::Timer,
+    next_auto_check: Option<Instant>,
+    pending_app: Option<(Version, updates::PreparedApp)>,
+    pending_skill: Option<updates::skill::InstalledSkill>,
+    installed_skill: Option<updates::skill::InstalledSkill>,
+    skill_status: String,
+    checking_skill: bool,
+    applying: bool,
+    skipped_version: Option<Version>,
 }
 
 impl SettingsPane {
+    pub(crate) fn for_live() -> Self {
+        Self {
+            live_server: Some(prefs::ServerPrefs {
+                enabled: true,
+                listen: "127.0.0.1:0".to_owned(),
+                token: String::new(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn live_workspace(&self) -> Option<&Path> {
+        self.live_workspace.as_deref()
+    }
+
+    fn select_live_workspace(&mut self, live_enabled: bool, path: PathBuf) -> Result<(), String> {
+        if !live_enabled || self.live_server.is_none() {
+            return Err("Рабочую папку можно выбирать только в Concat Live.".to_owned());
+        }
+        let canonical = path.canonicalize().map_err(|error| {
+            format!(
+                "Не удалось открыть рабочую папку {}: {error}",
+                path.display()
+            )
+        })?;
+        if !canonical.is_dir() {
+            return Err(format!(
+                "Рабочая папка должна быть каталогом: {}",
+                path.display()
+            ));
+        }
+        self.live_workspace = Some(canonical);
+        Ok(())
+    }
+
+    fn server_roots(&self, live_enabled: bool) -> Vec<PathBuf> {
+        if !live_enabled {
+            return Vec::new();
+        }
+        if let Some(workspace) = self.live_workspace() {
+            return vec![workspace.to_path_buf()];
+        }
+        std::env::var_os("CONCAT_MCP_ROOTS")
+            .filter(|paths| !paths.is_empty())
+            .map(|paths| std::env::split_paths(&paths).collect())
+            .unwrap_or_default()
+    }
+
+    fn server_prefs<'a>(&'a self, prefs: &'a prefs::Preferences) -> &'a prefs::ServerPrefs {
+        self.live_server.as_ref().unwrap_or(&prefs.server)
+    }
+
+    fn server_prefs_mut<'a>(
+        &'a mut self,
+        prefs: &'a mut prefs::Preferences,
+    ) -> &'a mut prefs::ServerPrefs {
+        self.live_server.as_mut().unwrap_or(&mut prefs.server)
+    }
+
+    fn change_server(&mut self, studio: &mut Studio, change: impl FnOnce(&mut prefs::ServerPrefs)) {
+        change(self.server_prefs_mut(&mut studio.prefs));
+        if self.live_server.is_none() {
+            studio.prefs.save(&studio.host.dirs);
+        }
+        self.apply_server(studio);
+    }
+
     /// Applies one message. The studio is the rest of the window; while
     /// this runs the studio's copy of the pane is a blank it must not read.
     pub fn update(&mut self, msg: SettingsMsg, studio: &mut Studio) {
@@ -294,6 +392,22 @@ impl SettingsPane {
                 Self::apply_download_source(studio);
                 self.apply_server(studio);
                 self.refresh(studio);
+                if studio.live_enabled && cfg!(target_os = "macos") {
+                    match updates::skill::current(&studio.host.dirs) {
+                        Ok(skill) => self.installed_skill = skill,
+                        Err(error) => self.skill_status = error,
+                    }
+                    self.auto_timer.start(
+                        slint::TimerMode::Repeated,
+                        Duration::from_secs(5),
+                        || {
+                            on_ui(|studio, _, _| {
+                                studio.handle(Msg::Settings(SettingsMsg::AutoTick))
+                            });
+                        },
+                    );
+                    on_ui(|studio, _, _| studio.handle(Msg::Settings(SettingsMsg::AutoTick)));
+                }
             }
             SettingsMsg::Open => {
                 self.refresh(studio);
@@ -419,31 +533,34 @@ impl SettingsPane {
                 Self::apply_download_source(studio);
             }
             SettingsMsg::ServerEnabledChanged(on) => {
-                studio.prefs.server.enabled = on;
-                studio.prefs.save(&studio.host.dirs);
-                self.apply_server(studio);
+                self.change_server(studio, |server| server.enabled = on);
+            }
+            SettingsMsg::LiveWorkspaceChanged(path) => {
+                match self.select_live_workspace(studio.live_enabled, path) {
+                    Ok(()) => self.apply_server(studio),
+                    Err(error) => {
+                        self.server_error = error.clone();
+                        studio.notify(&error, true);
+                    }
+                }
             }
             SettingsMsg::ServerHostEdited(text) => {
-                let (_, port) = split_listen(&studio.prefs.server.listen);
-                studio.prefs.server.listen = join_listen(&text, port);
-                studio.prefs.save(&studio.host.dirs);
-                self.apply_server(studio);
+                self.change_server(studio, |server| {
+                    let (_, port) = split_listen(&server.listen);
+                    server.listen = join_listen(&text, port);
+                });
             }
             SettingsMsg::ServerPortEdited(port) => {
-                let (host, _) = split_listen(&studio.prefs.server.listen);
-                studio.prefs.server.listen = join_listen(&host, port.clamp(0, 65535) as u16);
-                studio.prefs.save(&studio.host.dirs);
-                self.apply_server(studio);
+                self.change_server(studio, |server| {
+                    let (host, _) = split_listen(&server.listen);
+                    server.listen = join_listen(&host, port.clamp(0, 65535) as u16);
+                });
             }
             SettingsMsg::ServerTokenEdited(text) => {
-                studio.prefs.server.token = text.trim().to_owned();
-                studio.prefs.save(&studio.host.dirs);
-                self.apply_server(studio);
+                self.change_server(studio, |server| server.token = text.trim().to_owned());
             }
             SettingsMsg::ServerTokenGenerated => {
-                studio.prefs.server.token = new_token();
-                studio.prefs.save(&studio.host.dirs);
-                self.apply_server(studio);
+                self.change_server(studio, |server| server.token = new_token());
             }
             SettingsMsg::ModelActivated(id) => {
                 if self.is_transcriber(&id) {
@@ -543,7 +660,70 @@ impl SettingsPane {
                 }
                 self.refresh(studio);
             }
-            SettingsMsg::CheckUpdates => self.check_updates(),
+            SettingsMsg::CheckUpdates => {
+                self.check_updates();
+                self.check_skill(studio);
+                self.next_auto_check = Some(Instant::now() + AUTO_CHECK_INTERVAL);
+            }
+            SettingsMsg::AutoTick => self.poll_updates(studio),
+            SettingsMsg::AppPrepared { version, result } => {
+                match result {
+                    Ok(prepared) if !self.install_cancel.load(Ordering::Relaxed) => {
+                        self.pending_app = Some((version, prepared));
+                        self.update_status = format!(
+                            "Concat Live {version} загружен. Ожидаю завершения работы в редакторе."
+                        );
+                    }
+                    Ok(_) => self.install = None,
+                    Err(_) if self.install_cancel.load(Ordering::Relaxed) => self.install = None,
+                    Err(error) => {
+                        self.install = None;
+                        self.update_status =
+                            format!("Не удалось подготовить обновление {version}: {error}");
+                    }
+                }
+                self.apply_ready_update(studio);
+            }
+            SettingsMsg::SkillPrepared(result) => {
+                self.checking_skill = false;
+                match result {
+                    Ok(Some(skill)) => {
+                        self.skill_status = format!(
+                            "Навык {} загружен. Он подключится после текущего запроса.",
+                            skill.version
+                        );
+                        self.pending_skill = Some(skill);
+                    }
+                    Ok(None) => {
+                        self.skill_status = match &self.installed_skill {
+                            Some(skill) => format!("Установлена версия навыка {}.", skill.version),
+                            None => "Опубликованных обновлений навыка пока нет. Используется установленный в Codex навык.".into(),
+                        };
+                    }
+                    Err(error) => self.skill_status = format!("Не удалось обновить навык: {error}"),
+                }
+                self.apply_ready_update(studio);
+            }
+            SettingsMsg::SkillActivated { version, result } => {
+                self.applying = false;
+                crate::agent::resume_after_update();
+                match result {
+                    Ok(()) => match updates::skill::current(&studio.host.dirs) {
+                        Ok(skill) => {
+                            self.installed_skill = skill;
+                            self.skill_status = format!(
+                                "Навык {version} подключится со следующего запроса. Беседа сохранена."
+                            );
+                        }
+                        Err(error) => self.skill_status = error,
+                    },
+                    Err(error) => {
+                        self.skill_status =
+                            format!("Не удалось подключить навык {version}: {error}")
+                    }
+                }
+                self.apply_ready_update(studio);
+            }
             SettingsMsg::UpdatesFetched(result) => {
                 self.checking = false;
                 match result {
@@ -562,6 +742,14 @@ impl SettingsPane {
                         // the one most people opened the page for.
                         self.version_choice = 0;
                         self.releases = releases;
+                        if studio.live_enabled
+                            && cfg!(target_os = "macos")
+                            && updates::installed_as().is_ok()
+                            && let Some(index) = self.automatic_release(current)
+                        {
+                            self.version_choice = index;
+                            self.install_version(studio);
+                        }
                     }
                     Err(error) => self.update_status = tf("settings.couldNotCheck", &[&error]),
                 }
@@ -571,7 +759,19 @@ impl SettingsPane {
                     (index.max(0) as usize).min(self.releases.len().saturating_sub(1));
             }
             SettingsMsg::InstallVersion => self.install_version(studio),
-            SettingsMsg::InstallCancel => self.install_cancel.store(true, Ordering::Relaxed),
+            SettingsMsg::InstallCancel => {
+                if self.applying {
+                    return;
+                }
+                self.install_cancel.store(true, Ordering::Relaxed);
+                self.skipped_version = self
+                    .releases
+                    .get(self.version_choice)
+                    .map(|release| release.version);
+                if self.pending_app.take().is_some() {
+                    self.install = None;
+                }
+            }
             SettingsMsg::InstallProgress { fetched, total } => {
                 if self.install.is_some() {
                     self.install = Some((fetched, total));
@@ -579,11 +779,12 @@ impl SettingsPane {
             }
             SettingsMsg::InstallFinished { version, result } => {
                 self.install = None;
+                self.applying = false;
                 match result {
                     Ok(Installed::InstallerRunning) => {
                         log::info!("update: the installer for {version} is running; closing");
                         studio.notify(&tf("settings.installerOpened", &[&version]), false);
-                        quit_for_switch(|| {});
+                        quit_for_switch(|_, _| {});
                     }
                     Ok(Installed::Replaced) => {
                         // The bundle on disk is already the new build; what
@@ -591,18 +792,23 @@ impl SettingsPane {
                         // project being saved.
                         log::info!("update: {version} is in place; starting it");
                         studio.notify(&tf("settings.versionInstalled", &[&version]), false);
-                        quit_for_switch(|| {
-                            if let Err(error) = updates::relaunch() {
-                                log::warn!("update: could not arrange the start: {error}");
-                            }
-                        });
+                        let project = studio
+                            .session
+                            .as_ref()
+                            .map(|session| PathBuf::from(session.path()));
+                        restart(project);
                     }
                     Ok(Installed::Opened) => {
+                        crate::agent::resume_after_update();
                         studio.notify(&tf("settings.packageOpened", &[&version]), false);
                     }
                     // A cancel is a choice, not a failure worth a toast.
-                    Err(_) if self.install_cancel.load(Ordering::Relaxed) => {}
+                    Err(_) if self.install_cancel.load(Ordering::Relaxed) => {
+                        crate::agent::resume_after_update()
+                    }
                     Err(error) => {
+                        crate::agent::resume_after_update();
+                        self.update_status = format!("Не удалось установить {version}: {error}");
                         log::warn!("update: {version} could not be installed: {error}");
                         studio.notify(&tf("settings.couldNotInstall", &[&version, &error]), true);
                     }
@@ -629,7 +835,7 @@ impl SettingsPane {
     /// download reports as [`SettingsMsg::InstallProgress`] and the whole
     /// ends as [`SettingsMsg::InstallFinished`].
     fn install_version(&mut self, studio: &mut Studio) {
-        if self.install.is_some() {
+        if self.install.is_some() || self.applying {
             return;
         }
         let Some(release) = self.releases.get(self.version_choice).cloned() else {
@@ -647,31 +853,153 @@ impl SettingsPane {
         self.install = Some((0.0, 0.0));
         let folder = updates::folder(&studio.host.dirs);
         let version = release.version;
-        log::info!(
-            "update: switching to {version} by its {} package",
-            kind.key()
-        );
         spawn(
             move || {
-                let result = updates::fetch_package(&release, kind)
-                    .and_then(|package| {
-                        let mut report = |received: u64, total: u64| {
-                            let msg = SettingsMsg::InstallProgress {
+                let result = updates::fetch_package(&release, kind).and_then(|package| {
+                    let mut report = |received: u64, total: u64| {
+                        on_ui(move |studio, _, _| {
+                            studio.handle(Msg::Settings(SettingsMsg::InstallProgress {
                                 fetched: received as f32 / 1_000_000.0,
                                 total: total as f32 / 1_000_000.0,
-                            };
-                            on_ui(move |studio, _, _| studio.handle(Msg::Settings(msg)));
-                        };
-                        updates::download_package(&package, &folder, &cancel, &mut report)
-                    })
-                    .and_then(|path| updates::install(&path, kind));
-                (version, result)
+                            }));
+                        });
+                    };
+                    updates::download_package(&package, &folder, &cancel, &mut report)
+                });
+                if kind == updates::PackageKind::Dmg {
+                    let result = result.and_then(|path| updates::prepare_app(&path, version));
+                    SettingsMsg::AppPrepared { version, result }
+                } else {
+                    SettingsMsg::InstallFinished {
+                        version,
+                        result: result.and_then(|path| updates::install(&path, kind)),
+                    }
+                }
             },
-            |studio, _, _, (version, result)| {
+            |studio, _, _, message| studio.handle(Msg::Settings(message)),
+        );
+    }
+
+    fn automatic_release(&self, current: Version) -> Option<usize> {
+        if self.install.is_some() || self.pending_app.is_some() || self.applying {
+            return None;
+        }
+        self.releases
+            .first()
+            .filter(|release| {
+                release.version > current && self.skipped_version != Some(release.version)
+            })
+            .map(|_| 0)
+    }
+
+    fn check_skill(&mut self, studio: &Studio) {
+        if !studio.live_enabled
+            || !cfg!(target_os = "macos")
+            || self.checking_skill
+            || self.pending_skill.is_some()
+            || self.applying
+        {
+            return;
+        }
+        self.checking_skill = true;
+        self.skill_status = "Проверяю опубликованные версии навыка…".into();
+        let dirs = studio.host.dirs.clone();
+        spawn(
+            move || {
+                let Some(manifest) = updates::skill::fetch_latest(Version::current())? else {
+                    return Ok(None);
+                };
+                if updates::skill::current(&dirs)?
+                    .is_some_and(|current| current.version >= manifest.version)
+                {
+                    return Ok(None);
+                }
+                let skill = updates::skill::prepare(
+                    &manifest,
+                    &dirs,
+                    &AtomicBool::new(false),
+                    &mut |_, _| {},
+                )?;
+                Ok(Some(skill))
+            },
+            |studio, _, _, result| studio.handle(Msg::Settings(SettingsMsg::SkillPrepared(result))),
+        );
+    }
+
+    fn poll_updates(&mut self, studio: &mut Studio) {
+        if !studio.live_enabled || !cfg!(target_os = "macos") {
+            return;
+        }
+        if self
+            .next_auto_check
+            .is_none_or(|next| Instant::now() >= next)
+        {
+            self.next_auto_check = Some(Instant::now() + AUTO_CHECK_INTERVAL);
+            self.check_updates();
+            self.check_skill(studio);
+        }
+        self.apply_ready_update(studio);
+    }
+
+    fn apply_ready_update(&mut self, studio: &mut Studio) {
+        if self.applying || studio.busy_for_update() || crate::host::native_dialog_open() {
+            return;
+        }
+        if self.pending_skill.is_some()
+            && !crate::agent::busy_for_update(false)
+            && crate::agent::pause_for_update(false)
+        {
+            let skill = self.pending_skill.take().expect("a prepared skill");
+            let version = skill.version;
+            let dirs = studio.host.dirs.clone();
+            self.applying = true;
+            spawn(
+                move || updates::skill::activate(&dirs, &skill),
+                move |studio, _, _, result| {
+                    studio.handle(Msg::Settings(SettingsMsg::SkillActivated {
+                        version,
+                        result,
+                    }))
+                },
+            );
+            return;
+        }
+        if self.pending_app.is_none()
+            || crate::agent::busy_for_update(true)
+            || !crate::agent::pause_for_update(true)
+        {
+            return;
+        }
+        let (version, prepared) = self.pending_app.take().expect("a prepared app");
+        studio.flush_commit();
+        let saved = studio
+            .session
+            .as_mut()
+            .map(|session| session.save(None))
+            .transpose();
+        if let Err(error) = saved {
+            self.install = None;
+            self.skipped_version = Some(version);
+            self.update_status =
+                format!("Обновление отложено: не удалось сохранить проект: {error}");
+            studio.notify(&self.update_status, true);
+            crate::agent::resume_after_update();
+            return;
+        }
+        self.applying = true;
+        self.update_status = format!("Устанавливаю Concat Live {version}…");
+        spawn(
+            move || {
+                updates::install_prepared_app(&prepared).map(|backup| {
+                    log::info!("update: previous app preserved at {}", backup.display());
+                    Installed::Replaced
+                })
+            },
+            move |studio, _, _, result| {
                 studio.handle(Msg::Settings(SettingsMsg::InstallFinished {
                     version,
                     result,
-                }));
+                }))
             },
         );
     }
@@ -724,6 +1052,9 @@ impl SettingsPane {
     /// takes effect; a bind that fails turns the switch back off and says
     /// why on the page.
     fn apply_server(&mut self, studio: &mut Studio) {
+        if studio.live_enabled {
+            crate::live::invalidate_server();
+        }
         // Detached: the address is free again when this returns, and a
         // call or an export the old server was in the middle of is
         // cancelled and finished off the event loop, not waited for on it.
@@ -734,7 +1065,9 @@ impl SettingsPane {
         let exporter = studio.host.exporter.clone();
         let open_projects = studio.host.open_projects.clone();
         let dirs = studio.host.dirs.clone();
-        let prefs = &studio.prefs.server;
+        let live_enabled = studio.live_enabled;
+        let roots = self.server_roots(live_enabled);
+        let prefs = self.server_prefs(&studio.prefs);
         if !prefs.enabled {
             return;
         }
@@ -745,6 +1078,7 @@ impl SettingsPane {
             self.server_error = tf("settings.tokenTooWeak", &[&concat_server::MIN_TOKEN_CHARS]);
             return;
         }
+        let window = live_enabled.then(crate::live::Window::new);
         let started = prefs
             .listen
             .trim()
@@ -753,27 +1087,32 @@ impl SettingsPane {
             .and_then(|address| {
                 let config = concat_server::Config {
                     json: Some(address),
+                    roots,
                     token: Some(prefs.token.clone()).filter(|token| !token.is_empty()),
                     // Where `concat --mcp`, started by an agent, finds this
                     // server rather than opening projects behind its back.
                     discovery: Some(concat_server::discovery::path_in(&dirs.config)),
                     ..concat_server::Config::default()
                 };
-                // The window's export slot and its register of open
-                // projects, so one export at a time holds across the two
-                // and a caller never edits the project on screen.
+                // The window keeps the export slot and project claims shared.
+                // Live mode forwards edits to its existing session on the event loop.
                 concat_server::Server::start(config, move |events| {
                     let mut api = concat_api::Api::new(events)?;
                     api.share_exporter(exporter);
                     api.share_open_projects(open_projects);
+                    if let Some(window) = window {
+                        api.enable_live(Arc::new(window));
+                    }
                     Ok(api)
                 })
             });
         match started {
             Ok(server) => studio.host.server = Some(server),
             Err(error) => {
-                studio.prefs.server.enabled = false;
-                studio.prefs.save(&studio.host.dirs);
+                self.server_prefs_mut(&mut studio.prefs).enabled = false;
+                if self.live_server.is_none() {
+                    studio.prefs.save(&studio.host.dirs);
+                }
                 self.server_error = error.clone();
                 studio.notify(&error, true);
             }
@@ -941,6 +1280,7 @@ impl SettingsPane {
 
     /// The sheet as Slint shows it.
     pub fn data(&self, studio: &Studio) -> SettingsData {
+        let server_prefs = self.server_prefs(&studio.prefs);
         SettingsData {
             open: self.open,
             tab: self.tab,
@@ -976,14 +1316,14 @@ impl SettingsPane {
             magnetic: studio.prefs.magnetic(),
             download_source: self.download_source as i32,
             download_base: self.download_base.as_str().into(),
-            server_enabled: studio.prefs.server.enabled,
-            server_host: split_listen(&studio.prefs.server.listen).0.into(),
-            server_port: i32::from(split_listen(&studio.prefs.server.listen).1),
+            server_enabled: server_prefs.enabled,
+            server_host: split_listen(&server_prefs.listen).0.into(),
+            server_port: i32::from(split_listen(&server_prefs.listen).1),
             server_token: match &studio.host.server {
                 // A token the server minted for itself is shown where a
                 // chosen one would be typed: it is how a caller gets in.
-                Some(server) if studio.prefs.server.token.is_empty() => server.token().into(),
-                _ => studio.prefs.server.token.as_str().into(),
+                Some(server) if server_prefs.token.is_empty() => server.token().into(),
+                _ => server_prefs.token.as_str().into(),
             },
             server_status: self.server_status(studio).into(),
             server_state: match &studio.host.server {
@@ -991,7 +1331,7 @@ impl SettingsPane {
                 None if !self.server_error.is_empty() => 2,
                 None => 0,
             },
-            server_local: is_loopback(&split_listen(&studio.prefs.server.listen).0),
+            server_local: is_loopback(&split_listen(&server_prefs.listen).0),
             disk: {
                 let on_disk: Vec<&ModelState> = installed(&self.transcribers)
                     .into_iter()
@@ -1006,9 +1346,18 @@ impl SettingsPane {
             },
             version: env!("CARGO_PKG_VERSION").into(),
             update_status: self.update_status.as_str().into(),
-            checking: self.checking,
+            auto_updates: studio.live_enabled && cfg!(target_os = "macos"),
+            skill_version: self
+                .installed_skill
+                .as_ref()
+                .map(|skill| skill.version.to_string())
+                .unwrap_or_else(|| "Из каталога Codex".into())
+                .into(),
+            skill_update_status: self.skill_status.as_str().into(),
+            checking: self.checking || self.checking_skill,
             version_choice: self.version_choice as i32,
             installing: self.install.is_some(),
+            can_cancel_install: !self.applying,
             install_progress: match self.install {
                 Some((fetched, total)) if total > 0.0 => (fetched / total).min(1.0),
                 _ => 0.0,
@@ -1061,28 +1410,38 @@ fn fixed_note(why: Fixed) -> String {
 /// can be started by hand.
 /// Saves, quits and starts Concat again on `project`; see
 /// `updates::restart`. A save that fails keeps the window, as any close.
-pub(crate) fn restart(project: Option<std::path::PathBuf>) {
-    log::info!("close: restarting for a setting read at launch");
-    quit_for_switch(move || {
-        if let Err(error) = updates::restart(project.as_deref()) {
+pub(crate) fn restart(_project: Option<std::path::PathBuf>) {
+    log::info!("close: restarting Concat Live");
+    quit_for_switch(move |project, roots| {
+        if let Err(error) = updates::restart_with_roots(project.as_deref(), &roots) {
             log::warn!("restart: could not start Concat again: {error}");
         }
     });
 }
 
-fn quit_for_switch(after: impl FnOnce() + Send + 'static) {
+fn quit_for_switch(after: impl FnOnce(Option<PathBuf>, Vec<PathBuf>) + Send + 'static) {
     on_ui(move |studio, app, models| {
+        if crate::host::native_dialog_open() || studio.busy_for_update() {
+            slint::Timer::single_shot(Duration::from_millis(250), move || quit_for_switch(after));
+            return;
+        }
         log::info!("close: quitting for a version switch");
+        let project = studio
+            .session
+            .as_ref()
+            .map(|session| PathBuf::from(session.path()));
+        let roots = studio.settings.server_roots(studio.live_enabled);
         studio.save_layout(slint::ComponentHandle::window(app));
         let outcome = close_window(
             || studio.close_project(),
             || {
-                after();
+                after(project, roots);
                 slint::ComponentHandle::window(app).hide().ok();
                 slint::quit_event_loop().ok();
             },
         );
         if let Err(error) = outcome {
+            crate::agent::resume_after_update();
             log::warn!("close: not switching, project could not be saved: {error}");
             studio.offer_quit_without_saving(error);
             studio.refresh_art();
@@ -1123,6 +1482,121 @@ pub fn new_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_updates_skip_current_older_cancelled_and_inflight_versions() {
+        let mut pane = SettingsPane::default();
+        let release = |patch| Release {
+            version: Version::new(0, 3, patch),
+            tag: format!("v0.3.{patch}"),
+            published: String::new(),
+        };
+        pane.releases = vec![release(2), release(1), release(0)];
+        assert_eq!(pane.automatic_release(Version::new(0, 3, 0)), Some(0));
+        pane.skipped_version = Some(Version::new(0, 3, 2));
+        assert_eq!(pane.automatic_release(Version::new(0, 3, 0)), None);
+        assert_eq!(pane.automatic_release(Version::new(0, 3, 1)), None);
+        pane.install = Some((1.0, 2.0));
+        assert_eq!(pane.automatic_release(Version::new(0, 2, 0)), None);
+        pane.install = None;
+        pane.applying = true;
+        assert_eq!(pane.automatic_release(Version::new(0, 2, 0)), None);
+        pane.applying = false;
+        assert_eq!(pane.automatic_release(Version::new(0, 4, 0)), None);
+    }
+
+    #[test]
+    fn live_automation_changes_never_enter_saved_preferences() {
+        let mut prefs = prefs::Preferences::default();
+        let before = serde_json::to_value(&prefs).expect("serializes preferences");
+        let mut pane = SettingsPane::for_live();
+        let server = pane.server_prefs_mut(&mut prefs);
+        assert!(server.enabled);
+        assert_eq!(server.listen, "127.0.0.1:0");
+        assert!(server.token.is_empty());
+        server.enabled = false;
+        server.listen = "127.0.0.1:7654".to_owned();
+        assert_eq!(
+            serde_json::to_value(&prefs).expect("serializes preferences"),
+            before
+        );
+        assert!(!pane.server_prefs(&prefs).enabled);
+        assert_eq!(pane.server_prefs(&prefs).listen, "127.0.0.1:7654");
+    }
+
+    #[test]
+    fn a_chosen_live_workspace_replaces_default_roots_without_enabling_automation() {
+        let mut prefs = prefs::Preferences::default();
+        let before = serde_json::to_value(&prefs).expect("serializes preferences");
+        let mut pane = SettingsPane::for_live();
+        assert_eq!(pane.live_workspace(), None);
+        let configured = std::env::var_os("CONCAT_MCP_ROOTS")
+            .filter(|paths| !paths.is_empty())
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert_eq!(pane.server_roots(true), configured);
+        assert!(pane.server_roots(false).is_empty());
+
+        pane.server_prefs_mut(&mut prefs).enabled = false;
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let canonical = directory.canonicalize().expect("an existing directory");
+        pane.select_live_workspace(true, directory.join("."))
+            .expect("accepts an existing directory");
+        assert_eq!(pane.live_workspace(), Some(canonical.as_path()));
+        assert_eq!(pane.server_roots(true), vec![canonical]);
+        assert!(pane.server_roots(false).is_empty());
+        assert!(!pane.server_prefs(&prefs).enabled);
+        assert_eq!(
+            serde_json::to_value(&prefs).expect("serializes preferences"),
+            before
+        );
+    }
+
+    #[test]
+    fn a_live_workspace_replaces_the_previous_choice_and_rejects_invalid_paths() {
+        let mut pane = SettingsPane::for_live();
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+        pane.select_live_workspace(true, directory.to_path_buf())
+            .expect("accepts an existing directory");
+        let selected = directory
+            .join("src")
+            .canonicalize()
+            .expect("source directory");
+        pane.select_live_workspace(true, selected.clone())
+            .expect("replaces the previous workspace");
+        assert_eq!(pane.server_roots(true), vec![selected.clone()]);
+
+        let file = directory.join("Cargo.toml");
+        for invalid in [file.clone(), file.join("not-a-directory")] {
+            let error = pane
+                .select_live_workspace(true, invalid)
+                .expect_err("a file and a missing path cannot be workspaces");
+            assert!(!error.is_empty());
+            assert_eq!(pane.live_workspace(), Some(selected.as_path()));
+            assert_eq!(pane.server_roots(true), vec![selected.clone()]);
+        }
+        assert!(
+            pane.select_live_workspace(false, directory.to_path_buf())
+                .is_err()
+        );
+        assert_eq!(pane.live_workspace(), Some(selected.as_path()));
+        let mut normal = SettingsPane::default();
+        assert!(
+            normal
+                .select_live_workspace(false, directory.to_path_buf())
+                .is_err()
+        );
+        assert_eq!(normal.live_workspace(), None);
+    }
+
+    #[test]
+    fn normal_automation_still_edits_saved_preferences() {
+        let mut prefs = prefs::Preferences::default();
+        let mut pane = SettingsPane::default();
+        pane.server_prefs_mut(&mut prefs).enabled = true;
+        assert!(prefs.server.enabled);
+        assert!(pane.server_prefs(&prefs).enabled);
+    }
 
     #[test]
     fn a_token_is_thirty_two_hex_digits_and_never_the_same_twice() {

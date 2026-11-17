@@ -21,10 +21,10 @@
 
 use std::path::{Path, PathBuf};
 
-/// The app identifier, which is also the folder name everywhere. Every
-/// release so far has used it; a phone treats a new one as another app,
-/// so it changes only with a domain of the project's own behind it.
-pub const IDENTIFIER: &str = "app.concat.editor";
+/// The fork has its own settings, recents and automation discovery.
+pub const IDENTIFIER: &str = "ru.steel0rat.concat-live";
+
+const UPSTREAM_IDENTIFIER: &str = "app.concat.editor";
 
 /// The identifier builds of `main` used between 2026-10-26 and
 /// 2026-11-04, never released. Those builds moved the folder to it and
@@ -52,8 +52,10 @@ impl AppDirs {
         let convention = convention(std::env::consts::OS);
         if convention == Convention::Apple {
             let dirs = apple(&home()?, cfg!(target_os = "ios"));
-            adopt(&dirs.config);
-            adopt(&dirs.data);
+            if IDENTIFIER == UPSTREAM_IDENTIFIER {
+                adopt(&dirs.config);
+                adopt(&dirs.data);
+            }
             Ok(dirs)
         } else if convention == Convention::Windows {
             let config = std::env::var_os("APPDATA")
@@ -63,8 +65,10 @@ impl AppDirs {
             let data = std::env::var_os("LOCALAPPDATA")
                 .map(PathBuf::from)
                 .map_or_else(|| config.clone(), |base| base.join(IDENTIFIER));
-            adopt(&config);
-            adopt(&data);
+            if IDENTIFIER == UPSTREAM_IDENTIFIER {
+                adopt(&config);
+                adopt(&data);
+            }
             move_data(&config, &data);
             Ok(AppDirs { config, data })
         } else {
@@ -88,8 +92,10 @@ impl AppDirs {
                 config: config_base.join(IDENTIFIER),
                 data: data_base.join(IDENTIFIER),
             };
-            adopt(&dirs.config);
-            adopt(&dirs.data);
+            if IDENTIFIER == UPSTREAM_IDENTIFIER {
+                adopt(&dirs.config);
+                adopt(&dirs.data);
+            }
             Ok(dirs)
         }
     }

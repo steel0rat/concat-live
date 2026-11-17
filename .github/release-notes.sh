@@ -6,12 +6,6 @@
 # Writes markdown to stdout: what changed, what to know before installing,
 # then how to download each bundle and the checksum file.
 #
-# "Before you install" says what the pipeline could not vouch for, so a
-# release never reads as more checked than it was. The caller says which:
-# WINDOWS_SIGNED=false when no certificate signed the Windows bundles, and
-# ANDROID_STARTED=false when no launch check got as far as the APK's own
-# code.
-#
 # What changed is the subjects of the commits between the two refs,
 # filtered as follows.
 #
@@ -35,7 +29,7 @@ set -euo pipefail
 since="$1"
 until="$2"
 version="$3"
-title="Concat $version"
+title="Concat Live $version"
 
 # A conventional-commit type, with its optional (scope) and breaking `!`.
 type='^[a-z0-9]+(\([^)]*\))?!?: '
@@ -81,31 +75,15 @@ if [ -n "$changes" ]; then
   echo "$changes"
   echo
 fi
-caveats=()
-if [ "${WINDOWS_SIGNED:-true}" = false ]; then
-  caveats+=("- **Windows:** this release is not code-signed yet. SmartScreen asks before it runs: **More info** › **Run anyway**. Where Smart App Control is on, Windows refuses unsigned programs; see the [code signing policy](https://github.com/jub0t/concat/blob/main/CODE_SIGNING.md).")
-fi
-if [ "${ANDROID_STARTED:-true}" = false ]; then
-  caveats+=("- **Android:** no automated check has started this APK: CI's emulators run x86_64 and it is built for arm64. If it does not open on your phone, [say so](https://github.com/jub0t/concat/issues).")
-fi
-if [ "${#caveats[@]}" -gt 0 ]; then
-  echo "### Before you install"
-  echo
-  printf '%s\n' "${caveats[@]}"
-  echo
-fi
 cat <<'MD'
 ### Download
 
-A self-contained build for every platform Concat ships on.
+Concat Live for macOS. Choose the package for your Mac.
 
-| | Apple silicon | Intel / x86_64 | arm64 |
-|---|---|---|---|
-| macOS | `macos-arm64.dmg` | `macos-x86_64.dmg` | |
-| Windows | | `windows-x86_64-setup.exe`, `.msi` | |
-| Linux | | `linux-x86_64.deb`, `.rpm`, `x86_64.AppImage` | `linux-aarch64.deb`, `.rpm`, `aarch64.AppImage` |
-| Android | | | `android-arm64.apk` |
-| iOS / iPadOS | | | `ios-arm64.ipa` |
+| Apple silicon | Intel |
+|---|---|
+| `macos-arm64.dmg` | `macos-x86_64.dmg` |
 
-`SHA256SUMS` lists each file's checksum.
+The application inside the disk image is `Concat Live.app`.
+`manifest.json` describes the packages; `SHA256SUMS` lists their checksums.
 MD

@@ -73,11 +73,24 @@ fn main() -> Result<(), slint::PlatformError> {
         .inspect_err(concat::report_startup_failure)?;
     match launch {
         Launch::Normal(project) => {
-            concat::run_with_project(project).inspect_err(concat::report_startup_failure)
+            let result = if cfg!(any(target_os = "android", target_os = "ios")) {
+                concat::run_with_project(project)
+            } else {
+                concat::run_with_live(project)
+            };
+            result.inspect_err(concat::report_startup_failure)
+        }
+        Launch::Live(project) => {
+            concat::run_with_live(project).inspect_err(concat::report_startup_failure)
         }
         Launch::Software => {
             concat::draw_in_software();
-            concat::run_with_project(None).inspect_err(concat::report_startup_failure)
+            let result = if cfg!(any(target_os = "android", target_os = "ios")) {
+                concat::run_with_project(None)
+            } else {
+                concat::run_with_live(None)
+            };
+            result.inspect_err(concat::report_startup_failure)
         }
         // Logged and returned, never put up in a dialog: a smoke run is a
         // machine's, and a modal box with nobody to press OK would hang it

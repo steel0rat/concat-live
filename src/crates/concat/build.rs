@@ -5,6 +5,7 @@
 //! the build for Settings > About.
 
 fn main() {
+    compile_dictation();
     // Fonts and images are compiled into the binary rather than read off disk
     // at run time.
     //
@@ -153,4 +154,86 @@ fn main() {
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=BUILD_RUSTC={version}");
+}
+
+fn compile_dictation() {
+    println!("cargo:rustc-check-cfg=cfg(concat_dictation_qa)");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    let source = "src/agent/dictation/apple_speech.swift";
+    println!("cargo:rerun-if-changed={source}");
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+    println!("cargo:rerun-if-env-changed=SDKROOT");
+
+    let tool = |arguments: &[&str]| {
+        let output = std::process::Command::new("/usr/bin/xcrun")
+            .args(arguments)
+            .output()
+            .expect("Apple dictation requires Xcode 26 or Command Line Tools 26");
+        assert!(
+            output.status.success(),
+            "could not find the Apple dictation toolchain: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("Apple toolchain path is UTF-8")
+            .trim()
+            .to_owned()
+    };
+    let compiler = std::path::PathBuf::from(tool(&["--find", "swiftc"]));
+    let sdk = std::path::PathBuf::from(tool(&["--show-sdk-path"]));
+    let runtime = compiler
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Swift compiler is in its toolchain's bin folder")
+        .join("lib/swift/macosx");
+    let output = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("out dir"));
+    let deployment = std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "12.0".into());
+    let architecture = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        Ok("x86_64") => "x86_64",
+        other => panic!("unsupported Apple dictation architecture: {other:?}"),
+    };
+    let target = format!("{architecture}-apple-macosx{deployment}");
+    let compiled = std::process::Command::new(compiler)
+        .args([
+            "-swift-version",
+            "6",
+            "-warnings-as-errors",
+            "-parse-as-library",
+            "-emit-library",
+            "-static",
+            "-O",
+            "-module-name",
+            "ConcatDictation",
+            "-target",
+            &target,
+            "-sdk",
+        ])
+        .arg(&sdk)
+        .arg("-module-cache-path")
+        .arg(output.join("swift-modules"))
+        .arg(source)
+        .arg("-o")
+        .arg(output.join("libconcat_dictation.a"))
+        .output()
+        .expect("could not run the Swift compiler for Apple dictation");
+    assert!(
+        compiled.status.success(),
+        "Apple dictation requires a macOS 26 SDK and Swift 6.2 or newer: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    println!("cargo:rustc-link-search=native={}", output.display());
+    println!("cargo:rustc-link-search=native={}", runtime.display());
+    println!("cargo:rustc-link-search=native=/usr/lib/swift");
+    println!(
+        "cargo:rustc-link-search=framework={}",
+        sdk.join("System/Library/Frameworks").display()
+    );
+    println!("cargo:rustc-link-lib=static=concat_dictation");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+    println!("cargo:rustc-link-arg=-mmacosx-version-min={deployment}");
 }

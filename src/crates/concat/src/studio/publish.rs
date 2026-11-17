@@ -20,6 +20,15 @@ impl Studio {
     // ── publishing ──
 
     pub fn publish(&self, app: &App, models: &Models) {
+        if self.live_enabled {
+            crate::agent::set_context(
+                self.session
+                    .as_ref()
+                    .map(|session| std::path::PathBuf::from(session.path())),
+                &self.project_name,
+                crate::host::project_epoch(),
+            );
+        }
         // The tray's three menu labels and the tooltips' bare-letter
         // hints, spelled from the keymap so a rebind moves the words
         // with the key. An action left unbound shows an em dash rather

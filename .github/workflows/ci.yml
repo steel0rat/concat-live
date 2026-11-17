@@ -63,6 +63,8 @@ jobs:
       # the two saying the same thing. See models/manifest.toml.
       - run: python3 scripts/models.py --check
         if: ${{ !cancelled() }}
+      - run: python3 -B scripts/test_models_release.py
+        if: ${{ !cancelled() }}
 
   engine:
     name: Engine tests and lints
@@ -263,7 +265,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
+          - os: macos-26
             verb: Compiles
           - os: windows-2022
             verb: Tests

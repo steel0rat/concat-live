@@ -1,0 +1,499 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Concat contributors
+
+import { Theme } from "../theme/theme.slint";
+import { Glyph, Icon } from "../icons.slint";
+import { IconButton } from "../primitives/panel.slint";
+import { Select } from "../primitives/select.slint";
+import { LevelMeter } from "../primitives/level-meter.slint";
+import { Button } from "../primitives/modal.slint";
+import { ResizeBox } from "../primitives/resize-box.slint";
+import { ThinScrollbar } from "../primitives/scrollbar.slint";
+import { Pane, PaneHeader } from "pane.slint";
+import { PaneKind, PaneSwitcher } from "pane-switcher.slint";
+
+export struct AgentMessageData {
+    id: string,
+    role: string,
+    text: string,
+    streaming: bool,
+    failed: bool,
+}
+
+export struct AgentApprovalData {
+    id: string,
+    title: string,
+    detail: string,
+}
+
+export global Agent {
+    in property <bool> enabled;
+    in property <[AgentMessageData]> messages;
+    in property <[AgentApprovalData]> approvals;
+    in-out property <string> draft;
+    in property <bool> busy;
+    in property <bool> maintenance;
+    in property <string> status: "Describe what you want to create or edit";
+    in property <string> error;
+    in property <string> project-name;
+    in property <bool> has-project;
+    in property <string> workspace-path;
+    in property <bool> dictation-available;
+    /// 0 idle, 1 preparing, 2 recording, 3 finishing.
+    in property <int> dictation-phase;
+    in property <string> dictation-status;
+    in property <string> dictation-preview;
+    in property <string> dictation-error;
+    in property <float> dictation-level;
+    in property <int> dictation-seconds;
+    in-out property <string> dictation-language: "ru-RU";
+    callback dictation-start();
+    callback dictation-stop();
+    callback dictation-cancel();
+    callback choose-workspace();
+    callback draft-edited(text: string);
+    callback submitted();
+    callback interrupt();
+    callback new-thread();
+    callback reconnect();
+    callback approval(id: string, accepted: bool);
+}
+
+component AgentWords inherits TextInput {
+    min-width: 0px;
+    color: Theme.fg;
+    font-size: Theme.fs-lg;
+    read-only: true;
+    single-line: false;
+    wrap: word-wrap;
+    selection-background-color: Theme.accent;
+    selection-foreground-color: Theme.on-accent;
+}
+
+// Bound transient speech and errors so the composer stays inside the pane.
+component AgentTextViewport inherits Flickable {
+    in property <string> value;
+    in property <brush> ink: Theme.fg;
+    in property <bool> follow-end;
+    min-width: 0px;
+    min-height: 0px;
+    max-height: 72px;
+    preferred-height: Math.min(72px, words.preferred-height);
+    vertical-stretch: 0;
+    interactive: false;
+    content-width: self.width;
+    content-height: Math.max(self.height, words.preferred-height);
+    changed content-height => {
+        if (root.follow-end) {
+            self.content-y = Math.min(0px, self.height - self.content-height);
+        }
+    }
+    words := AgentWords {
+        width: root.width;
+        height: self.preferred-height;
+        text: root.value;
+        color: root.ink;
+        font-size: Theme.fs;
+        wrap: word-wrap;
+    }
+    ThinScrollbar {
+        x: parent.width - self.width - 1px;
+        y: -root.content-y;
+        height: root.height;
+        viewport: root.height;
+        content: root.content-height;
+        offset: -root.content-y;
+        scrolled(to) => { root.content-y = -to; }
+    }
+}
+
+export component AgentChat inherits Rectangle {
+    min-width: 0px;
+    min-height: 0px;
+    max-height: 100000px;
+    preferred-height: 0px;
+    vertical-stretch: 1;
+    clip: true;
+    property <int> voice-phase: Agent.dictation-phase;
+    property <bool> had-dictation;
+    changed voice-phase => {
+        if (root.voice-phase != 0) {
+            root.had-dictation = true;
+        } else if (root.had-dictation) {
+            root.had-dictation = false;
+            input.focus();
+            input.set-selection-offsets(1000000000, 1000000000);
+        }
+    }
+
+    VerticalLayout {
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 8px;
+            padding-bottom: 6px;
+            spacing: 6px;
+            Text {
+                text: Agent.has-project ? Agent.project-name : "Working folder";
+                min-width: 0px;
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Button {
+                label: "New chat";
+                ghost: true;
+                enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
+                clicked => { Agent.new-thread(); }
+            }
+            Button {
+                label: "Reconnect";
+                ghost: true;
+                enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
+                clicked => { Agent.reconnect(); }
+            }
+        }
+
+        if !Agent.has-project: HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-bottom: 6px;
+            spacing: 6px;
+            Text {
+                text: Agent.workspace-path == "" ? "Choose a working folder" : Agent.workspace-path;
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                min-width: 0px;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Button {
+                label: "Choose folder";
+                ghost: true;
+                enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
+                clicked => { Agent.choose-workspace(); }
+            }
+        }
+
+        transcript := Flickable {
+            min-width: 0px;
+            min-height: 0px;
+            preferred-height: 0px;
+            vertical-stretch: 1;
+            interactive: false;
+            content-width: self.width;
+            content-height: Math.max(self.height, history.preferred-height);
+            property <length> previous-height;
+            changed content-height => {
+                if (-self.content-y + self.height >= self.previous-height - 24px) {
+                    self.content-y = Math.min(0px, self.height - self.content-height);
+                }
+                self.previous-height = self.content-height;
+            }
+            history := VerticalLayout {
+                width: transcript.width;
+                padding: 12px;
+                spacing: 12px;
+                alignment: start;
+                if Agent.messages.length == 0: Text {
+                    text: Agent.has-project
+                        ? "Describe the edit you want. Codex works on the project visible in this window."
+                        : "Describe the video you want to make. Codex works in the selected folder.";
+                    color: Theme.fg-muted;
+                    font-size: Theme.fs-lg;
+                    wrap: word-wrap;
+                }
+                for message in Agent.messages: Rectangle {
+                    min-height: message-body.preferred-height;
+                    background: message.role == "You" ? Theme.field : Colors.transparent;
+                    border-radius: Theme.r;
+                    message-body := VerticalLayout {
+                        padding: 8px;
+                        spacing: 5px;
+                        Text {
+                            text: message.role + (message.streaming ? " · …" : "");
+                            color: message.failed ? Theme.danger : message.role == "You" ? Theme.accent : Theme.fg-muted;
+                            font-size: Theme.fs-sm;
+                            font-weight: Theme.weight-title;
+                        }
+                        AgentWords {
+                            text: message.text;
+                            color: message.failed ? Theme.danger : Theme.fg;
+                        }
+                    }
+                }
+            }
+            ThinScrollbar {
+                x: parent.width - self.width - 1px;
+                y: -transcript.content-y;
+                height: transcript.height;
+                viewport: transcript.height;
+                content: transcript.content-height;
+                offset: -transcript.content-y;
+                scrolled(to) => { transcript.content-y = -to; }
+            }
+        }
+
+        if Agent.approvals.length > 0: approvals := Flickable {
+            min-height: 0px;
+            preferred-height: Math.min(140px, requests.preferred-height);
+            max-height: 260px;
+            vertical-stretch: 0;
+            interactive: false;
+            content-height: requests.preferred-height;
+            content-width: self.width;
+            requests := VerticalLayout {
+                width: parent.width;
+                padding: 12px;
+                spacing: 8px;
+                for request in Agent.approvals: Rectangle {
+                    min-height: request-body.preferred-height;
+                    background: Theme.accent-soft;
+                    border-radius: Theme.r;
+                    request-body := VerticalLayout {
+                        padding: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: request.title;
+                            color: Theme.fg;
+                            font-size: Theme.fs-lg;
+                            font-weight: Theme.weight-title;
+                            wrap: word-wrap;
+                        }
+                        AgentWords { text: request.detail; }
+                        HorizontalLayout {
+                            alignment: end;
+                            spacing: 8px;
+                            Button {
+                                label: "Deny";
+                                clicked => { Agent.approval(request.id, false); }
+                            }
+                            Button {
+                                label: "Allow once";
+                                primary: true;
+                                clicked => { Agent.approval(request.id, true); }
+                            }
+                        }
+                    }
+                }
+            }
+            ThinScrollbar {
+                x: parent.width - self.width - 1px;
+                y: -approvals.content-y;
+                height: approvals.height;
+                viewport: approvals.height;
+                content: approvals.content-height;
+                offset: -approvals.content-y;
+                scrolled(to) => { approvals.content-y = -to; }
+            }
+        }
+
+        VerticalLayout {
+            padding: Agent.dictation-phase != 0 ? 8px : 12px;
+            spacing: Agent.dictation-phase != 0 ? 6px : 8px;
+            if Agent.error != "": chat-error-view := AgentTextViewport {
+                value: Agent.error;
+                ink: Theme.danger;
+            }
+            if Agent.dictation-phase == 0: Text {
+                text: !Agent.enabled ? "Chat is available in Live mode" : Agent.maintenance ? "Installing update…" : Agent.status;
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+            if Agent.dictation-phase != 0: VerticalLayout {
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            glyph: Glyph.mic;
+                            size: 14px;
+                            tint: Agent.dictation-phase == 2 ? Theme.danger : Theme.fg-muted;
+                        }
+                    }
+                    Text {
+                        text: Agent.dictation-status != "" ? Agent.dictation-status
+                            : Agent.dictation-phase == 1 ? "Preparing voice input…"
+                            : Agent.dictation-phase == 2 ? "Listening…" : "Finishing dictation…";
+                        min-width: 0px;
+                        horizontal-stretch: 1;
+                        color: Agent.dictation-phase == 2 ? Theme.fg : Theme.fg-muted;
+                        font-size: Theme.fs;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: Agent.dictation-seconds + " s";
+                        color: Theme.fg-muted;
+                        font-size: Theme.fs;
+                        vertical-alignment: center;
+                    }
+                }
+                if Agent.dictation-phase == 2: LevelMeter {
+                    value: Agent.dictation-level;
+                    min-height: 6px;
+                    max-height: 6px;
+                    preferred-height: 6px;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    if Agent.dictation-phase == 2: dictation-stop-button := Button {
+                        label: "Stop";
+                        clicked => { Agent.dictation-stop(); }
+                    }
+                    dictation-cancel-button := Button {
+                        label: "Cancel";
+                        ghost: true;
+                        clicked => { Agent.dictation-cancel(); }
+                    }
+                }
+            }
+            if Agent.dictation-preview != "" && (Agent.dictation-phase != 0 || Agent.dictation-error != ""): dictation-preview-view := AgentTextViewport {
+                min-height: 16px;
+                value: Agent.dictation-preview;
+                follow-end: true;
+            }
+            if Agent.dictation-error != "": dictation-error-view := AgentTextViewport {
+                value: Agent.dictation-error;
+                ink: Theme.danger;
+            }
+            composer-frame := Rectangle {
+                min-width: 0px;
+                min-height: composer.min-box;
+                max-height: composer.max-box;
+                vertical-stretch: 0;
+                preferred-height: Math.clamp(composer.box-height, composer.min-box, composer.max-box);
+                changed height => {
+                    if (input.has-focus) {
+                        input.set-selection-offsets(input.anchor-position-byte-offset, input.cursor-position-byte-offset);
+                    }
+                }
+                composer := ResizeBox {
+                    width: parent.width;
+                    height: parent.height;
+                    box-height: 86px;
+                    min-box: 40px;
+                    max-box: 240px;
+                    content-height: input.preferred-height;
+                    focused: input.has-focus;
+                    input := TextInput {
+                        y: composer.pad-y;
+                        // The viewport must follow the frame, never the text's implicit width.
+                        width: Math.max(0px, composer.width - 2 * composer.pad-x);
+                        height: Math.max(self.preferred-height, composer.view-height);
+                        text <=> Agent.draft;
+                        read-only: Agent.maintenance;
+                        color: Theme.fg;
+                        font-size: Theme.fs-lg;
+                        single-line: false;
+                        wrap: word-wrap;
+                        selection-background-color: Theme.accent;
+                        selection-foreground-color: Theme.on-accent;
+                        edited => { Agent.draft-edited(self.text); }
+                        cursor-position-changed(at) => { composer.reveal(at.y, self.font-size * 1.4); }
+                        // Reflow changes the caret's visual line without moving its byte offset.
+                        changed width => {
+                            if (self.has-focus) {
+                                self.set-selection-offsets(self.anchor-position-byte-offset, self.cursor-position-byte-offset);
+                            }
+                        }
+                        changed height => {
+                            if (self.has-focus) {
+                                self.set-selection-offsets(self.anchor-position-byte-offset, self.cursor-position-byte-offset);
+                            }
+                        }
+                        key-pressed(event) => {
+                            if (event.text == Key.Return && (event.modifiers.control || event.modifiers.meta)) {
+                                if (Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0 && Agent.draft != "") {
+                                    Agent.submitted();
+                                }
+                                return accept;
+                            }
+                            if (event.text == Key.Home) {
+                                self.set-selection-offsets(0, 0);
+                                return accept;
+                            }
+                            if (event.text == Key.End) {
+                                self.set-selection-offsets(1000000000, 1000000000);
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                    if Agent.draft == "" && !input.has-focus: Text {
+                        y: composer.pad-y;
+                        text: "Ask Codex…";
+                        color: Theme.fg-dim;
+                        font-size: Theme.fs-lg;
+                    }
+                }
+            }
+            if Agent.busy && Agent.dictation-phase == 0: HorizontalLayout {
+                alignment: end;
+                Button {
+                    label: "Interrupt";
+                    clicked => { Agent.interrupt(); }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                if Agent.dictation-available && Agent.dictation-phase == 0: dictation-language-picker := Select {
+                    options: ["Русский", "English"];
+                    current: Agent.dictation-language == "en-US" ? 1 : 0;
+                    width: 84px;
+                    enabled: Agent.enabled && !Agent.maintenance;
+                    changed(index) => {
+                        Agent.dictation-language = index == 1 ? "en-US" : "ru-RU";
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                if Agent.busy && Agent.dictation-phase != 0: Button {
+                    label: "Interrupt";
+                    clicked => { Agent.interrupt(); }
+                }
+                dictation-microphone := IconButton {
+                    glyph: Glyph.mic;
+                    label: Agent.dictation-available
+                        ? "Dictate a message"
+                        : "Voice input requires macOS 26 or later";
+                    enabled: Agent.enabled && !Agent.maintenance && Agent.dictation-available && Agent.dictation-phase == 0;
+                    clicked => { Agent.dictation-start(); input.focus(); }
+                }
+                Button {
+                    label: "Send";
+                    primary: true;
+                    enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0 && Agent.draft != "";
+                    clicked => { Agent.submitted(); }
+                }
+            }
+        }
+    }
+}
+
+export component AgentPane inherits Pane {
+    in property <int> pane-seat;
+    in property <bool> pane-removable: true;
+    callback pane-picked(kind: PaneKind);
+    callback pane-removed();
+
+    PaneHeader {
+        title: "Codex";
+        VerticalLayout {
+            alignment: center;
+            PaneSwitcher {
+                kind: PaneKind.agent;
+                seat: root.pane-seat;
+                removable: root.pane-removable;
+                picked(kind) => { root.pane-picked(kind); }
+                removed => { root.pane-removed(); }
+            }
+        }
+    }
+    AgentChat { }
+}

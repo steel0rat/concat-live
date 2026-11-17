@@ -84,6 +84,8 @@ import { CaptionStyles } from "dialogs/captions.slint";
 import { Meters } from "timeline/vu-meter.slint";
 import { MotionPose, MotionTile, MotionTiles } from "inspector/motion-picker.slint";
 import { Workspace } from "workspace/workspace.slint";
+import { Agent, AgentChat, AgentMessageData, AgentApprovalData } from "workspace/agent.slint";
+import { Pane, PaneHeader } from "workspace/pane.slint";
 import {
     Backdrop,
     BackdropData,
@@ -133,6 +135,10 @@ export {
     DockDivider,
     DockSide,
     PaneKind,
+    Panes,
+    Agent,
+    AgentMessageData,
+    AgentApprovalData,
     SeatBox,
     EffectData,
     FontSearch,
@@ -189,7 +195,7 @@ export {
     NewVoiceData,
 }
 export component App inherits Window {
-    title: "Concat";
+    title: Panes.agent-enabled ? "Concat Live" : "Concat";
     // The taskbar's and Alt-Tab's picture on Windows, and the window
     // list's on X11. A Mac takes its Dock icon from the bundle and ignores
     // this; the .exe's own, for Explorer, is embedded by build.rs.
@@ -754,29 +760,47 @@ export component App inherits Window {
                 export-clicked => { root.export-clicked(); }
             }
 
-            if root.on-start: StartScreen {
+            if root.on-start: HorizontalLayout {
                 vertical-stretch: 1;
+                spacing: Agent.enabled && !root.phone ? 10px : 0px;
+                padding-right: Agent.enabled && !root.phone ? 10px : 0px;
+                StartScreen {
+                    horizontal-stretch: 1;
+                    min-width: 0px;
 
-                recents: root.recents;
-                recents-total: root.recents-total;
-                query: root.start.query;
-                sort: root.start.sort;
-                busy: root.start.busy;
-                phone: root.phone;
-                version: root.app-version;
-                can-drop: root.can-drop;
-                capcut: root.capcut;
+                    recents: root.recents;
+                    recents-total: root.recents-total;
+                    query: root.start.query;
+                    sort: root.start.sort;
+                    busy: root.start.busy;
+                    phone: root.phone;
+                    version: root.app-version;
+                    can-drop: root.can-drop;
+                    capcut: root.capcut;
 
-                compose => { root.start-compose(); }
-                open => { root.start-open(); }
-                import-capcut => { root.start-import-capcut(); }
-                open-settings => { root.open-settings(); }
-                open-recent(path) => { root.start-open-recent(path); }
-                forget-recent(path) => { root.start-forget-recent(path); }
-                reveal-recent(path) => { root.start-reveal-recent(path); }
-                search-edited(query) => { root.start-search-edited(query); }
-                sort-changed(sort) => { root.start-sort-changed(sort); }
-                link(name) => { root.start-link(name); }
+                    compose => { root.start-compose(); }
+                    open => { root.start-open(); }
+                    import-capcut => { root.start-import-capcut(); }
+                    open-settings => { root.open-settings(); }
+                    open-recent(path) => { root.start-open-recent(path); }
+                    forget-recent(path) => { root.start-forget-recent(path); }
+                    reveal-recent(path) => { root.start-reveal-recent(path); }
+                    search-edited(query) => { root.start-search-edited(query); }
+                    sort-changed(sort) => { root.start-sort-changed(sort); }
+                    link(name) => { root.start-link(name); }
+                }
+
+                if Agent.enabled && !root.phone: Pane {
+                    preferred-width: 360px;
+                    min-width: 320px;
+                    max-width: 460px;
+                    horizontal-stretch: 0;
+                    PaneHeader { title: "Codex"; }
+                    AgentChat {
+                        min-width: 0px;
+                        vertical-stretch: 1;
+                    }
+                }
             }
 
             // Everything the workspace shows now reads the Editor global, so

@@ -42,8 +42,8 @@ name: Build app
 # - Every prebuilt dependency downloaded here is pinned to one file and its
 #   digest in scripts/ci/deps.lock, and every action to a commit.
 #
-# The six targets are a matrix so one fails without taking the rest down;
-# `fail-fast` is off for the same reason.
+# A caller may restrict the matrix to the two macOS packages. Other callers
+# retain the desktop targets, with fail-fast disabled.
 on:
   workflow_call:
     inputs:
@@ -51,6 +51,10 @@ on:
         description: The ref to build, when it is not the one this runs on
         type: string
         default: ""
+      macos_only:
+        description: Build only the macOS packages published by Concat Live
+        type: boolean
+        default: false
     secrets:
       APPLE_CERTIFICATE_P12:
         description: Base64 of a Developer ID Application .p12
@@ -114,57 +118,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # `ffmpeg` and `ort` name the target the way each project's
-          # release archives do.
-          - platform: macos
-            arch: arm64
-            os: macos-15
-            target: aarch64-apple-darwin
-          - platform: macos
-            arch: x86_64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            # No `ggml` row: built as 0.2.7 was, with no AVX2. This bundle
-            # runs on macOS 12 again, and so on the 2013 Mac Pro, whose Ivy
-            # Bridge has AVX and nothing newer; Intel Macs are about one
-            # download in a hundred, and slower captions there beat a crash.
-          # 22.04, not latest: the binary links the build machine's glibc,
-          # so the oldest supported runner is what keeps it runnable on
-          # older distributions.
-          - platform: linux
-            arch: x86_64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            ffmpeg: linux64
-            ort: x64
-            nfpm: amd64
-            appimage: x86_64
-            ggml: variants
-          - platform: linux
-            arch: aarch64
-            os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            ffmpeg: linuxarm64
-            ort: aarch64
-            nfpm: arm64
-            appimage: aarch64
-          - platform: windows
-            arch: x86_64
-            os: windows-2022
-            target: x86_64-pc-windows-msvc
-            ffmpeg: win64
-            ort: win-x64
-            llvm: win64
-            vc: x64
-            inno: x64compatible
-            wix: x64
-            ggml: variants
-          # No Windows on ARM until its program starts: v0.2.7-rc.4's
-          # concat.exe died with an access violation on `--version` (#326).
-          # Its row was platform windows, arch aarch64, os windows-11-arm,
-          # target aarch64-pc-windows-msvc, ffmpeg winarm64, ort
-          # win-arm64, llvm woa64, vc and inno and wix arm64.
+        include: ${{ fromJSON(inputs.macos_only && '[{"platform":"macos","arch":"arm64","os":"macos-26","target":"aarch64-apple-darwin"},{"platform":"macos","arch":"x86_64","os":"macos-26-intel","target":"x86_64-apple-darwin"}]' || '[{"platform":"macos","arch":"arm64","os":"macos-26","target":"aarch64-apple-darwin"},{"platform":"macos","arch":"x86_64","os":"macos-26-intel","target":"x86_64-apple-darwin"},{"platform":"linux","arch":"x86_64","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","ffmpeg":"linux64","ort":"x64","nfpm":"amd64","appimage":"x86_64","ggml":"variants"},{"platform":"linux","arch":"aarch64","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","ffmpeg":"linuxarm64","ort":"aarch64","nfpm":"arm64","appimage":"aarch64"},{"platform":"windows","arch":"x86_64","os":"windows-2022","target":"x86_64-pc-windows-msvc","ffmpeg":"win64","ort":"win-x64","llvm":"win64","vc":"x64","inno":"x64compatible","wix":"x64","ggml":"variants"}]') }}
     runs-on: ${{ matrix.os }}
     # The slowest target is Intel macOS, whose build alone ran past an hour
     # in v0.2.7-rc.1. The steps that can hang have timeouts of their own,
@@ -230,6 +184,14 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' src/Cargo.toml | head -1)
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building Concat $version for ${{ matrix.target }}"
+
+      - name: Apple dictation toolchain
+        if: matrix.platform == 'macos'
+        run: |
+          set -euo pipefail
+          sdk=$(xcrun --sdk macosx --show-sdk-version)
+          test "${sdk%%.*}" -ge 26
+          xcrun swiftc --version
 
       # ── Linux ──────────────────────────────────────────────────────────
       # Slint's Skia renderer links fontconfig and freetype; cpal links
@@ -523,14 +485,14 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          app=Concat.app
-          rm -rf "$app"
+          app="Concat Live.app"
+          test ! -e "$app"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$app/Contents/Frameworks"
           cp "src/target/${{ matrix.target }}/app/concat" "$app/Contents/MacOS/concat"
 
           # The icon set Apple wants: each size and its @2x twin.
           iconset=Concat.iconset
-          rm -rf "$iconset"; mkdir "$iconset"
+          mkdir "$iconset"
           icons=assets/icons
           cp "$icons/concat_logo_16.png"  "$iconset/icon_16x16.png"
           cp "$icons/concat_logo_32.png"  "$iconset/icon_16x16@2x.png"
@@ -548,9 +510,9 @@ jobs:
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-            <key>CFBundleName</key><string>Concat</string>
-            <key>CFBundleDisplayName</key><string>Concat</string>
-            <key>CFBundleIdentifier</key><string>app.concat.editor</string>
+            <key>CFBundleName</key><string>Concat Live</string>
+            <key>CFBundleDisplayName</key><string>Concat Live</string>
+            <key>CFBundleIdentifier</key><string>ru.steel0rat.concat-live</string>
             <key>CFBundleVersion</key><string>${VERSION}</string>
             <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleExecutable</key><string>concat</string>
@@ -561,7 +523,7 @@ jobs:
             <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
             <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
             <key>NSHumanReadableCopyright</key><string>AGPL-3.0-or-later. See THIRD_PARTY_NOTICES.md.</string>
-            <key>NSMicrophoneUsageDescription</key><string>Concat records voiceovers from your microphone.</string>
+            <key>NSMicrophoneUsageDescription</key><string>Concat uses your microphone for voice dictation and voiceovers.</string>
           </dict>
           </plist>
           PLIST
@@ -619,7 +581,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          app=Concat.app
+          app="Concat Live.app"
           dmg="Concat-${VERSION}-macos-${{ matrix.arch }}.dmg"
           if [ -n "${CERT_P12}" ] && [ -n "${IDENTITY}" ]; then
             keychain=$RUNNER_TEMP/signing.keychain-db
@@ -635,7 +597,7 @@ jobs:
             find "$app/Contents/Frameworks" -name '*.dylib' -exec \
               codesign --force --options runtime --timestamp -s "$IDENTITY" {} \;
             # The hardened runtime keeps the microphone shut unless the app
-            # says it records: the voiceover.
+            # says it records dictation and voiceovers.
             entitlements="$RUNNER_TEMP/concat.entitlements"
             printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
               '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -649,7 +611,7 @@ jobs:
             codesign --force --deep -s - "$app"
           fi
 
-          hdiutil create -volname Concat -srcfolder "$app" -ov -format UDZO "$dmg"
+          hdiutil create -volname "Concat Live" -srcfolder "$app" -format UDZO "$dmg"
 
           if [ -n "${APPLE_ID}" ] && [ -n "${TEAM_ID}" ] && [ -n "${APP_PASSWORD}" ] && [ -n "${IDENTITY}" ]; then
             codesign --force --timestamp -s "$IDENTITY" "$dmg"
@@ -665,7 +627,7 @@ jobs:
       - name: Smoke test (macOS)
         if: matrix.platform == 'macos'
         timeout-minutes: 10
-        run: scripts/ci/smoke-macos.sh Concat.app
+        run: scripts/ci/smoke-macos.sh "Concat Live.app"
 
       # ── Package: Linux ─────────────────────────────────────────────────
       # The binary, the FFmpeg runtime libraries it loads from lib/ beside

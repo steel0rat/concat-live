@@ -374,6 +374,39 @@ pub fn on_ui_in_project(
     on_ui_gated(Some(epoch), body);
 }
 
+thread_local! {
+    static NATIVE_DIALOG_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct NativeDialogScope(std::marker::PhantomData<Rc<()>>);
+
+impl NativeDialogScope {
+    fn enter() -> Self {
+        NATIVE_DIALOG_DEPTH.with(|depth| {
+            depth.set(
+                depth
+                    .get()
+                    .checked_add(1)
+                    .expect("native dialog depth overflow"),
+            );
+        });
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl Drop for NativeDialogScope {
+    fn drop(&mut self) {
+        let _ = NATIVE_DIALOG_DEPTH.try_with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+/// Whether a native picker is pumping the UI's nested event loop.
+pub(crate) fn native_dialog_open() -> bool {
+    NATIVE_DIALOG_DEPTH.with(|depth| depth.get() != 0)
+}
+
 /// Asks a native dialog on the event-loop thread with the studio
 /// unborrowed, and hands its answer to `then` with the studio borrowed,
 /// publishing after. For every file and folder dialog.
@@ -391,7 +424,11 @@ pub fn after_dialog<T: Send + 'static>(
     then: impl FnOnce(&mut Studio, &App, &Models, T) + Send + 'static,
 ) {
     let _ = slint::invoke_from_event_loop(move || {
-        let Some(answer) = ask() else {
+        let answer = {
+            let _dialog = NativeDialogScope::enter();
+            ask()
+        };
+        let Some(answer) = answer else {
             return;
         };
         Shell::with(|shell, app| {
@@ -878,5 +915,45 @@ mod epoch_tests {
             "the project it was made in has closed"
         );
         assert!(!super::stale(Some(super::project_epoch())));
+    }
+}
+
+#[cfg(test)]
+mod native_dialog_tests {
+    use super::*;
+
+    #[test]
+    fn nested_dialog_scopes_remain_busy_until_the_last_one_closes() {
+        assert!(!native_dialog_open());
+        let outer = NativeDialogScope::enter();
+        assert!(native_dialog_open());
+        {
+            let _inner = NativeDialogScope::enter();
+            assert!(native_dialog_open());
+        }
+        assert!(native_dialog_open());
+        drop(outer);
+        assert!(!native_dialog_open());
+    }
+
+    #[test]
+    fn a_panicking_dialog_releases_its_scope() {
+        let panic = std::panic::catch_unwind(|| {
+            let _dialog = NativeDialogScope::enter();
+            assert!(native_dialog_open());
+            panic!("synthetic dialog failure");
+        });
+        assert!(panic.is_err());
+        assert!(!native_dialog_open());
+    }
+
+    #[test]
+    fn dialog_depth_is_owned_by_its_event_loop_thread() {
+        let _dialog = NativeDialogScope::enter();
+        assert!(native_dialog_open());
+        std::thread::spawn(|| assert!(!native_dialog_open()))
+            .join()
+            .expect("independent thread");
+        assert!(native_dialog_open());
     }
 }

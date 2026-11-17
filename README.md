@@ -1,8 +1,158 @@
+# Concat Live
+
+Форк [Concat 0.2.10](https://github.com/jub0t/Concat/tree/v0.2.10) с совместным
+редактированием видимого проекта и нативной панелью Codex. Агент и пользователь
+работают с одной сессией, таймлайном и историей отмены. Экспорт и предпросмотр
+получают текущее состояние, включая несохранённые изменения.
+
+На настольной системе обычный запуск, `--project DIR` и `--live` включают
+live-режим. `--mcp window` подключается к нему; `--mcp headless` остаётся
+отдельным процессом. На Android и iOS сохранён прежний редактор, панель
+Codex и явный `--live` там не поддерживаются. Новые функции проверяются
+на macOS Apple Silicon; Windows и Linux требуют отдельной проверки.
+
+Для сборки нужны закреплённый Rust 1.93.1, CMake, компилятор C++ и библиотеки
+разработки FFmpeg 7+ (общие инструкции ниже). Для сборки на macOS также нужны
+Swift 6.2+ и SDK macOS 26+ из Xcode или Command Line Tools. Из корня репозитория:
+
+```sh
+cd src
+cargo run --profile quick -p concat -- --live
+```
+
+Чтобы сразу открыть существующий проект, добавьте `--project /путь/к/проекту`.
+Проект — каталог, содержащий `concat.json`. Для готового macOS-пакета
+используется отдельное имя `Concat Live.app` и идентификатор
+`ru.steel0rat.concat-live`. Его настройки и Automation discovery хранятся
+отдельно от штатного Concat; данные исходного приложения не мигрируют.
+
+## Чат Codex
+
+Нужен установленный и авторизованный Codex CLI. Панель доступна справа
+на главной странице и в редакторе. До создания проекта выберите рабочую
+папку кнопкой Choose folder. В запросе укажите название проекта, размер
+сцены, частоту кадров и фон, затем нажмите Send. Например:
+«Создай проект Проба: 1080×1920, 30 кадров/с, белый фон».
+
+Агент создаёт проект в выбранной папке, открывает его в окне и продолжает
+монтаж в той же беседе. История и набранный черновик сообщения сохраняются
+при переходе с главной в редактор. New chat начинает отдельную беседу;
+Reconnect повторно подключается к известной беседе.
+
+Обычные действия показываются краткими статусами. Аргументы инструментов,
+их JSON-результаты и вывод команд в переписку не копируются. Сообщения
+об ошибках остаются видимыми. Запросы на команды, правки файлов и разрешения
+сохраняют подробности для проверки и требуют Allow once или Deny.
+Interrupt останавливает текущий ход. Переключение уже открытого проекта
+прерывает выполняемую операцию и сохраняет историю беседы.
+
+Используется локальный `codex app-server` через stdio и действующая
+конфигурация CLI. Новые API-ключи и отдельное хранение токенов не нужны;
+модель не подменяется. Сообщения чата и результаты инструментов обрабатывает
+настроенный провайдер Codex. Медиаобработка и экспорт редактора выполняются
+локально; работа чата требует доступа к выбранному провайдеру.
+Подписи новой панели пока английские.
+
+На macOS 26 и новее кнопка микрофона включает локальную диктовку Apple
+DictationTranscriber. Выберите русский или английский язык и нажмите микрофон.
+При первом использовании macOS запросит доступ к нему. Текущий текст
+распознавания показывается отдельно от черновика; Stop завершает запись
+и добавляет результат к набранному тексту. Затем сообщение можно отредактировать
+и отправить кнопкой Send. Cancel отменяет диктовку и сохраняет черновик.
+
+Аудио обрабатывается в памяти на этом Mac. Если языковая модель не установлена,
+системе нужен интернет для её загрузки. Запись ограничена тремя минутами;
+её можно начать и во время работы Codex, чтобы подготовить следующий запрос.
+Во время диктовки отправка сообщения и смена беседы недоступны.
+Закрытие окна отменяет диктовку. На других ОС и более ранних версиях macOS
+кнопка недоступна.
+
+Live Automation слушает случайный порт на `127.0.0.1`. Включение при запуске
+не записывается в сохранённые пользовательские настройки. Отключение
+Automation прекращает доступ агента к окну. Запросы к другому проекту,
+переключение с несохранённой работы и конфликт с текущим жестом
+возвращают ошибку; тихого перехода в headless нет. Закрытие проекта через
+агента требует `save: true`; `save: false` в live-режиме всегда возвращает
+отказ. Изменяющая команда
+после потери ответа не повторяется автоматически: сначала нужно прочитать
+фактическое состояние проекта.
+
+## Навык по умолчанию и обновления
+
+Перед каждым запросом панель перечитывает каталог навыков Codex и явно
+подключает `steel0rat-video-maker-skill`. Устанавливать или вызывать его
+по имени в сообщении не требуется. Если навыка нет или он отключён, запрос
+не передаётся модели, а текст возвращается в черновик. Беседа сохраняется.
+
+На macOS live-окно проверяет опубликованные стабильные релизы при запуске
+и каждые шесть часов. Приложение берётся из
+[steel0rat/concat-live](https://github.com/steel0rat/concat-live/releases),
+навык — из
+[steel0rat/steel0rat-video-maker-skill](https://github.com/steel0rat/steel0rat-video-maker-skill/releases).
+Кнопка проверки на странице версии проверяет оба канала. Черновики релизов
+и предварительные версии пропускаются. До первой публикации используется
+уже установленный навык.
+
+Навык хранится в каталогах версий в данных Concat Live. После проверки
+SHA-256 и содержимого архива приложение переключает установленную ссылку
+`~/.agents/skills/steel0rat-video-maker-skill`; прежняя ссылка или каталог
+сохраняются отдельно. Рабочая папка, на которую указывала старая ссылка,
+не изменяется. Новая версия подключается со следующего запроса той же беседы.
+
+Пакет приложения проверяется до замены: идентификатор
+`ru.steel0rat.concat-live`, версия, подпись и запуск `--smoke`.
+Установка ждёт завершения работы агента, диктовки, воспроизведения и экспорта,
+а также отправки или очистки черновика чата. Перед заменой проект сохраняется.
+Прежняя сборка остаётся рядом с приложением; затем открывается тот же проект.
+Ошибка сохранения оставляет редактор открытым. Переписка панели и её черновик
+между запусками приложения пока не восстанавливаются.
+
+Текущий автоматический выпуск предназначен для macOS Apple silicon и Intel.
+Для локальной сборки вне `.app` автоматическая замена приложения недоступна.
+Новые ключи, файлы `.env` и изменение конфигурации Codex не требуются.
+
+### Выпуск версии
+
+Версия приложения задаётся в `src/Cargo.toml`. После коммита изменений
+владелец репозитория создаёт и отправляет соответствующий тег; например,
+для первой версии форка:
+
+```sh
+git tag v0.3.0
+git push origin master
+git push origin v0.3.0
+```
+
+Workflow Release проверяет код, собирает оба macOS-пакета и создаёт черновик
+релиза с `manifest.json` и SHA-256. Опубликуйте проверенный черновик на странице
+Releases: только после публикации версия становится доступна обновлятору.
+Версии навыка выпускаются отдельно, как описано в его README.
+
+## CONCAT_MCP_ROOTS
+
+- Назначение: разрешить запись проектов, кадров и экспорта в указанных папках,
+  в том числе в live-окне вне домашнего каталога.
+- Формат: список абсолютных путей с разделителем ОС (`:` на macOS/Linux,
+  `;` на Windows).
+- Обязательность: необязательна; передаётся окружению процесса GUI при запуске.
+- По умолчанию: запись ограничена домашним каталогом пользователя.
+- Пример: `CONCAT_MCP_ROOTS=/var/www/my-video`.
+
+Выбор рабочей папки в чате заменяет разрешённые папки записи для текущего
+live-окна одним выбранным каталогом. Настройки приложения и окружение
+не переписываются. Выбор не включает Automation, если её отключили вручную.
+
+Проверки разработки: `cargo fmt --all --check`, тесты затронутых crates и
+`cargo clippy --all-targets -- -D warnings`. Сохранённые исходные проверки
+и сведения о базовом редакторе приведены ниже.
+
+---
+
 <p align="center">
   <img src="https://cdn.jsdelivr.net/gh/jub0t/Concat@main/assets/concat-mark-dark.png" alt="Concat" width="100" />
 </p>
 
-<h1 align="center">Concat</h1>
+<h1 align="center">Concat — исходный редактор</h1>
 <h3 align="center">The free, open-source, cross-platform video editor.</h3>
 
 <div align="center">
@@ -48,7 +198,7 @@
 
 Concat is a free, open-source video editor for macOS, Windows, Linux and Android. It covers what most edits need: auto-captions, text-to-speech, background removal, keyframe animation, effects and titles, multi-track cutting, 4K export. With none of the catches: no watermark, no account, no subscription, no upload.
 
-Everything runs on your machine. Install it, drop in footage, cut. The AI models for captions, voices and cutout download once from Settings and work offline after that. Your footage never leaves your disk.
+The editor's media processing runs on your machine. The models for captions, voices and cutout download once from Settings and work offline after that. The optional Codex chat in this fork uses the provider configured in Codex CLI; prompts and tool results, including inspected frames, can be sent to that provider.
 
 **Good for:** TikTok, Reels and Shorts, YouTube videos, tutorials and screen recordings, podcast clips, memes.
 
@@ -56,8 +206,8 @@ Everything runs on your machine. Install it, drop in footage, cut. The AI models
 
 ## Highlights
 
-- 🚫 **No watermarks. No account. No paywall.** Ever.
-- 🔒 **100% local.** Nothing uploads. Works offline.
+- 🚫 **The base editor has no watermark or account requirement.** The optional Codex panel uses your Codex account and provider.
+- 🔒 **Local media processing and export.** The optional Codex chat requires its configured provider.
 - 💬 **Auto-captions.** Made on your machine. Pick a model size, get styled captions on the timeline.
 - 🗣️ **Text-to-speech + voice cloning.** A free local voice on the desktop, or any voice from a few seconds of a recording. Phones are getting their own system voice.
 - 🧍 **Background removal.** People, objects, or paint the mask yourself.
@@ -74,7 +224,7 @@ Everything runs on your machine. Install it, drop in footage, cut. The AI models
 
 ## Download
 
-Two ways in:
+The links in this section download the upstream editor; they do not include this fork's live mode or Codex panel. Build Concat Live from this repository using the instructions above. Upstream downloads:
 
 1. **[The website](https://concat.standalones.org/#download)** hands you the right build for your machine. Start here.
 2. **[GitHub Releases](https://github.com/jub0t/Concat/releases)** has every build for every platform, with installers, packages and checksums. For when you want to pick.

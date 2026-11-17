@@ -31,6 +31,7 @@ mod ui {
     slint::include_modules!();
 }
 
+mod agent;
 mod batch_volume;
 mod chips;
 mod dock;
@@ -44,6 +45,7 @@ mod i18n;
 #[cfg(target_os = "ios")]
 mod ios;
 mod keymap;
+mod live;
 mod meters;
 mod motion_tiles;
 mod platform;
@@ -160,7 +162,19 @@ pub fn run() -> Result<(), slint::PlatformError> {
 /// unreadable project leaves the launch screen open with the usual error notice.
 /// Each invocation creates its own window; this does not control another instance.
 pub fn run_with_project(project: Option<std::path::PathBuf>) -> Result<(), slint::PlatformError> {
-    start(project, false)
+    start(project, false, false)
+}
+
+/// Builds the window with a local Automation server for its shared editing session.
+/// The launch-only address and token are never saved in the user's preferences.
+/// Live Automation is unavailable on Android and iOS.
+pub fn run_with_live(project: Option<std::path::PathBuf>) -> Result<(), slint::PlatformError> {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        return Err(slint::PlatformError::Other(
+            "live mode is only available on desktop".to_owned(),
+        ));
+    }
+    start(project, false, true)
 }
 
 /// Starts the way [`run`] does, as far as the window's first publish, and
@@ -174,7 +188,7 @@ pub fn run_with_project(project: Option<std::path::PathBuf>) -> Result<(), slint
 /// No project is opened, so the recents list is not touched; the
 /// preferences are read, and a log file written, as on any launch.
 pub fn smoke() -> Result<(), slint::PlatformError> {
-    start(None, true)
+    start(None, true, false)
 }
 
 /// Runs one way out of the open project, in the order that keeps the work
@@ -203,7 +217,11 @@ pub(crate) fn close_window(
 /// a few seconds of scrubbing around where the monitor is, at its size.
 const IDLE_FRAMES: usize = 96 * 1024 * 1024;
 
-fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::PlatformError> {
+fn start(
+    project: Option<std::path::PathBuf>,
+    smoke: bool,
+    live: bool,
+) -> Result<(), slint::PlatformError> {
     // What Import and a finished export reach on an iPhone. Android's own
     // crate installs its; iOS runs this crate's binary, so it is here.
     // https://github.com/jub0t/Concat/issues/332
@@ -325,6 +343,7 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     // The base fonts, so the preset cards can be drawn in them.
     fonts::register();
     let app = App::new()?;
+    app.global::<Panes>().set_agent_enabled(live);
     app.set_macos(platform::MACOS);
     // A phone wears the phone shell - see ui/phone/ - and its lanes keep
     // the playhead at their middle; the strip and the dock are the desk's.
@@ -340,7 +359,19 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     // or the community wrote - sit beside the built-ins from the first
     // frame. One that will not load is skipped, and its reason is the
     // first thing the window says.
-    let mut studio = Studio::new(host);
+    let mut studio = if live {
+        Studio::new_with_live(host, true)
+    } else {
+        Studio::new(host)
+    };
+    if live && studio.host.server.is_none() {
+        let error = if studio.settings.server_error.is_empty() {
+            "the Automation server did not start".to_owned()
+        } else {
+            studio.settings.server_error.clone()
+        };
+        return Err(slint::PlatformError::Other(format!("live mode: {error}")));
+    }
     studio.set_phone(phone);
     if safe {
         // Each key in a call of its own: scripts/locales.py finds a key by
@@ -443,6 +474,10 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
         models: Models::new(),
     });
     Shell::install(shell.clone());
+    if live {
+        agent::install(&app);
+        app.global::<Agent>().set_enabled(true);
+    }
 
     // The machine's fonts, for the Text inspector's picker. Read on a
     // worker: on a machine with a few thousand faces it is a moment, and
@@ -837,7 +872,8 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
         // library or the inspector into it. The wide dock waits, whole,
         // for the window to widen again; every dock operation works on
         // whichever is showing.
-        state.set_compact(width < studio::COMPACT_WIDTH);
+        let compact_width = studio::COMPACT_WIDTH + if state.live_enabled { 300.0 } else { 0.0 };
+        state.set_compact(width < compact_width);
     }));
     editor.on_dock_set(on_dock!(|state, seat: i32, kind: PaneKind| {
         let Some(path) = state.dock.leaf_path(seat.max(0) as usize) else {
@@ -2899,9 +2935,13 @@ fn stop_exports() {
     let mut held = None;
     Shell::with(|shell, _| {
         let mut studio = shell.studio.borrow_mut();
-        held = Some((studio.host.exporter.clone(), studio.host.server.take()));
+        held = Some((
+            studio.host.exporter.clone(),
+            studio.host.server.take(),
+            studio.live_enabled,
+        ));
     });
-    let Some((exporter, server)) = held else {
+    let Some((exporter, server, live_enabled)) = held else {
         return;
     };
     if !exporter.is_busy() && server.is_none() {
@@ -2912,14 +2952,19 @@ fn stop_exports() {
     // its caller can tell apart from a failure.
     if let Some(server) = server {
         log::info!("close: stopping the API's server");
-        let (stopped, wait) = std::sync::mpsc::channel();
-        let _ = std::thread::Builder::new()
-            .name("concat server stop".to_owned())
-            .spawn(move || {
-                server.stop();
-                let _ = stopped.send(());
-            });
-        let _ = wait.recv_timeout(EXPORT_PATIENCE);
+        if live_enabled {
+            // A live request may still be waiting for this event loop.
+            server.stop_detached();
+        } else {
+            let (stopped, wait) = std::sync::mpsc::channel();
+            let _ = std::thread::Builder::new()
+                .name("concat server stop".to_owned())
+                .spawn(move || {
+                    server.stop();
+                    let _ = stopped.send(());
+                });
+            let _ = wait.recv_timeout(EXPORT_PATIENCE);
+        }
     }
     exporter.cancel();
     while exporter.is_busy() && std::time::Instant::now() < until {
@@ -3029,6 +3074,7 @@ pub fn draw_in_software() {
 /// `exit`, and macOS said Concat had quit unexpectedly. macOS ends an app
 /// that way itself when it opts into sudden termination.
 fn leave(code: i32) -> ! {
+    agent::shutdown();
     log::logger().flush();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {

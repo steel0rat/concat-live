@@ -301,6 +301,20 @@ impl Session {
         self.editor.to_document(&self.settings)
     }
 
+    /// Captures the unsaved document without reading or writing its
+    /// folder. Renderers get an independent editor with no undo history;
+    /// the original session remains the only writer and keeps its history.
+    pub fn snapshot(&self) -> Session {
+        Session {
+            path: self.path.clone(),
+            settings: self.settings.clone(),
+            editor: Editor::from_document(&self.document())
+                .expect("an open session produces a readable document"),
+            upgraded: self.upgraded.clone(),
+            retired: self.retired.clone(),
+        }
+    }
+
     /// The active timeline flattened for rendering. This is what export and
     /// preview consume: the engine flattens its own session, so the pixels
     /// rendered are the model's, never a copy of it.
@@ -417,5 +431,44 @@ mod tests {
         let opened = Session::open(&scratch.to_string_lossy(), settings());
         assert!(opened.is_err(), "a half document is not an empty project");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_snapshot_keeps_unsaved_state_without_touching_disk_or_history() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let folder = scratch.path().join("not-created");
+        let path = folder.to_string_lossy().into_owned();
+        let mut session = Session::open(&path, settings()).expect("an empty session");
+        session
+            .apply(Command::AddTrack { bottom: false })
+            .expect("an unsaved edit");
+        session
+            .set_video(VideoSettings {
+                width: 640,
+                height: 360,
+                rate_num: 25,
+                ..session.video()
+            })
+            .expect("an unsaved frame");
+        session.prepare_save(Some("Unsaved name"));
+        let document = session.document();
+
+        let mut snapshot = session.snapshot();
+        assert_eq!(snapshot.path(), path);
+        assert_eq!(snapshot.document(), document);
+        assert_eq!(snapshot.settings().name, "Unsaved name");
+        assert!(!snapshot.can_undo() && !snapshot.can_redo());
+        assert!(session.can_undo());
+        assert!(!folder.exists(), "taking a snapshot creates no folder");
+
+        snapshot
+            .apply(Command::AddTrack { bottom: true })
+            .expect("the detached editor is independent");
+        assert_eq!(session.document(), document);
+        assert_ne!(snapshot.document(), document);
+        session.undo();
+        assert_eq!(session.video().width, 1920);
+        assert_eq!(snapshot.video().width, 640);
+        assert!(!folder.exists(), "neither snapshot nor undo writes a file");
     }
 }
