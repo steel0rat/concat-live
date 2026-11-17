@@ -31,27 +31,28 @@ until="$2"
 version="$3"
 title="Concat Live $version"
 
-# A conventional-commit type, with its optional (scope) and breaking `!`.
-type='^[a-z0-9]+(\([^)]*\))?!?: '
-
 # Each line opens with one mark for what it touches, from the commit's
 # scope where it has one and its type where it has not - a fix reads as a
 # fix at a glance, and the text rows stand apart from the timeline's. A
 # subject with neither carries no mark rather than a wrong one.
 marks='text=📝 speech=🗣️ enhance=🗣️ keyframes=🎞️ effects=✨ render=✨ colour=✨ color=✨ timeline=✂️ media=📁 export=📤 settings=⚙️ i18n=🌍 locales=🌍 api=🤖 server=🤖 android=📱 ios=📱 models=📦 inspector=🖥️ window=🖥️ workspace=🖥️ ui=🖥️ start=🖥️ feat=✨ fix=🐛 perf=⚡'
+# Empty filtered ranges are valid; awk keeps them successful while pipefail
+# still reports a failed git log.
 changes=$(git log "$since..$until" --no-merges --format='%s' 2>/dev/null \
-  | grep -Ev '^((Create|Update) [^ ]+\.[a-z]+|Version [0-9]|Lock the flake|Format the workspace|Changelog for|Merge )' \
-  | grep -Ev 'in the (export|pool) tests$' \
-  | grep -Eiv '^(test|chore|ci|build|refactor|style|docs)(\([^)]*\))?!?: ' \
-  | grep -Eiv '^[a-z0-9]+\((release|ci)\)!?: ' \
-  | grep -Eiv "${type}.*(clippy|lint|rustfmt|(unused|duplicate|missing) [A-Za-z]* ?import|non-existent|does not compile|before test module|green again)" \
-  | grep -Eiv '^(updates?|wip|fixes?|cleanup)\.?$' \
   | awk -v marks="$marks" '
       BEGIN {
         n = split(marks, pairs, " ")
         for (i = 1; i <= n; i++) { split(pairs[i], kv, "="); mark[kv[1]] = kv[2] }
       }
       {
+        lower = tolower($0)
+        if ($0 ~ /^((Create|Update) [^ ]+\.[a-z]+|Version [0-9]|Lock the flake|Format the workspace|Changelog for|Merge )/ ||
+            $0 ~ /in the (export|pool) tests$/ ||
+            lower ~ /^(test|chore|ci|build|refactor|style|docs)(\([^)]*\))?!?: / ||
+            lower ~ /^[a-z0-9]+\((release|ci)\)!?: / ||
+            lower ~ /^[a-z0-9]+(\([^)]*\))?!?: .*(clippy|lint|rustfmt|(unused|duplicate|missing) [A-Za-z]* ?import|non-existent|does not compile|before test module|green again)/ ||
+            lower ~ /^(updates?|wip|fixes?|cleanup)\.?$/)
+          next
         prefix = ""
         if (match($0, /^[a-z0-9]+(\([^)]*\))?!?: /)) {
           head = substr($0, 1, RLENGTH)
