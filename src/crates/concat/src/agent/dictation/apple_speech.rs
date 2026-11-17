@@ -17,6 +17,8 @@ use std::{
     },
 };
 
+// Only macOS callbacks construct events; other targets keep the shared receiver contract.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, PartialEq)]
 pub(super) enum Event {
     Status(String),
