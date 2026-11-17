@@ -24,7 +24,7 @@ use slint::{ComponentHandle, Model, VecModel};
 
 use crate::ui::{Agent, AgentApprovalData, AgentMessageData, App};
 use dictation::Dictation;
-use protocol::{Context, Effect, Event, Protocol};
+use protocol::{Context, Effect, Event, ModelOption, ModelSelection, Protocol};
 
 const DISPLAY_LIMIT: usize = 32_000;
 const WIRE_LIMIT: u64 = 16 * 1024 * 1024;
@@ -33,7 +33,7 @@ thread_local! {
     static PANE: RefCell<Option<AgentPane>> = const { RefCell::new(None) };
 }
 
-/// Installs the models and callbacks without starting a process.
+/// Installs the controls; the initial Codex connection waits for the event loop.
 pub(crate) fn install(app: &App) {
     let messages = Rc::new(VecModel::default());
     let approvals = Rc::new(VecModel::default());
@@ -45,6 +45,8 @@ pub(crate) fn install(app: &App) {
     global.on_new_thread(|| with_pane(|pane| pane.restart(true)));
     global.on_reconnect(|| with_pane(|pane| pane.restart(false)));
     global.on_choose_workspace(|| with_pane(AgentPane::choose_workspace));
+    global.on_model_selected(|index| with_pane(|pane| pane.select_model(index)));
+    global.on_effort_selected(|index| with_pane(|pane| pane.select_effort(index)));
     global.on_dictation_start(|| with_pane(AgentPane::start_dictation));
     global.on_dictation_stop(|| {
         with_pane(|pane| {
@@ -97,6 +99,8 @@ pub(crate) fn install(app: &App) {
             next_message: 0,
             thread: None,
             worker: None,
+            connect_pending: true,
+            models: Models::default(),
             busy: false,
             maintenance: false,
             unsent_draft: None,
@@ -233,6 +237,56 @@ fn with_pane(work: impl FnOnce(&mut AgentPane)) {
     });
 }
 
+#[derive(Default)]
+struct Models {
+    catalogue: Vec<ModelOption>,
+    current: ModelSelection,
+    explicit: bool,
+}
+
+impl Models {
+    fn current_index(&self) -> Option<usize> {
+        self.catalogue
+            .iter()
+            .position(|option| Some(option.model.as_str()) == self.current.model.as_deref())
+    }
+
+    fn current_model(&self) -> Option<&ModelOption> {
+        self.current_index()
+            .and_then(|index| self.catalogue.get(index))
+    }
+
+    fn select_model(&mut self, index: usize) {
+        if let Some(option) = self.catalogue.get(index)
+            && self.current.model.as_deref() != Some(option.model.as_str())
+        {
+            self.current = ModelSelection {
+                model: Some(option.model.clone()),
+                effort: option.default_effort.clone(),
+            };
+            self.explicit = true;
+        }
+    }
+
+    fn select_effort(&mut self, index: usize) {
+        if let Some(effort) = self
+            .current_model()
+            .and_then(|model| model.efforts.get(index))
+        {
+            self.current.effort = Some(effort.clone());
+            self.explicit = true;
+        }
+    }
+
+    fn selection(&self) -> ModelSelection {
+        if self.explicit {
+            self.current.clone()
+        } else {
+            ModelSelection::default()
+        }
+    }
+}
+
 struct AgentPane {
     ui: slint::Weak<App>,
     messages: Rc<VecModel<AgentMessageData>>,
@@ -243,6 +297,8 @@ struct AgentPane {
     next_message: u64,
     thread: Option<String>,
     worker: Option<Worker>,
+    connect_pending: bool,
+    models: Models,
     busy: bool,
     maintenance: bool,
     unsent_draft: Option<(String, String)>,
@@ -274,6 +330,82 @@ impl AgentPane {
         }
     }
 
+    fn publish_models(&self, placeholder: &str) {
+        let Some(app) = self.ui.upgrade() else { return };
+        let global = app.global::<Agent>();
+        let labels: Vec<slint::SharedString> = self
+            .models
+            .catalogue
+            .iter()
+            .map(|model| cap(&model.label).into())
+            .collect();
+        global.set_model_options(Rc::new(VecModel::from(labels)).into());
+        global.set_model_index(self.models.current_index().map_or(-1, |index| index as i32));
+        global.set_model_placeholder(
+            self.models
+                .current
+                .model
+                .as_deref()
+                .unwrap_or(placeholder)
+                .into(),
+        );
+        self.publish_efforts(&global);
+    }
+
+    fn publish_efforts(&self, global: &Agent<'_>) {
+        let efforts = self
+            .models
+            .current_model()
+            .map_or(&[][..], |model| &model.efforts);
+        let selected = self.models.current.effort.as_deref();
+        let labels: Vec<slint::SharedString> = efforts
+            .iter()
+            .map(|effort| effort_label(effort).into())
+            .collect();
+        global.set_effort_options(Rc::new(VecModel::from(labels)).into());
+        global.set_effort_index(
+            efforts
+                .iter()
+                .position(|effort| Some(effort.as_str()) == selected)
+                .map_or(-1, |index| index as i32),
+        );
+        global.set_effort_placeholder(selected.map_or("Default", effort_label).into());
+    }
+
+    fn select_model(&mut self, index: i32) {
+        if self.allowed()
+            && !self.busy
+            && !self.dictation.active()
+            && let Ok(index) = usize::try_from(index)
+        {
+            self.models.select_model(index);
+            if let Some(app) = self.ui.upgrade() {
+                let global = app.global::<Agent>();
+                global
+                    .set_model_index(self.models.current_index().map_or(-1, |index| index as i32));
+                self.publish_efforts(&global);
+            }
+        }
+    }
+
+    fn select_effort(&mut self, index: i32) {
+        if self.allowed()
+            && !self.busy
+            && !self.dictation.active()
+            && let Ok(index) = usize::try_from(index)
+        {
+            self.models.select_effort(index);
+            if let Some(app) = self.ui.upgrade() {
+                self.publish_efforts(&app.global::<Agent>());
+            }
+        }
+    }
+
+    fn clear_models(&mut self, placeholder: &str) {
+        self.models = Models::default();
+        self.publish_models(placeholder);
+    }
+
     fn clear_approvals(&self) {
         while self.approvals.row_count() > 0 {
             self.approvals.remove(self.approvals.row_count() - 1);
@@ -296,6 +428,7 @@ impl AgentPane {
         self.restore_unsent();
         self.dictation.cancel();
         self.worker.take();
+        self.clear_models("Connect to Codex");
         self.finish_streaming(true);
         self.generation = self.generation.wrapping_add(1);
         self.busy = false;
@@ -358,6 +491,7 @@ impl AgentPane {
     }
 
     fn start(&mut self) -> Result<(), String> {
+        self.connect_pending = false;
         if self.worker.is_some() {
             return Ok(());
         }
@@ -371,6 +505,7 @@ impl AgentPane {
             self.generation,
         )?);
         self.status = "Connecting to Codex…".into();
+        self.clear_models("Loading models…");
         self.error.clear();
         Ok(())
     }
@@ -422,6 +557,7 @@ impl AgentPane {
                         name: String::new(),
                         epoch: crate::host::project_epoch(),
                     });
+                    pane.connect_pending = true;
                     pane.error.clear();
                     pane.status = "Ready · describe the project to create".into();
                     if let Some(app) = pane.ui.upgrade() {
@@ -458,6 +594,7 @@ impl AgentPane {
                 .send(Control::Send {
                     text,
                     id,
+                    selection: self.models.selection(),
                     context: self
                         .context
                         .clone()
@@ -468,6 +605,7 @@ impl AgentPane {
             self.error = "Codex disconnected. Reconnect before sending again.".into();
             self.finish_streaming(true);
             self.worker.take();
+            self.clear_models("Disconnected");
             self.publish();
             return;
         }
@@ -539,6 +677,12 @@ impl AgentPane {
             self.stop();
             return;
         }
+        if self.connect_pending
+            && self.allowed()
+            && let Err(error) = self.start()
+        {
+            self.error = error;
+        }
         if let Some(transcript) = self.dictation.poll()
             && let Some(app) = self.ui.upgrade()
         {
@@ -557,7 +701,7 @@ impl AgentPane {
             }
             match event {
                 Event::State { busy, status } => {
-                    self.busy = busy;
+                    self.busy = busy || self.unsent_draft.is_some();
                     self.status = status;
                 }
                 Event::Error(error) => self.error = error,
@@ -569,8 +713,18 @@ impl AgentPane {
                     self.finish_streaming(true);
                     self.clear_approvals();
                     self.worker.take();
+                    self.clear_models("Disconnected");
                 }
                 Event::Thread(id) => self.thread = Some(id),
+                Event::Models { current, options } => {
+                    self.models = Models {
+                        catalogue: options,
+                        current,
+                        explicit: false,
+                    };
+                    self.publish_models("Models unavailable");
+                }
+                Event::ModelsUnavailable => self.clear_models("Models unavailable"),
                 Event::Message {
                     id,
                     role,
@@ -620,6 +774,7 @@ enum Control {
     Send {
         text: String,
         id: String,
+        selection: ModelSelection,
         context: Context,
     },
     ContextChanged(Context),
@@ -905,11 +1060,13 @@ fn run_worker(
                 Control::Send {
                     text,
                     id,
+                    selection,
                     context: updated,
                 } => {
                     context = updated;
                     check_live(&context)?;
                     effects.extend(protocol.update_context(context.clone()));
+                    protocol.selection = selection;
                     effects.extend(protocol.submit(text, id)?);
                 }
                 Control::ContextChanged(updated) => {
@@ -935,6 +1092,7 @@ fn run_worker(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+        effects.extend(protocol.expire_model_list());
         if protocol.timed_out() {
             return Err("Codex did not answer a protocol request within two minutes. Reconnect to continue.".into());
         }
@@ -954,6 +1112,20 @@ fn run_worker(
         }
     }
     Ok(())
+}
+
+fn effort_label(effort: &str) -> &str {
+    match effort {
+        "none" => "None",
+        "minimal" => "Minimal",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra high",
+        "max" => "Max",
+        "ultra" => "Ultra",
+        _ => effort,
+    }
 }
 
 fn cap(text: &str) -> String {
@@ -995,5 +1167,42 @@ mod tests {
         let shown = cap(&text);
         assert!(shown.starts_with(&"Ж".repeat(DISPLAY_LIMIT)));
         assert!(shown.contains("Display truncated"));
+    }
+
+    #[test]
+    fn model_change_uses_the_new_default_and_refuses_an_out_of_range_effort() {
+        let mut models = Models {
+            catalogue: vec![
+                ModelOption {
+                    model: "primary".into(),
+                    label: "Primary".into(),
+                    efforts: vec!["medium".into(), "high".into()],
+                    default_effort: Some("medium".into()),
+                },
+                ModelOption {
+                    model: "secondary".into(),
+                    label: "Secondary".into(),
+                    efforts: vec!["low".into()],
+                    default_effort: Some("low".into()),
+                },
+            ],
+            current: ModelSelection {
+                model: Some("primary".into()),
+                effort: Some("high".into()),
+            },
+            explicit: false,
+        };
+        assert!(
+            models.selection().model.is_none(),
+            "inherit Codex configuration"
+        );
+        models.select_model(1);
+        models.select_effort(1);
+        let selection = models.selection();
+        assert_eq!(selection.model.as_deref(), Some("secondary"));
+        assert_eq!(selection.effort.as_deref(), Some("low"));
+        models.select_model(0);
+        models.select_effort(1);
+        assert_eq!(models.selection().effort.as_deref(), Some("high"));
     }
 }

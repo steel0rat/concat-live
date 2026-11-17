@@ -9,6 +9,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DEFAULT_SKILL: &str = "steel0rat-video-maker-skill";
+const MODEL_PAGE_SIZE: u32 = 100;
+const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(super) struct Context {
@@ -16,6 +18,59 @@ pub(super) struct Context {
     pub project: Option<PathBuf>,
     pub name: String,
     pub epoch: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ModelSelection {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) struct ModelOption {
+    pub model: String,
+    pub label: String,
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
+}
+
+impl ModelOption {
+    fn from_catalogue(value: &Value) -> Option<Self> {
+        if value["hidden"].as_bool() == Some(true) {
+            return None;
+        }
+        let model = required(value, "model").ok()?;
+        let label = required(value, "displayName").unwrap_or(model);
+        let mut efforts = Vec::new();
+        for effort in value["supportedReasoningEfforts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(level) = required(effort, "reasoningEffort")
+                && !efforts.iter().any(|existing| existing == level)
+            {
+                efforts.push(level.to_owned());
+            }
+        }
+        let default_effort = efforts
+            .iter()
+            .find(|level| level.as_str() == string(value, "defaultReasoningEffort"))
+            .cloned();
+        Some(Self {
+            model: model.to_owned(),
+            label: label.to_owned(),
+            efforts,
+            default_effort,
+        })
+    }
+}
+
+struct ModelCatalogue {
+    provider: Option<String>,
+    current: ModelSelection,
+    models: Vec<ModelOption>,
+    seen_cursors: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -27,6 +82,11 @@ pub(super) enum Event {
     Error(String),
     Fatal(String),
     Thread(String),
+    Models {
+        current: ModelSelection,
+        options: Vec<ModelOption>,
+    },
+    ModelsUnavailable,
     Message {
         id: String,
         role: String,
@@ -58,6 +118,7 @@ enum Pending {
     Initialize,
     Account,
     Thread,
+    Models(ModelCatalogue),
     Skills,
     Turn(String),
     Interrupt,
@@ -77,6 +138,7 @@ pub(super) struct Protocol {
     turn: Option<String>,
     completed: HashSet<String>,
     queued: Option<(String, String)>,
+    pub(super) selection: ModelSelection,
     unacknowledged_user: Option<String>,
     active: bool,
     interrupt_requested: bool,
@@ -95,6 +157,7 @@ impl Protocol {
             turn: None,
             completed: HashSet::new(),
             queued: None,
+            selection: ModelSelection::default(),
             unacknowledged_user: None,
             active: false,
             interrupt_requested: false,
@@ -119,8 +182,47 @@ impl Protocol {
             .any(|(_, since)| since.elapsed() > Duration::from_secs(120))
     }
 
+    pub fn expire_model_list(&mut self) -> Option<Effect> {
+        let count = self.pending.len();
+        self.pending.retain(|_, (kind, since)| {
+            !matches!(kind, Pending::Models(_)) || since.elapsed() < MODEL_LIST_TIMEOUT
+        });
+        (self.pending.len() != count).then_some(Effect::Show(Event::ModelsUnavailable))
+    }
+
     pub fn connected(&self) -> bool {
         self.thread.is_some()
+    }
+
+    fn model_page(&mut self, catalogue: ModelCatalogue, cursor: Option<String>) -> Effect {
+        let params = json!({
+            "modelProvider": catalogue.provider,
+            "includeHidden": false,
+            "limit": MODEL_PAGE_SIZE,
+            "cursor": cursor
+        });
+        Effect::Write(self.request("model/list", params, Pending::Models(catalogue)))
+    }
+
+    fn receive_models(&mut self, mut catalogue: ModelCatalogue, result: &Value) -> Effect {
+        let Some(entries) = result["data"].as_array() else {
+            return Effect::Show(Event::ModelsUnavailable);
+        };
+        for option in entries.iter().filter_map(ModelOption::from_catalogue) {
+            if !catalogue.models.iter().any(|old| old.model == option.model) {
+                catalogue.models.push(option);
+            }
+        }
+        if let Some(cursor) = result["nextCursor"].as_str() {
+            if !catalogue.seen_cursors.insert(cursor.to_owned()) {
+                return Effect::Show(Event::ModelsUnavailable);
+            }
+            return self.model_page(catalogue, Some(cursor.to_owned()));
+        }
+        Effect::Show(Event::Models {
+            current: catalogue.current,
+            options: catalogue.models,
+        })
     }
 
     fn instructions(&self) -> String {
@@ -248,7 +350,22 @@ impl Protocol {
         };
         self.unacknowledged_user = Some(id.clone());
         self.active = true;
-        let request = self.request("turn/start", json!({"threadId": thread, "clientUserMessageId": id, "input": [{"type": "text", "text": text}, {"type": "text", "text": format!("Application context: working folder {}. {}", self.context.path.display(), self.context_note())}, skill]}), Pending::Turn(id));
+        let mut params = json!({
+            "threadId": thread,
+            "clientUserMessageId": id,
+            "input": [
+                {"type": "text", "text": text},
+                {"type": "text", "text": format!("Application context: working folder {}. {}", self.context.path.display(), self.context_note())},
+                skill
+            ]
+        });
+        if let Some(model) = &self.selection.model {
+            params["model"] = json!(model);
+        }
+        if let Some(effort) = &self.selection.effort {
+            params["effort"] = json!(effort);
+        }
+        let request = self.request("turn/start", params, Pending::Turn(id));
         vec![Effect::Write(request), state(true, "Codex is working…")]
     }
 
@@ -326,6 +443,11 @@ impl Protocol {
         let Some((kind, _)) = self.pending.remove(&id) else {
             return Ok(Vec::new());
         };
+        if matches!(&kind, Pending::Models(_))
+            && (message.get("error").is_some() || message.get("result").is_none())
+        {
+            return Ok(vec![Effect::Show(Event::ModelsUnavailable)]);
+        }
         if let Some(error) = message.get("error") {
             let detail = format!("Codex rejected a request: {}", string(error, "message"));
             return if matches!(&kind, Pending::Skills) {
@@ -383,11 +505,22 @@ impl Protocol {
                 let id = required(&result["thread"], "id")?.to_owned();
                 self.thread = Some(id.clone());
                 effects.push(Effect::Show(Event::Thread(id)));
+                let catalogue = ModelCatalogue {
+                    provider: required(result, "modelProvider").ok().map(str::to_owned),
+                    current: ModelSelection {
+                        model: required(result, "model").ok().map(str::to_owned),
+                        effort: required(result, "reasoningEffort").ok().map(str::to_owned),
+                    },
+                    models: Vec::new(),
+                    seen_cursors: HashSet::new(),
+                };
+                effects.push(self.model_page(catalogue, None));
                 if self.queued.is_none() {
                     effects.push(state(false, "Ready"));
                 }
                 effects.extend(self.begin_turn());
             }
+            Pending::Models(catalogue) => effects.push(self.receive_models(catalogue, result)),
             Pending::Skills => match self.default_skill(result) {
                 Ok(skill) => effects.extend(self.send_turn(skill)),
                 Err(error) => effects.extend(self.fail_queued(error)),
@@ -1555,5 +1688,125 @@ mod tests {
             )
         );
         assert_eq!(p.turn.as_deref(), Some("current-turn"));
+    }
+
+    #[test]
+    fn model_catalogue_uses_the_threads_provider_and_follows_pages() {
+        let mut p = protocol();
+        let init = p.initialize();
+        let account = write(
+            &p.receive(json!({"id":init["id"],"result":{}}))
+                .expect("initialize"),
+            "account/read",
+        );
+        let thread = write(
+            &p.receive(
+                json!({"id":account["id"],"result":{"requiresOpenaiAuth":false,"account":null}}),
+            )
+            .expect("account"),
+            "thread/start",
+        );
+        let effects = p
+            .receive(json!({"id":thread["id"],"result":{
+                "thread":{"id":"thread"}, "model":"primary", "modelProvider":"provider",
+                "reasoningEffort":"high"
+            }}))
+            .expect("thread");
+        let first = write(&effects, "model/list");
+        assert_eq!(first["params"]["modelProvider"], "provider");
+        assert_eq!(first["params"]["includeHidden"], false);
+        let effects = p
+            .receive(json!({"id":first["id"],"result":{
+                "data":[
+                    {"id":"registry-id", "model":"primary","displayName":"Primary",
+                     "defaultReasoningEffort":"medium","supportedReasoningEfforts":[
+                        {"reasoningEffort":"medium"}, {"reasoningEffort":"high"}
+                     ]},
+                    {"model":"hidden","hidden":true}
+                ],
+                "nextCursor":"second-page"
+            }}))
+            .expect("first page");
+        let second = write(&effects, "model/list");
+        assert_eq!(second["params"]["cursor"], "second-page");
+        assert_eq!(second["params"]["modelProvider"], "provider");
+        let effects = p.receive(json!({"id":second["id"],"result":{
+            "data":[{"model":"secondary","displayName":"Secondary","defaultReasoningEffort":"low",
+                     "supportedReasoningEfforts":[{"reasoningEffort":"low"}]}]
+        }})).expect("second page");
+        let Effect::Show(Event::Models { current, options }) = &effects[0] else {
+            panic!("missing completed model list");
+        };
+        assert_eq!(current.model.as_deref(), Some("primary"));
+        assert_eq!(current.effort.as_deref(), Some("high"));
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].model, "primary");
+        assert_eq!(options[0].label, "Primary");
+        assert_eq!(options[0].efforts, ["medium", "high"]);
+        assert_eq!(options[0].default_effort.as_deref(), Some("medium"));
+        assert_eq!(options[1].efforts, ["low"]);
+    }
+
+    #[test]
+    fn selected_model_and_effort_apply_to_the_next_turn_in_the_same_thread() {
+        let mut p = protocol();
+        ready(&mut p);
+        let original = submit_turn(&mut p, "First edit", "first");
+        assert!(original["params"].get("model").is_none());
+        assert!(original["params"].get("effort").is_none());
+        p.receive(json!({"id":original["id"],"result":{"turn":{
+            "id":"first-turn","status":"completed","items":[]
+        }}}))
+        .expect("first turn completed");
+
+        p.selection = ModelSelection {
+            model: Some("secondary".into()),
+            effort: Some("xhigh".into()),
+        };
+        let turn = submit_turn(&mut p, "Another edit", "second");
+        let params = &turn["params"];
+        assert_eq!(params["threadId"], original["params"]["threadId"]);
+        assert_eq!(params["model"], "secondary");
+        assert_eq!(params["effort"], "xhigh");
+        assert_eq!(params["input"][2]["name"], DEFAULT_SKILL);
+        for field in [
+            "approvalPolicy",
+            "approvalsReviewer",
+            "sandboxPolicy",
+            "serviceTier",
+        ] {
+            assert!(params.get(field).is_none(), "inherit {field}");
+        }
+    }
+
+    #[test]
+    fn expired_model_list_does_not_block_chat_or_accept_a_late_page() {
+        let mut p = protocol();
+        ready(&mut p);
+        let id = p
+            .pending
+            .iter_mut()
+            .find_map(|(&id, (kind, since))| {
+                if matches!(kind, Pending::Models(_)) {
+                    *since = Instant::now() - Duration::from_secs(121);
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .expect("catalogue pending");
+        assert!(matches!(
+            p.expire_model_list(),
+            Some(Effect::Show(Event::ModelsUnavailable))
+        ));
+        assert!(!p.timed_out());
+        assert!(
+            p.receive(json!({"id":id,"result":{"data":[]}}))
+                .expect("late list")
+                .is_empty()
+        );
+        let turn = submit_turn(&mut p, "Keep working", "user");
+        assert_eq!(turn["params"]["threadId"], "thread");
+        assert!(turn["params"].get("model").is_none());
     }
 }

@@ -38,6 +38,14 @@ export global Agent {
     in property <string> project-name;
     in property <bool> has-project;
     in property <string> workspace-path;
+    in property <[string]> model-options;
+    in property <[string]> effort-options;
+    in-out property <int> model-index: -1;
+    in-out property <int> effort-index: -1;
+    in property <string> model-placeholder: "Connect to Codex";
+    in property <string> effort-placeholder: "Default";
+    callback model-selected(index: int);
+    callback effort-selected(index: int);
     in property <bool> dictation-available;
     /// 0 idle, 1 preparing, 2 recording, 3 finishing.
     in property <int> dictation-phase;
@@ -362,6 +370,43 @@ export component AgentChat inherits Rectangle {
             if Agent.dictation-error != "": dictation-error-view := AgentTextViewport {
                 value: Agent.dictation-error;
                 ink: Theme.danger;
+            }
+            if Agent.dictation-phase == 0: HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    spacing: 3px;
+                    horizontal-stretch: 2;
+                    Text {
+                        text: "Model";
+                        color: Theme.fg-muted;
+                        font-size: Theme.fs-sm;
+                    }
+                    model-picker := Select {
+                        options: Agent.model-options;
+                        current <=> Agent.model-index;
+                        placeholder: Agent.model-placeholder;
+                        enabled: Agent.enabled && !Agent.maintenance && !Agent.busy
+                            && Agent.model-options.length > 0;
+                        changed(index) => { Agent.model-selected(index); }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 3px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: "Reasoning";
+                        color: Theme.fg-muted;
+                        font-size: Theme.fs-sm;
+                    }
+                    effort-picker := Select {
+                        options: Agent.effort-options;
+                        current <=> Agent.effort-index;
+                        placeholder: Agent.effort-placeholder;
+                        enabled: Agent.enabled && !Agent.maintenance && !Agent.busy
+                            && Agent.effort-options.length > 0;
+                        changed(index) => { Agent.effort-selected(index); }
+                    }
+                }
             }
             composer-frame := Rectangle {
                 min-width: 0px;
