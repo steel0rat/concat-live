@@ -134,10 +134,11 @@ jobs:
         run: |
           set -euo pipefail
           stem="onnxruntime-linux-x64-$ORT_VERSION"
-          scripts/ci/fetch.sh onnxruntime-linux-x64 onnxruntime.tgz
-          tar -xzf onnxruntime.tgz
-          test -f "$stem/lib/libonnxruntime.so.$ORT_VERSION"
-          ln -sf "libonnxruntime.so.$ORT_VERSION" "$stem/lib/libonnxruntime.so"
+          scripts/ci/fetch.sh "onnxruntime-nuget-$ORT_VERSION" onnxruntime.zip
+          mkdir -p "$stem/lib"
+          unzip -jnq onnxruntime.zip 'runtimes/linux-x64/native/libonnxruntime*.so' -d "$stem/lib"
+          test -f "$stem/lib/libonnxruntime.so"
+          ln -s libonnxruntime.so "$stem/lib/libonnxruntime.so.1"
           {
             echo "ORT_LIB_LOCATION=$PWD/$stem/lib"
             echo "ORT_PREFER_DYNAMIC_LINK=1"
@@ -339,11 +340,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh onnxruntime-win-x64 onnxruntime.zip
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh "onnxruntime-nuget-$env:ORT_VERSION" onnxruntime.zip
           if ($LASTEXITCODE -ne 0) { throw "the ONNX Runtime download failed" }
-          Expand-Archive onnxruntime.zip -DestinationPath .
-          $lib = "$PWD\onnxruntime-win-x64-$env:ORT_VERSION\lib"
+          Expand-Archive onnxruntime.zip -DestinationPath onnxruntime
+          $lib = "$PWD\onnxruntime\runtimes\win-x64\native"
           if (-not (Test-Path "$lib\onnxruntime.lib")) { throw "$lib\onnxruntime.lib is not there" }
+          if (-not (Test-Path "$lib\onnxruntime.dll")) { throw "$lib\onnxruntime.dll is not there" }
           "ORT_LIB_LOCATION=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append
           "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
           $lib | Out-File -FilePath $env:GITHUB_PATH -Append

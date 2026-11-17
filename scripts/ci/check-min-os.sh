@@ -52,13 +52,15 @@ is_lazy() {
 newer() { printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1; }
 
 # A Mach-O's own minimum OS: LC_BUILD_VERSION's minos, or the older
-# LC_VERSION_MIN_* command's version.
+# LC_VERSION_MIN_* command's version. Consume all of otool's output so
+# closing awk early does not interrupt otool under pipefail.
 minimum_of() {
   otool -l "$1" 2>/dev/null | awk '
     /LC_BUILD_VERSION/ { build = 1; next }
     /LC_VERSION_MIN_/  { legacy = 1; next }
-    build  && $1 == "minos"   { print $2; exit }
-    legacy && $1 == "version" { print $2; exit }'
+    !minimum && build  && $1 == "minos"   { minimum = $2 }
+    !minimum && legacy && $1 == "version" { minimum = $2 }
+    END { if (minimum) print minimum }'
 }
 
 for path in ${lazy[@]+"${lazy[@]}"}; do
