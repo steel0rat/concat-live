@@ -270,12 +270,12 @@ jobs:
           - os: windows-2022
             verb: Tests
     runs-on: ${{ matrix.os }}
-    # Windows' steps that can run long have timeouts of their own, 115
+    # Windows' steps that can run long have timeouts of their own, 145
     # minutes between them, so whichever is stuck is named by its own
     # timeout. A stuck job kept main red for a week once: the tests' one
     # step held the compile and every test, ran into its ninety minutes
     # every time, and said nothing about which test it was waiting on.
-    timeout-minutes: 135
+    timeout-minutes: 165
     env:
       # No debug info in the test binaries, as on Linux: smaller, faster
       # to link, and nothing reads it here.
@@ -381,17 +381,19 @@ jobs:
       # here on its own. Each step has its own timeout, so a red run says
       # whether the compile was slow, a test failed, or a test hung, and a
       # test that hangs is killed by nextest after its slow-timeout and
-      # reported by name (src/.config/nextest.toml). Two compile jobs: the
-      # runner has the memory for two, and one took most of an hour.
+      # reported by name (src/.config/nextest.toml). The library and its
+      # tests both compile the generated UI: two concurrent rustc processes
+      # exhausted Windows runner memory. Compile one at a time, as on Linux,
+      # with a longer budget for the sequential build.
       - name: Build the tests (Windows)
         id: build-tests
         if: runner.os == 'Windows'
-        timeout-minutes: 60
+        timeout-minutes: 90
         working-directory: src
         shell: bash
         run: |
           set -o pipefail
-          cargo nextest run --workspace --no-run --build-jobs 2 2>&1 | tee build-tests.log
+          cargo nextest run --workspace --no-run --build-jobs 1 2>&1 | tee build-tests.log
       - name: Run the tests (Windows)
         if: runner.os == 'Windows'
         timeout-minutes: 30
@@ -399,7 +401,7 @@ jobs:
         shell: bash
         run: |
           status=0
-          cargo nextest run --workspace --build-jobs 2 --profile ci \
+          cargo nextest run --workspace --build-jobs 1 --profile ci \
             -E 'not test(=every_edit_still_exports)' 2>&1 | tee nextest-workspace.log || status=$?
           mv target/nextest/ci/junit.xml target/nextest/ci/junit-workspace.xml 2>/dev/null || true
           exit "$status"
@@ -415,7 +417,7 @@ jobs:
         shell: bash
         run: |
           status=0
-          cargo nextest run -p concat-host --test export --build-jobs 2 --profile ci --no-capture \
+          cargo nextest run -p concat-host --test export --build-jobs 1 --profile ci --no-capture \
             -E 'test(=every_edit_still_exports)' 2>&1 | tee nextest-every-edit.log || status=$?
           mv target/nextest/ci/junit.xml target/nextest/ci/junit-every-edit.xml 2>/dev/null || true
           exit "$status"
