@@ -6,7 +6,7 @@ import { Glyph, Icon } from "../icons.slint";
 import { IconButton } from "../primitives/panel.slint";
 import { Select } from "../primitives/select.slint";
 import { LevelMeter } from "../primitives/level-meter.slint";
-import { Button } from "../primitives/modal.slint";
+import { Button, Field } from "../primitives/modal.slint";
 import { ResizeBox } from "../primitives/resize-box.slint";
 import { ThinScrollbar } from "../primitives/scrollbar.slint";
 import { Pane, PaneHeader } from "pane.slint";
@@ -26,8 +26,30 @@ export struct AgentApprovalData {
     detail: string,
 }
 
+export struct AgentSavedChatData {
+    id: string,
+    title: string,
+    workspace: string,
+    active: bool,
+    has-draft: bool,
+}
+
 export global Agent {
     in property <bool> enabled;
+    in property <bool> connected;
+    in property <[AgentSavedChatData]> saved-chats;
+    in property <bool> history-open;
+    in property <bool> history-loading;
+    in property <string> history-error;
+    in-out property <string> chat-query;
+    in property <bool> chat-opening;
+    in property <string> chat-title;
+    in property <bool> has-earlier;
+    in property <bool> earlier-loading;
+    callback toggle-history();
+    callback chat-filter-edited(query: string);
+    callback open-chat(id: string);
+    callback load-earlier();
     in property <[AgentMessageData]> messages;
     in property <[AgentApprovalData]> approvals;
     in-out property <string> draft;
@@ -115,10 +137,161 @@ component AgentTextViewport inherits Flickable {
     }
 }
 
-export component AgentChat inherits Rectangle {
+component ChatAction inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> ghost: true;
+    callback clicked();
+    min-width: action.min-width;
+    min-height: action.min-height;
+    max-height: action.max-height;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => {
+        if root.enabled { root.clicked(); }
+    }
+    keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    action := Button {
+        width: parent.width;
+        height: parent.height;
+        label: root.label;
+        enabled: root.enabled;
+        ghost: root.ghost;
+        border-width: keys.has-focus ? 1px : 0px;
+        border-color: Theme.accent;
+        clicked => { root.clicked(); }
+    }
+}
+
+component SavedChatRow inherits Rectangle {
+    in property <AgentSavedChatData> chat;
+    in property <bool> enabled;
+    min-height: content.preferred-height;
+    border-radius: Theme.r;
+    border-width: keys.has-focus || root.chat.active ? 1px : 0px;
+    border-color: Theme.accent;
+    background: root.chat.active ? Theme.accent-soft
+        : touch.has-hover && root.enabled ? Theme.field-hover : Theme.field;
+    accessible-role: button;
+    accessible-label: root.chat.title + (root.chat.active ? " · Current chat" : "");
+    accessible-action-default => {
+        if root.enabled { Agent.open-chat(root.chat.id); }
+    }
+    content := VerticalLayout {
+        padding: 9px;
+        spacing: 3px;
+        Text {
+            min-width: 0px;
+            text: root.chat.title;
+            overflow: elide;
+            color: Theme.fg;
+            font-size: Theme.fs-lg;
+        }
+        if root.chat.workspace != "" || root.chat.has-draft: HorizontalLayout {
+            spacing: 6px;
+            Text {
+                min-width: 0px;
+                text: root.chat.workspace;
+                overflow: elide;
+                color: Theme.fg-muted;
+                font-size: Theme.fs-sm;
+                horizontal-stretch: 1;
+            }
+            if root.chat.has-draft: Text {
+                text: "Draft";
+                color: Theme.accent;
+                font-size: Theme.fs-sm;
+            }
+        }
+    }
+    keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                Agent.open-chat(root.chat.id);
+                return accept;
+            }
+            return reject;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { Agent.open-chat(root.chat.id); }
+    }
+}
+
+component ChatHistoryView inherits VerticalLayout {
     min-width: 0px;
     min-height: 0px;
-    max-height: 100000px;
+    preferred-height: 0px;
+    vertical-stretch: 1;
+    padding-left: 12px;
+    padding-right: 12px;
+    padding-bottom: 10px;
+    spacing: 8px;
+
+    Field {
+        value: Agent.chat-query;
+        placeholder: "Search chats";
+        edited(query) => {
+            Agent.chat-query = query;
+            Agent.chat-filter-edited(query);
+        }
+    }
+    if Agent.history-error != "" || Agent.error != "": AgentTextViewport {
+        value: Agent.history-error != "" ? Agent.history-error : Agent.error;
+        ink: Theme.danger;
+    }
+    if Agent.history-loading || Agent.chat-opening || (Agent.saved-chats.length == 0 && Agent.history-error == ""): Text {
+        text: Agent.chat-opening ? "Opening chat…"
+            : Agent.history-loading ? "Loading chats…"
+            : Agent.chat-query != "" ? "No matching chats" : "No saved chats yet";
+        font-size: Theme.fs;
+        color: Theme.fg-muted;
+        wrap: word-wrap;
+    }
+    list-viewport := Flickable {
+        min-width: 0px;
+        min-height: 0px;
+        preferred-height: 0px;
+        vertical-stretch: 1;
+        content-width: self.width;
+        content-height: Math.max(self.height, list.preferred-height);
+        list := VerticalLayout {
+            width: list-viewport.width - 7px;
+            spacing: 6px;
+            alignment: start;
+            for chat in Agent.saved-chats: SavedChatRow {
+                chat: chat;
+                enabled: Agent.enabled && !Agent.maintenance && !Agent.busy &&
+                    (Agent.connected || chat.active);
+            }
+        }
+        ThinScrollbar {
+            x: parent.width - self.width;
+            y: -list-viewport.content-y;
+            height: list-viewport.height;
+            viewport: list-viewport.height;
+            content: list-viewport.content-height;
+            offset: -list-viewport.content-y;
+            scrolled(to) => { list-viewport.content-y = -to; }
+        }
+    }
+}
+
+component ChatConversation inherits Rectangle {
+    min-width: 0px;
+    min-height: 0px;
     preferred-height: 0px;
     vertical-stretch: 1;
     clip: true;
@@ -135,32 +308,15 @@ export component AgentChat inherits Rectangle {
     }
 
     VerticalLayout {
-        HorizontalLayout {
+        if Agent.has-project && Agent.chat-title != "": HorizontalLayout {
             padding-left: 12px;
             padding-right: 12px;
-            padding-top: 8px;
-            padding-bottom: 6px;
-            spacing: 6px;
             Text {
-                text: Agent.has-project ? Agent.project-name : "Working folder";
                 min-width: 0px;
-                color: Theme.fg-muted;
-                font-size: Theme.fs;
-                vertical-alignment: center;
+                text: "Project · " + Agent.project-name;
                 overflow: elide;
-                horizontal-stretch: 1;
-            }
-            Button {
-                label: "New chat";
-                ghost: true;
-                enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
-                clicked => { Agent.new-thread(); }
-            }
-            Button {
-                label: "Reconnect";
-                ghost: true;
-                enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
-                clicked => { Agent.reconnect(); }
+                font-size: Theme.fs;
+                color: Theme.fg-muted;
             }
         }
 
@@ -206,6 +362,13 @@ export component AgentChat inherits Rectangle {
                 padding: 12px;
                 spacing: 12px;
                 alignment: start;
+                if Agent.has-earlier: ChatAction {
+                    label: Agent.earlier-loading ? "Loading earlier…" : "Earlier messages";
+                    ghost: true;
+                    enabled: Agent.connected && !Agent.maintenance && !Agent.busy
+                        && !Agent.earlier-loading && Agent.dictation-phase == 0;
+                    clicked => { Agent.load-earlier(); }
+                }
                 if Agent.messages.length == 0: Text {
                     text: Agent.has-project
                         ? "Describe the edit you want. Codex works on the project visible in this window."
@@ -479,7 +642,7 @@ export component AgentChat inherits Rectangle {
                     }
                 }
             }
-            if Agent.busy && Agent.dictation-phase == 0: HorizontalLayout {
+            if Agent.busy && !Agent.chat-opening && Agent.dictation-phase == 0: HorizontalLayout {
                 alignment: end;
                 Button {
                     label: "Interrupt";
@@ -518,6 +681,55 @@ export component AgentChat inherits Rectangle {
                 }
             }
         }
+    }
+}
+
+export component AgentChat inherits Rectangle {
+    min-width: 0px;
+    min-height: 0px;
+    max-height: 100000px;
+    preferred-height: 0px;
+    vertical-stretch: 1;
+    clip: true;
+    VerticalLayout {
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 8px;
+            padding-bottom: 6px;
+            spacing: 6px;
+            Text {
+                text: Agent.history-open ? "Chats"
+                    : Agent.chat-title != "" ? Agent.chat-title
+                    : Agent.has-project ? Agent.project-name : "Working folder";
+                min-width: 0px;
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            history-button := ChatAction {
+                label: Agent.history-open ? "Back" : "History";
+                ghost: true;
+                enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
+                clicked => { Agent.toggle-history(); }
+            }
+            ChatAction {
+                label: "New chat";
+                ghost: true;
+                enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
+                clicked => { Agent.new-thread(); }
+            }
+            if !Agent.connected: IconButton {
+                glyph: Glyph.rotate;
+                label: "Reconnect Codex";
+                enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
+                clicked => { Agent.reconnect(); }
+            }
+        }
+        if Agent.history-open: ChatHistoryView { }
+        if !Agent.history-open: ChatConversation { }
     }
 }
 

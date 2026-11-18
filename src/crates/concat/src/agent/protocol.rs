@@ -8,7 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub(super) const CLIENT_NAME: &str = "concat_native";
 const DEFAULT_SKILL: &str = "steel0rat-video-maker-skill";
+const CHAT_PAGE_SIZE: u32 = 16;
+const APPLICATION_CONTEXT: &str = "Application context: working folder ";
 const MODEL_PAGE_SIZE: u32 = 100;
 const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -74,6 +77,33 @@ struct ModelCatalogue {
 }
 
 #[derive(Debug)]
+pub(super) struct SavedChat {
+    pub id: String,
+    pub title: String,
+    pub cwd: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug)]
+pub(super) struct HistoryMessage {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct HistoryPage {
+    pub messages: Vec<HistoryMessage>,
+    pub older: Option<String>,
+}
+
+struct ChatLookup {
+    remaining: usize,
+    chats: Vec<SavedChat>,
+    incomplete: bool,
+}
+
+#[derive(Debug)]
 pub(super) enum Event {
     State {
         busy: bool,
@@ -82,6 +112,18 @@ pub(super) enum Event {
     Error(String),
     Fatal(String),
     Thread(String),
+    SavedChats {
+        chats: Vec<SavedChat>,
+        incomplete: bool,
+    },
+    ChatListFailed(String),
+    ChatOpened {
+        id: String,
+        page: HistoryPage,
+    },
+    ChatOpenFailed,
+    OlderMessages(HistoryPage),
+    OlderMessagesFailed,
     Models {
         current: ModelSelection,
         options: Vec<ModelOption>,
@@ -118,6 +160,13 @@ enum Pending {
     Initialize,
     Account,
     Thread,
+    SavedChat(String),
+    OpenTranscript(String),
+    ChangeThread {
+        expected: Option<String>,
+        page: HistoryPage,
+    },
+    OlderMessages(String),
     Models(ModelCatalogue),
     Skills,
     Turn(String),
@@ -132,6 +181,7 @@ struct Approval {
 pub(super) struct Protocol {
     context: Context,
     resume: Option<String>,
+    chat_lookup: Option<ChatLookup>,
     next_id: u64,
     pending: HashMap<u64, (Pending, Instant)>,
     thread: Option<String>,
@@ -151,6 +201,7 @@ impl Protocol {
         Self {
             context,
             resume,
+            chat_lookup: None,
             next_id: 0,
             pending: HashMap::new(),
             thread: None,
@@ -173,7 +224,7 @@ impl Protocol {
     }
 
     pub fn initialize(&mut self) -> Value {
-        self.request("initialize", json!({"clientInfo": {"name": "concat_native", "title": "Concat Live", "version": env!("CARGO_PKG_VERSION")}}), Pending::Initialize)
+        self.request("initialize", json!({"clientInfo": {"name": CLIENT_NAME, "title": "Concat Live", "version": env!("CARGO_PKG_VERSION")}}), Pending::Initialize)
     }
 
     pub fn timed_out(&self) -> bool {
@@ -192,6 +243,149 @@ impl Protocol {
 
     pub fn connected(&self) -> bool {
         self.thread.is_some()
+    }
+
+    pub fn list_chats(&mut self, ids: Vec<String>) -> Vec<Effect> {
+        if self.chat_lookup.is_some() {
+            return Vec::new();
+        }
+        if ids.is_empty() {
+            return vec![Effect::Show(Event::SavedChats {
+                chats: Vec::new(),
+                incomplete: false,
+            })];
+        }
+        self.chat_lookup = Some(ChatLookup {
+            remaining: ids.len(),
+            chats: Vec::new(),
+            incomplete: false,
+        });
+        ids.into_iter()
+            .map(|id| {
+                Effect::Write(self.request(
+                    "thread/read",
+                    json!({"threadId": id, "includeTurns": false}),
+                    Pending::SavedChat(id),
+                ))
+            })
+            .collect()
+    }
+
+    fn receive_chat(&mut self, id: &str, thread: &Value) -> Vec<Effect> {
+        let Some(lookup) = &mut self.chat_lookup else {
+            return Vec::new();
+        };
+        if thread["id"].as_str() == Some(id)
+            && thread["originator"]
+                .as_str()
+                .is_none_or(|originator| originator == CLIENT_NAME)
+        {
+            if thread["ephemeral"].as_bool() != Some(true) {
+                lookup.chats.push(SavedChat {
+                    id: id.to_owned(),
+                    title: required(thread, "name")
+                        .or_else(|_| required(thread, "preview"))
+                        .unwrap_or("Untitled chat")
+                        .to_owned(),
+                    cwd: string(thread, "cwd").to_owned(),
+                    updated_at: thread["updatedAt"].as_i64().unwrap_or_default(),
+                });
+            }
+        } else {
+            lookup.incomplete = true;
+        }
+        lookup.remaining -= 1;
+        if lookup.remaining != 0 {
+            return Vec::new();
+        }
+        let mut result = self.chat_lookup.take().expect("completed chat lookup");
+        result.chats.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        vec![Effect::Show(Event::SavedChats {
+            chats: result.chats,
+            incomplete: result.incomplete,
+        })]
+    }
+
+    fn switching_chat(&self) -> bool {
+        self.pending.values().any(|(kind, _)| {
+            matches!(
+                kind,
+                Pending::OpenTranscript(_) | Pending::ChangeThread { .. }
+            )
+        })
+    }
+
+    pub fn change_chat(&mut self, thread: Option<String>) -> Result<Vec<Effect>, String> {
+        if self.active || self.queued.is_some() || self.switching_chat() || !self.connected() {
+            return Ok(vec![Effect::Show(Event::ChatOpenFailed)]);
+        }
+        let request = match thread {
+            Some(id) => self.transcript_page(&id, None, Pending::OpenTranscript(id.clone())),
+            None => self.thread_request(
+                None,
+                Pending::ChangeThread {
+                    expected: None,
+                    page: HistoryPage::default(),
+                },
+            )?,
+        };
+        Ok(vec![Effect::Write(request)])
+    }
+
+    pub fn older_messages(&mut self, cursor: String) -> Option<Effect> {
+        let thread = self.thread.clone()?;
+        Some(Effect::Write(self.transcript_page(
+            &thread,
+            Some(&cursor),
+            Pending::OlderMessages(cursor.clone()),
+        )))
+    }
+
+    fn transcript_page(&mut self, thread: &str, cursor: Option<&str>, kind: Pending) -> Value {
+        self.request(
+            "thread/turns/list",
+            json!({
+                "threadId": thread, "itemsView": "summary", "sortDirection": "desc",
+                "limit": CHAT_PAGE_SIZE, "cursor": cursor
+            }),
+            kind,
+        )
+    }
+
+    fn thread_request(&mut self, resume: Option<&str>, kind: Pending) -> Result<Value, String> {
+        let cwd = self
+            .context
+            .path
+            .to_str()
+            .ok_or("The project path is not valid UTF-8")?;
+        let (method, params) = match resume {
+            Some(thread) => (
+                "thread/resume",
+                json!({"threadId": thread, "cwd": cwd, "developerInstructions": self.instructions(), "excludeTurns": true}),
+            ),
+            None => (
+                "thread/start",
+                json!({"cwd": cwd, "developerInstructions": self.instructions()}),
+            ),
+        };
+        Ok(self.request(method, params, kind))
+    }
+
+    fn load_models(&mut self, result: &Value) -> Effect {
+        let catalogue = ModelCatalogue {
+            provider: required(result, "modelProvider").ok().map(str::to_owned),
+            current: ModelSelection {
+                model: required(result, "model").ok().map(str::to_owned),
+                effort: required(result, "reasoningEffort").ok().map(str::to_owned),
+            },
+            models: Vec::new(),
+            seen_cursors: HashSet::new(),
+        };
+        self.model_page(catalogue, None)
     }
 
     fn model_page(&mut self, catalogue: ModelCatalogue, cursor: Option<String>) -> Effect {
@@ -272,7 +466,7 @@ impl Protocol {
     }
 
     pub fn submit(&mut self, text: String, id: String) -> Result<Vec<Effect>, String> {
-        if self.active || self.queued.is_some() {
+        if self.active || self.queued.is_some() || self.switching_chat() {
             return Err("Codex is already working on a request.".into());
         }
         if self.context.path.to_str().is_none() {
@@ -355,7 +549,7 @@ impl Protocol {
             "clientUserMessageId": id,
             "input": [
                 {"type": "text", "text": text},
-                {"type": "text", "text": format!("Application context: working folder {}. {}", self.context.path.display(), self.context_note())},
+                {"type": "text", "text": format!("{APPLICATION_CONTEXT}{}. {}", self.context.path.display(), self.context_note())},
                 skill
             ]
         });
@@ -443,6 +637,21 @@ impl Protocol {
         let Some((kind, _)) = self.pending.remove(&id) else {
             return Ok(Vec::new());
         };
+        if let Pending::SavedChat(id) = &kind {
+            return Ok(self.receive_chat(id, &message["result"]["thread"]));
+        }
+        if message.get("error").is_some() || message.get("result").is_none() {
+            let failed = match &kind {
+                Pending::OpenTranscript(_) | Pending::ChangeThread { .. } => {
+                    Some(Event::ChatOpenFailed)
+                }
+                Pending::OlderMessages(_) => Some(Event::OlderMessagesFailed),
+                _ => None,
+            };
+            if let Some(event) = failed {
+                return Ok(vec![Effect::Show(event)]);
+            }
+        }
         if matches!(&kind, Pending::Models(_))
             && (message.get("error").is_some() || message.get("result").is_none())
         {
@@ -484,41 +693,64 @@ impl Protocol {
                 if requires_auth && result["account"].is_null() {
                     return Err("Codex is not signed in. Run codex login, then reconnect.".into());
                 }
-                let cwd = self
-                    .context
-                    .path
-                    .to_str()
-                    .ok_or("The project path is not valid UTF-8")?;
-                let (method, params) = match &self.resume {
-                    Some(thread) => (
-                        "thread/resume",
-                        json!({"threadId": thread, "cwd": cwd, "developerInstructions": self.instructions(), "excludeTurns": true}),
-                    ),
-                    None => (
-                        "thread/start",
-                        json!({"cwd": cwd, "developerInstructions": self.instructions()}),
-                    ),
-                };
-                effects.push(Effect::Write(self.request(method, params, Pending::Thread)));
+                let resume = self.resume.clone();
+                effects.push(Effect::Write(
+                    self.thread_request(resume.as_deref(), Pending::Thread)?,
+                ));
             }
             Pending::Thread => {
                 let id = required(&result["thread"], "id")?.to_owned();
                 self.thread = Some(id.clone());
                 effects.push(Effect::Show(Event::Thread(id)));
-                let catalogue = ModelCatalogue {
-                    provider: required(result, "modelProvider").ok().map(str::to_owned),
-                    current: ModelSelection {
-                        model: required(result, "model").ok().map(str::to_owned),
-                        effort: required(result, "reasoningEffort").ok().map(str::to_owned),
-                    },
-                    models: Vec::new(),
-                    seen_cursors: HashSet::new(),
-                };
-                effects.push(self.model_page(catalogue, None));
+                effects.push(self.load_models(result));
                 if self.queued.is_none() {
                     effects.push(state(false, "Ready"));
                 }
                 effects.extend(self.begin_turn());
+            }
+            Pending::SavedChat(_) => unreachable!("handled before general response errors"),
+            Pending::OpenTranscript(id) => {
+                if let Some(page) = history_page(result, None) {
+                    effects.push(Effect::Write(self.thread_request(
+                        Some(&id),
+                        Pending::ChangeThread {
+                            expected: Some(id.clone()),
+                            page,
+                        },
+                    )?));
+                } else {
+                    effects.push(Effect::Show(Event::ChatOpenFailed));
+                }
+            }
+            Pending::ChangeThread { expected, page } => {
+                let Some(id) = result["thread"]["id"].as_str().filter(|id| {
+                    !id.is_empty() && expected.as_deref().is_none_or(|expected| expected == *id)
+                }) else {
+                    return Ok(vec![Effect::Show(Event::ChatOpenFailed)]);
+                };
+                // Wait for the transcript and resume to succeed before switching.
+                // Responses still pending for the previous chat cannot update this one.
+                self.pending
+                    .retain(|_, (kind, _)| matches!(kind, Pending::SavedChat(_)));
+                self.thread = Some(id.to_owned());
+                self.turn = None;
+                self.completed.clear();
+                self.items.clear();
+                self.approvals.clear();
+                self.selection = ModelSelection::default();
+                self.unacknowledged_user = None;
+                self.interrupt_requested = false;
+                effects.push(Effect::Show(Event::ChatOpened {
+                    id: id.to_owned(),
+                    page,
+                }));
+                effects.push(self.load_models(result));
+                effects.push(state(false, "Ready"));
+            }
+            Pending::OlderMessages(cursor) => {
+                let event = history_page(result, Some(&cursor))
+                    .map_or(Event::OlderMessagesFailed, Event::OlderMessages);
+                effects.push(Effect::Show(event));
             }
             Pending::Models(catalogue) => effects.push(self.receive_models(catalogue, result)),
             Pending::Skills => match self.default_skill(result) {
@@ -793,6 +1025,48 @@ impl Protocol {
         ));
         effects
     }
+}
+
+fn history_page(result: &Value, previous_cursor: Option<&str>) -> Option<HistoryPage> {
+    let older = result["nextCursor"]
+        .as_str()
+        .filter(|cursor| !cursor.is_empty());
+    if older.is_some() && older == previous_cursor {
+        return None;
+    }
+    let messages = result["data"]
+        .as_array()?
+        .iter()
+        .rev()
+        .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+        .filter_map(|item| {
+            let id = required(item, "id").ok()?.to_owned();
+            let (role, text) = match string(item, "type") {
+                "userMessage" => (
+                    "You".to_owned(),
+                    item["content"]
+                        .as_array()?
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, part)| {
+                            let text = string(part, "text");
+                            (string(part, "type") == "text"
+                                && (index == 0 || !text.starts_with(APPLICATION_CONTEXT)))
+                            .then_some(text)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\\n\\n"),
+                ),
+                "agentMessage" | "plan" => item_text(item),
+                _ => return None,
+            };
+            (!text.is_empty()).then_some(HistoryMessage { id, role, text })
+        })
+        .collect();
+    Some(HistoryPage {
+        messages,
+        older: older.map(str::to_owned),
+    })
 }
 
 fn state(busy: bool, status: &str) -> Effect {
@@ -1808,5 +2082,117 @@ mod tests {
         let turn = submit_turn(&mut p, "Keep working", "user");
         assert_eq!(turn["params"]["threadId"], "thread");
         assert!(turn["params"].get("model").is_none());
+    }
+    #[test]
+    fn opening_a_saved_chat_restores_messages_then_continues_the_same_thread() {
+        let mut p = protocol();
+        ready(&mut p);
+        let history = write(
+            &p.change_chat(Some("saved".into())).expect("open"),
+            "thread/turns/list",
+        );
+        assert_eq!(history["params"]["threadId"], "saved");
+        assert_eq!(history["params"]["itemsView"], "summary");
+        assert_eq!(p.thread.as_deref(), Some("thread"));
+        let effects = p.receive(json!({"id":history["id"],"result":{"nextCursor":"older","data":[
+            {"id":"newest","items":[{"id":"answer","type":"agentMessage","text":"Here is the edit."}]},
+            {"id":"original","items":[{"id":"user","type":"userMessage","content":[
+                {"type":"text","text":"Show the first frame"},
+                {"type":"text","text":"Application context: working folder /tmp/private."},
+                {"type":"skill","name":"video"}
+            ]},{"id":"cmd","type":"commandExecution","aggregatedOutput":"hidden JSON"}]}
+        ]}})).expect("transcript");
+        let resume = write(&effects, "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "saved");
+        assert_eq!(resume["params"]["cwd"], "/tmp/concat project");
+        assert_eq!(resume["params"]["excludeTurns"], true);
+        assert!(resume["params"].get("approvalPolicy").is_none());
+        assert_eq!(p.thread.as_deref(), Some("thread"));
+        let effects = p
+            .receive(json!({"id":resume["id"],"result":{"thread":{"id":"saved"}}}))
+            .expect("resumed");
+        let Some(Effect::Show(Event::ChatOpened { id, page })) = effects.first() else {
+            panic!("chat not opened");
+        };
+        assert_eq!(id, "saved");
+        assert_eq!(page.older.as_deref(), Some("older"));
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|m| (m.role.as_str(), m.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("You", "Show the first frame"),
+                ("Codex", "Here is the edit.")
+            ]
+        );
+        let older = write(
+            &[p.older_messages("older".into()).expect("older page")],
+            "thread/turns/list",
+        );
+        assert_eq!(older["params"]["cursor"], "older");
+        assert_eq!(older["params"]["threadId"], "saved");
+        let next = submit_turn(&mut p, "Add titles", "next");
+        assert_eq!(next["params"]["threadId"], "saved");
+        assert_eq!(next["params"]["input"][2]["name"], DEFAULT_SKILL);
+    }
+
+    #[test]
+    fn failed_chat_restore_leaves_the_current_chat_sendable() {
+        let mut p = protocol();
+        ready(&mut p);
+        let history = write(
+            &p.change_chat(Some("stale".into())).expect("load"),
+            "thread/turns/list",
+        );
+        let effects = p
+            .receive(json!({"id":history["id"],"error":{"code":-32602,"message":"missing"}}))
+            .expect("failure event");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Show(Event::ChatOpenFailed)]
+        ));
+        assert_eq!(p.thread.as_deref(), Some("thread"));
+        assert_eq!(
+            submit_turn(&mut p, "Still in this chat", "user")["params"]["threadId"],
+            "thread"
+        );
+    }
+
+    #[test]
+    fn saved_chats_are_ordered_by_recency_and_carry_no_transcript_payloads() {
+        let mut p = protocol();
+        ready(&mut p);
+        let requests = p.list_chats(vec!["old".into(), "new".into(), "foreign".into()]);
+        assert_eq!(requests.len(), 3);
+        let mut events = Vec::new();
+        for effect in requests {
+            let Effect::Write(request) = effect else {
+                panic!("expected metadata request");
+            };
+            assert_eq!(request["method"], "thread/read");
+            assert_eq!(request["params"]["includeTurns"], false);
+            let id = request["params"]["threadId"].as_str().expect("id");
+            let originator = if id == "foreign" {
+                "another_app"
+            } else {
+                CLIENT_NAME
+            };
+            events.extend(
+                p.receive(json!({"id":request["id"],"result":{"thread":{
+                    "id":id,"originator":originator,"preview":"Title","cwd":"/workspace",
+                    "updatedAt":if id == "old" {1} else {2}, "turns":[{"items":[{"text":"raw"}]}]
+                }}}))
+                .expect("metadata"),
+            );
+        }
+        let [Effect::Show(Event::SavedChats { chats, incomplete })] = events.as_slice() else {
+            panic!("no catalogue");
+        };
+        assert!(*incomplete);
+        assert_eq!(
+            chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["new", "old"]
+        );
     }
 }

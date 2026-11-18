@@ -8,7 +8,8 @@ mod dictation;
 mod protocol;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, read_dir};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -22,9 +23,12 @@ use concat_mcp::Backend;
 use serde_json::Value;
 use slint::{ComponentHandle, Model, VecModel};
 
-use crate::ui::{Agent, AgentApprovalData, AgentMessageData, App};
+use crate::ui::{Agent, AgentApprovalData, AgentMessageData, AgentSavedChatData, App};
 use dictation::Dictation;
-use protocol::{Context, Effect, Event, ModelOption, ModelSelection, Protocol};
+use protocol::{
+    CLIENT_NAME, Context, Effect, Event, HistoryPage, ModelOption, ModelSelection, Protocol,
+    SavedChat,
+};
 
 const DISPLAY_LIMIT: usize = 32_000;
 const WIRE_LIMIT: u64 = 16 * 1024 * 1024;
@@ -42,8 +46,17 @@ pub(crate) fn install(app: &App) {
     global.set_approvals(approvals.clone().into());
     global.on_submitted(|| with_pane(AgentPane::submit));
     global.on_interrupt(|| with_pane(AgentPane::interrupt));
-    global.on_new_thread(|| with_pane(|pane| pane.restart(true)));
-    global.on_reconnect(|| with_pane(|pane| pane.restart(false)));
+    global.on_new_thread(|| with_pane(|pane| pane.change_chat(None, None, String::new())));
+    global.on_reconnect(|| with_pane(AgentPane::reconnect));
+    global.on_toggle_history(|| with_pane(AgentPane::toggle_history));
+    global.on_chat_filter_edited(|query| {
+        with_pane(|pane| {
+            pane.history.query = query.to_string();
+            pane.publish_history_rows();
+        })
+    });
+    global.on_open_chat(|id| with_pane(|pane| pane.open_chat(id.as_str())));
+    global.on_load_earlier(|| with_pane(AgentPane::load_earlier));
     global.on_choose_workspace(|| with_pane(AgentPane::choose_workspace));
     global.on_model_selected(|index| with_pane(|pane| pane.select_model(index)));
     global.on_effort_selected(|index| with_pane(|pane| pane.select_effort(index)));
@@ -99,6 +112,8 @@ pub(crate) fn install(app: &App) {
             next_message: 0,
             thread: None,
             worker: None,
+            connected: false,
+            history: ChatHistory::default(),
             connect_pending: true,
             models: Models::default(),
             busy: false,
@@ -189,14 +204,7 @@ pub(crate) fn shutdown() {
 pub(crate) fn pause_for_update(restarting: bool) -> bool {
     PANE.with_borrow_mut(|slot| {
         let Some(pane) = slot else { return true };
-        if pane.busy
-            || pane.dictation.active()
-            || (restarting
-                && pane
-                    .ui
-                    .upgrade()
-                    .is_some_and(|app| !app.global::<Agent>().get_draft().is_empty()))
-        {
+        if pane.busy || pane.dictation.active() || (restarting && pane.has_drafts()) {
             return false;
         }
         pane.maintenance = true;
@@ -220,11 +228,7 @@ pub(crate) fn busy_for_update(restarting: bool) -> bool {
             pane.busy
                 || pane.maintenance
                 || pane.dictation.active()
-                || (restarting
-                    && pane
-                        .ui
-                        .upgrade()
-                        .is_some_and(|app| !app.global::<Agent>().get_draft().is_empty()))
+                || (restarting && pane.has_drafts())
         })
     })
 }
@@ -287,6 +291,44 @@ impl Models {
     }
 }
 
+#[derive(PartialEq, Default)]
+enum ChatList {
+    #[default]
+    Idle,
+    Waiting,
+    Reading,
+}
+
+struct ChatOpening {
+    draft_from: Option<String>,
+    title: String,
+}
+
+#[derive(Default)]
+struct ChatHistory {
+    saved: Vec<SavedChat>,
+    drafts: HashMap<String, String>,
+    opening: Option<ChatOpening>,
+    list: ChatList,
+    open: bool,
+    query: String,
+    error: String,
+    title: String,
+    older: Option<String>,
+    reading_older: bool,
+}
+
+impl ChatHistory {
+    fn move_draft(&mut self, previous: Option<&str>, draft: String, selected: &str) -> String {
+        if let Some(previous) = previous
+            && !draft.is_empty()
+        {
+            self.drafts.insert(previous.to_owned(), draft);
+        }
+        self.drafts.remove(selected).unwrap_or_default()
+    }
+}
+
 struct AgentPane {
     ui: slint::Weak<App>,
     messages: Rc<VecModel<AgentMessageData>>,
@@ -297,6 +339,8 @@ struct AgentPane {
     next_message: u64,
     thread: Option<String>,
     worker: Option<Worker>,
+    connected: bool,
+    history: ChatHistory,
     connect_pending: bool,
     models: Models,
     busy: bool,
@@ -326,8 +370,208 @@ impl AgentPane {
             global.set_maintenance(self.maintenance);
             global.set_status(self.status.as_str().into());
             global.set_error(self.error.as_str().into());
+            global.set_connected(self.connected);
+            global.set_history_open(self.history.open);
+            global.set_history_loading(self.history.list != ChatList::Idle);
+            global.set_history_error(self.history.error.as_str().into());
+            global.set_chat_opening(self.history.opening.is_some());
+            global.set_chat_title(self.history.title.as_str().into());
+            global.set_has_earlier(self.history.older.is_some());
+            global.set_earlier_loading(self.history.reading_older);
             self.dictation.publish(&global);
         }
+    }
+
+    fn has_drafts(&self) -> bool {
+        !self.history.drafts.is_empty()
+            || self
+                .ui
+                .upgrade()
+                .is_some_and(|app| !app.global::<Agent>().get_draft().is_empty())
+    }
+
+    fn publish_history_rows(&self) {
+        let Some(app) = self.ui.upgrade() else { return };
+        let global = app.global::<Agent>();
+        let query = self.history.query.trim().to_lowercase();
+        let mut rows = Vec::new();
+        let mut add = |id: &str, title: &str, cwd: &str| {
+            let title = chat_title(title);
+            if !title.to_lowercase().contains(&query) && !cwd.to_lowercase().contains(&query) {
+                return;
+            }
+            rows.push(AgentSavedChatData {
+                id: id.into(),
+                title: title.into(),
+                workspace: cwd.into(),
+                active: self.thread.as_deref() == Some(id),
+                has_draft: self.history.drafts.contains_key(id),
+            });
+        };
+        let mut drafts: Vec<_> = self
+            .history
+            .drafts
+            .iter()
+            .filter(|(id, _)| !self.history.saved.iter().any(|entry| entry.id == **id))
+            .collect();
+        drafts.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        for (id, draft) in drafts {
+            add(id, draft, "");
+        }
+        for chat in &self.history.saved {
+            add(&chat.id, &chat.title, &chat.cwd);
+        }
+        global.set_saved_chats(Rc::new(VecModel::from(rows)).into());
+    }
+
+    fn toggle_history(&mut self) {
+        if !self.allowed() || self.busy || self.dictation.active() {
+            return;
+        }
+        self.history.open = !self.history.open;
+        if self.history.open {
+            self.history.error.clear();
+            if self.history.list == ChatList::Idle {
+                self.history.list = ChatList::Waiting;
+            }
+            self.history.query.clear();
+            if let Some(app) = self.ui.upgrade() {
+                app.global::<Agent>().set_chat_query("".into());
+            }
+            self.publish_history_rows();
+            if let Err(error) = self.start() {
+                self.history.list = ChatList::Idle;
+                self.history.error = error;
+            }
+        }
+        self.publish();
+    }
+
+    fn open_chat(&mut self, id: &str) {
+        if !self.history.open || !self.allowed() || self.busy || self.dictation.active() {
+            return;
+        }
+        if self.thread.as_deref() == Some(id) {
+            self.history.open = false;
+            self.publish();
+            return;
+        }
+        if let Some(chat) = self.history.saved.iter().find(|chat| chat.id == id) {
+            self.change_chat(Some(id.to_owned()), None, chat_title(&chat.title));
+        } else if let Some(draft) = self.history.drafts.get(id) {
+            self.change_chat(None, Some(id.to_owned()), chat_title(draft));
+        }
+    }
+
+    fn change_chat(&mut self, thread: Option<String>, draft_from: Option<String>, title: String) {
+        if !self.allowed() || self.busy || self.dictation.active() {
+            return;
+        }
+        if self.connected {
+            if self.send_control(Control::ChangeChat(thread)).is_err() {
+                self.error = "Codex disconnected. Reconnect to open another chat.".into();
+                self.stop();
+                self.publish();
+                return;
+            }
+        } else if thread.is_none() && self.worker.is_none() {
+            if let Err(error) = self.connect(None) {
+                self.error = error;
+                self.publish();
+                return;
+            }
+        } else {
+            return;
+        }
+        self.history.opening = Some(ChatOpening { draft_from, title });
+        self.busy = true;
+        self.status = "Opening chat…".into();
+        self.error.clear();
+        self.publish();
+    }
+
+    fn show_chat(&mut self, id: String, page: HistoryPage) {
+        let Some(opening) = self.history.opening.take() else {
+            return;
+        };
+        if let Some(app) = self.ui.upgrade() {
+            let global = app.global::<Agent>();
+            let draft = self.history.move_draft(
+                self.thread.as_deref(),
+                global.get_draft().to_string(),
+                opening.draft_from.as_deref().unwrap_or(&id),
+            );
+            global.set_draft(draft.into());
+        }
+        self.thread = Some(id);
+        self.history.title = opening.title;
+        self.history.open = false;
+        self.rows.clear();
+        self.messages.set_vec(Vec::new());
+        self.show_history_page(page);
+        self.clear_approvals();
+        self.clear_models("Loading models…");
+        self.publish_history_rows();
+    }
+
+    fn show_history_page(&mut self, page: HistoryPage) {
+        let mut rows = Vec::new();
+        for message in page.messages {
+            let key = format!("{}:{}", self.generation, message.id);
+            if !self.rows.contains_key(&key)
+                && !rows
+                    .iter()
+                    .any(|row: &AgentMessageData| row.id.as_str() == key)
+            {
+                rows.push(AgentMessageData {
+                    id: key.into(),
+                    role: message.role.into(),
+                    text: cap(&message.text).into(),
+                    streaming: false,
+                    failed: false,
+                });
+            }
+        }
+        if !rows.is_empty() {
+            rows.extend(self.messages.iter());
+            self.rows = rows
+                .iter()
+                .enumerate()
+                .map(|(i, row)| (row.id.to_string(), i))
+                .collect();
+            self.messages.set_vec(rows);
+        }
+        self.history.older = page.older;
+        self.history.reading_older = false;
+    }
+
+    fn load_earlier(&mut self) {
+        if !self.allowed()
+            || self.busy
+            || self.history.open
+            || self.history.reading_older
+            || self.dictation.active()
+        {
+            return;
+        }
+        if let Some(cursor) = self.history.older.clone() {
+            if self.send_control(Control::OlderMessages(cursor)).is_ok() {
+                self.history.reading_older = true;
+                self.error.clear();
+            } else {
+                self.error = "Reconnect to load earlier messages.".into();
+            }
+            self.publish();
+        }
+    }
+
+    fn send_control(&self, command: Control) -> Result<(), ()> {
+        self.worker
+            .as_ref()
+            .ok_or(())?
+            .commands
+            .send(command)
+            .map_err(|_| ())
     }
 
     fn publish_models(&self, placeholder: &str) {
@@ -428,6 +672,10 @@ impl AgentPane {
         self.restore_unsent();
         self.dictation.cancel();
         self.worker.take();
+        self.connected = false;
+        self.history.list = ChatList::Idle;
+        self.history.opening = None;
+        self.history.reading_older = false;
         self.clear_models("Connect to Codex");
         self.finish_streaming(true);
         self.generation = self.generation.wrapping_add(1);
@@ -495,15 +743,15 @@ impl AgentPane {
         if self.worker.is_some() {
             return Ok(());
         }
+        self.connect(self.thread.clone())
+    }
+
+    fn connect(&mut self, resume: Option<String>) -> Result<(), String> {
         let context = self
             .context
             .clone()
             .ok_or("Choose a working folder before starting Codex")?;
-        self.worker = Some(Worker::start(
-            context,
-            self.thread.clone(),
-            self.generation,
-        )?);
+        self.worker = Some(Worker::start(context, resume, self.generation)?);
         self.status = "Connecting to Codex…".into();
         self.clear_models("Loading models…");
         self.error.clear();
@@ -511,7 +759,11 @@ impl AgentPane {
     }
 
     fn start_dictation(&mut self) {
-        if !self.enabled() || self.maintenance || self.dictation.active() {
+        if !self.enabled()
+            || self.maintenance
+            || self.dictation.active()
+            || self.history.opening.is_some()
+        {
             return;
         }
         let Some(app) = self.ui.upgrade() else { return };
@@ -572,7 +824,7 @@ impl AgentPane {
     }
 
     fn submit(&mut self) {
-        if !self.allowed() || self.busy || self.dictation.active() {
+        if !self.allowed() || self.busy || self.dictation.active() || self.history.open {
             return;
         }
         let Some(app) = self.ui.upgrade() else { return };
@@ -605,6 +857,7 @@ impl AgentPane {
             self.error = "Codex disconnected. Reconnect before sending again.".into();
             self.finish_streaming(true);
             self.worker.take();
+            self.connected = false;
             self.clear_models("Disconnected");
             self.publish();
             return;
@@ -624,19 +877,17 @@ impl AgentPane {
         }
     }
 
-    fn restart(&mut self, fresh: bool) {
+    fn reconnect(&mut self) {
         if !self.allowed() || self.busy || self.dictation.active() {
             return;
         }
         self.stop();
-        if fresh {
-            self.thread = None;
-            self.local_message(
-                "Context",
-                "New conversation. Earlier messages remain visible above.".into(),
-            );
+        if self.history.open {
+            self.history.list = ChatList::Waiting;
+            self.history.error.clear();
         }
         if let Err(error) = self.start() {
+            self.history.list = ChatList::Idle;
             self.error = error;
         } else {
             self.busy = true;
@@ -683,6 +934,14 @@ impl AgentPane {
         {
             self.error = error;
         }
+        if self.history.list == ChatList::Waiting && self.connected {
+            if self.send_control(Control::ListChats).is_ok() {
+                self.history.list = ChatList::Reading;
+            } else {
+                self.history.list = ChatList::Idle;
+                self.history.error = "Reconnect to load chat history.".into();
+            }
+        }
         if let Some(transcript) = self.dictation.poll()
             && let Some(app) = self.ui.upgrade()
         {
@@ -701,21 +960,54 @@ impl AgentPane {
             }
             match event {
                 Event::State { busy, status } => {
-                    self.busy = busy || self.unsent_draft.is_some();
+                    self.busy =
+                        busy || self.unsent_draft.is_some() || self.history.opening.is_some();
                     self.status = status;
                 }
                 Event::Error(error) => self.error = error,
                 Event::Fatal(error) => {
-                    self.restore_unsent();
+                    self.stop();
                     self.error = error;
                     self.status = "Disconnected · reconnect to continue".into();
-                    self.busy = false;
-                    self.finish_streaming(true);
-                    self.clear_approvals();
-                    self.worker.take();
+                    if self.history.open {
+                        self.history.error = "Reconnect to load chat history.".into();
+                    }
                     self.clear_models("Disconnected");
                 }
-                Event::Thread(id) => self.thread = Some(id),
+                Event::Thread(id) => {
+                    self.connected = true;
+                    if self.history.opening.is_some() {
+                        self.show_chat(id, HistoryPage::default());
+                    } else {
+                        self.thread = Some(id);
+                    }
+                }
+                Event::SavedChats { chats, incomplete } => {
+                    self.history.saved = chats;
+                    self.history.list = ChatList::Idle;
+                    self.history.error = if incomplete {
+                        "Some chats could not be loaded.".into()
+                    } else {
+                        String::new()
+                    };
+                    self.publish_history_rows();
+                }
+                Event::ChatListFailed(error) => {
+                    self.history.list = ChatList::Idle;
+                    self.history.error = error;
+                }
+                Event::ChatOpened { id, page } => self.show_chat(id, page),
+                Event::ChatOpenFailed => {
+                    self.history.opening = None;
+                    self.busy = false;
+                    self.status = "Ready".into();
+                    self.error = "Could not open the chat. Try again or reconnect.".into();
+                }
+                Event::OlderMessages(page) => self.show_history_page(page),
+                Event::OlderMessagesFailed => {
+                    self.history.reading_older = false;
+                    self.error = "Could not load earlier messages. Try again.".into();
+                }
                 Event::Models { current, options } => {
                     self.models = Models {
                         catalogue: options,
@@ -738,8 +1030,10 @@ impl AgentPane {
                         .unsent_draft
                         .as_ref()
                         .is_some_and(|(pending, _)| *pending == id)
+                        && let Some((_, text)) = self.unsent_draft.take()
+                        && self.history.title.is_empty()
                     {
-                        self.unsent_draft = None;
+                        self.history.title = chat_title(&text);
                     }
                     let key = format!("{}:{id}", self.generation);
                     if let Some(&row) = self.rows.get(&key)
@@ -778,6 +1072,9 @@ enum Control {
         context: Context,
     },
     ContextChanged(Context),
+    ListChats,
+    ChangeChat(Option<String>),
+    OlderMessages(String),
     Interrupt,
     Approve {
         id: String,
@@ -1073,6 +1370,12 @@ fn run_worker(
                     context = updated;
                     effects.extend(protocol.update_context(context.clone()));
                 }
+                Control::ListChats => match saved_chat_ids(&context.path) {
+                    Ok(ids) => effects.extend(protocol.list_chats(ids)),
+                    Err(error) => effects.push(Effect::Show(Event::ChatListFailed(error))),
+                },
+                Control::ChangeChat(thread) => effects.extend(protocol.change_chat(thread)?),
+                Control::OlderMessages(cursor) => effects.extend(protocol.older_messages(cursor)),
                 Control::Interrupt => {
                     if !protocol.connected() {
                         return Err("Connection cancelled before the conversation started.".into());
@@ -1112,6 +1415,75 @@ fn run_worker(
         }
     }
     Ok(())
+}
+
+fn saved_chat_ids(workspace: &Path) -> Result<Vec<String>, String> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|path| !path.is_empty())
+        .map_or_else(
+            || PathBuf::from(crate::studio::home_folder(".codex")),
+            |path| workspace.join(path),
+        );
+    if home.as_os_str().is_empty() {
+        return Err("Codex home is unavailable.".into());
+    }
+    // Older Concat rollouts have a custom source omitted by the server's
+    // interactive list. Read only the metadata row to discover their IDs.
+    // Codex still reads the title, transcript and resume state itself.
+    let mut folders = vec![(home.join("sessions"), 0)];
+    let mut ids = HashSet::new();
+    while let Some((folder, depth)) = folders.pop() {
+        let children = match read_dir(folder) {
+            Ok(children) => children,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("Could not read the Codex sessions folder.".into()),
+        };
+        for entry in children.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && depth < 3 {
+                folders.push((entry.path(), depth + 1));
+            } else if kind.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+                && let Ok(file) = File::open(entry.path())
+                && let Some(id) = saved_chat_id(file)
+            {
+                ids.insert(id);
+            }
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+fn saved_chat_id(file: impl Read) -> Option<String> {
+    let mut line = String::new();
+    BufReader::new(file.take(64 * 1024))
+        .read_line(&mut line)
+        .ok()?;
+    let value: Value = serde_json::from_str(&line).ok()?;
+    let meta = &value["payload"];
+    if value["type"] != "session_meta" || meta["originator"] != CLIENT_NAME {
+        return None;
+    }
+    let id = meta["id"].as_str()?;
+    (id.len() == 36
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-'))
+    .then(|| id.to_owned())
+}
+
+fn chat_title(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Untitled chat");
+    line.chars().take(120).collect()
 }
 
 fn effort_label(effort: &str) -> &str {
@@ -1204,5 +1576,46 @@ mod tests {
         models.select_model(0);
         models.select_effort(1);
         assert_eq!(models.selection().effort.as_deref(), Some("high"));
+    }
+    #[test]
+    fn history_discovers_legacy_concat_sessions_without_importing_other_apps() {
+        let id = "12345678-1234-1234-1234-123456789abc";
+        for source in [
+            serde_json::json!({"custom": "concat_native"}),
+            serde_json::json!("vscode"),
+        ] {
+            let metadata = serde_json::json!({"type":"session_meta","payload":{
+                "originator":CLIENT_NAME,"source":source,"id":id
+            }});
+            let rollout = format!("{metadata}\nany later items belong to Codex");
+            assert_eq!(saved_chat_id(rollout.as_bytes()).as_deref(), Some(id));
+        }
+        let foreign = serde_json::json!({"type":"session_meta","payload":{
+            "originator":"another_client","source":"vscode","id":id
+        }})
+        .to_string();
+        assert!(saved_chat_id(foreign.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn switching_chats_restores_only_the_selected_draft() {
+        let mut history = ChatHistory::default();
+        assert!(
+            history
+                .move_draft(Some("one"), "Draft one".into(), "two")
+                .is_empty()
+        );
+        assert_eq!(
+            history.move_draft(Some("two"), "Draft two".into(), "one"),
+            "Draft one"
+        );
+        assert_eq!(
+            history.move_draft(Some("one"), "Updated".into(), "two"),
+            "Draft two"
+        );
+        assert_eq!(
+            history.drafts.get("one").map(String::as_str),
+            Some("Updated")
+        );
     }
 }
