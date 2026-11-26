@@ -90,16 +90,19 @@ impl Tasks {
             .position(|task| task.phase == Phase::Running)
     }
 
+    fn waiting_slots(&self) -> Vec<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, task)| (task.phase == Phase::Waiting).then_some(index))
+            .collect()
+    }
+
     fn move_waiting(&mut self, id: u64, offset: i32) -> bool {
         if offset != -1 && offset != 1 {
             return false;
         }
-        let waiting: Vec<_> = self
-            .tasks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, task)| (task.phase == Phase::Waiting).then_some(index))
-            .collect();
+        let waiting = self.waiting_slots();
         let Some(from) = waiting.iter().position(|index| self.tasks[*index].id == id) else {
             return false;
         };
@@ -110,6 +113,43 @@ impl Tasks {
             return false;
         };
         self.tasks.swap(waiting[from], *to);
+        true
+    }
+
+    fn reorder_waiting(&mut self, id: u64, anchor: u64, after: bool) -> bool {
+        if id == anchor {
+            return false;
+        }
+        let waiting = self.waiting_slots();
+        let position = |id| waiting.iter().position(|index| self.tasks[*index].id == id);
+        let (Some(from), Some(anchor)) = (position(id), position(anchor)) else {
+            return false;
+        };
+        let insertion = anchor + usize::from(after);
+        let to = insertion - usize::from(from < insertion);
+        // Rotate through the waiting slots so that every other phase keeps its row.
+        if from < to {
+            for pair in waiting[from..=to].windows(2) {
+                self.tasks.swap(pair[0], pair[1]);
+            }
+        } else if from > to {
+            for pair in waiting[to..=from].windows(2).rev() {
+                self.tasks.swap(pair[0], pair[1]);
+            }
+        }
+        from != to
+    }
+
+    fn restore_cancelled(&mut self, id: u64) -> bool {
+        let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == id && task.phase == Phase::Cancelled)
+        else {
+            return false;
+        };
+        task.phase = Phase::Waiting;
+        task.reason.clear();
         true
     }
 
@@ -138,6 +178,7 @@ struct StoredQueue {
 pub(super) struct TaskQueue {
     file: Option<PathBuf>,
     owner: Option<QueueKey>,
+    drag_scope: u64,
     tasks: Tasks,
     persisted: Tasks,
     loaded: bool,
@@ -162,6 +203,7 @@ impl TaskQueue {
             return;
         }
         self.owner = owner;
+        self.drag_scope = self.drag_scope.wrapping_add(1);
         self.tasks = Tasks::default();
         self.persisted = Tasks::default();
         self.loaded = false;
@@ -358,7 +400,13 @@ impl AgentPane {
                 pending,
                 can_move_up,
                 can_move_down: pending && index < waiting,
+                cancelled: task.phase == Phase::Cancelled,
                 recoverable: task.phase.recoverable(),
+                drag_token: if pending {
+                    format!("queue:{}:{}", self.queue.drag_scope, task.id).into()
+                } else {
+                    Default::default()
+                },
             });
         }
         let model = &self.queue.rows;
@@ -454,6 +502,47 @@ impl AgentPane {
         }
     }
 
+    fn queue_drop_ids(&self, source: &str, target: &str) -> Option<(u64, u64)> {
+        if !self.queue.open
+            || !self.queue_visible_for_chat()
+            || !self.allowed()
+            || self.history.opening.is_some()
+        {
+            return None;
+        }
+        let (scope, id) = source.strip_prefix("queue:")?.split_once(':')?;
+        let id = id.parse().ok()?;
+        let target = target.parse().ok()?;
+        if scope.parse::<u64>().ok()? != self.queue.drag_scope || id == target {
+            return None;
+        }
+        let is_waiting = |id| {
+            self.queue
+                .tasks
+                .tasks
+                .iter()
+                .any(|task| task.id == id && task.phase == Phase::Waiting)
+        };
+        (is_waiting(id) && is_waiting(target)).then_some((id, target))
+    }
+
+    pub(super) fn can_drop_queued(&self, source: &str, target: &str) -> bool {
+        self.queue_drop_ids(source, target).is_some()
+    }
+
+    pub(super) fn drop_queued(&mut self, source: &str, target: &str, after: bool) -> bool {
+        let Some((id, target)) = self.queue_drop_ids(source, target) else {
+            return false;
+        };
+        let mut next = self.queue.tasks.clone();
+        if !next.reorder_waiting(id, target, after) {
+            return true;
+        }
+        let saved = self.queue.change(next);
+        self.publish();
+        saved
+    }
+
     pub(super) fn cancel_queued(&mut self, id: &str) {
         if let Ok(id) = id.parse::<u64>()
             && self.queue_visible_for_chat()
@@ -466,6 +555,20 @@ impl AgentPane {
                 .find(|task| task.id == id && task.phase == Phase::Waiting)
             {
                 task.phase = Phase::Cancelled;
+                self.queue.change(next);
+                self.publish();
+            }
+        }
+    }
+
+    pub(super) fn restore_cancelled_queued(&mut self, id: &str) {
+        if let Ok(id) = id.parse()
+            && self.queue_visible_for_chat()
+            && self.allowed()
+            && self.history.opening.is_none()
+        {
+            let mut next = self.queue.tasks.clone();
+            if next.restore_cancelled(id) {
                 self.queue.change(next);
                 self.publish();
             }
@@ -679,6 +782,81 @@ mod tests {
         );
         assert_eq!(tasks.next_index(), Some(1));
         assert_eq!(tasks.running(), Some(0));
+    }
+
+    #[test]
+    fn dropping_before_or_after_an_anchor_shifts_only_waiting_slots() {
+        let mut tasks = Tasks {
+            last_id: 6,
+            paused: true,
+            tasks: vec![
+                task(1, Phase::Waiting),
+                task(2, Phase::Running),
+                task(3, Phase::Waiting),
+                task(4, Phase::Cancelled),
+                task(5, Phase::Waiting),
+                task(6, Phase::Waiting),
+            ],
+        };
+        let ids = |tasks: &Tasks| tasks.tasks.iter().map(|task| task.id).collect::<Vec<_>>();
+        assert!(!tasks.reorder_waiting(1, 3, false));
+        assert!(!tasks.reorder_waiting(1, 1, true));
+        assert!(!tasks.reorder_waiting(2, 5, true));
+        assert!(!tasks.reorder_waiting(1, 4, false));
+        assert!(!tasks.reorder_waiting(99, 6, true));
+        assert_eq!(ids(&tasks), [1, 2, 3, 4, 5, 6]);
+        assert!(tasks.reorder_waiting(1, 6, true));
+        assert_eq!(ids(&tasks), [3, 2, 5, 4, 6, 1]);
+        assert!(tasks.reorder_waiting(1, 3, false));
+        assert_eq!(ids(&tasks), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(tasks.next_index(), Some(0));
+        assert_eq!(tasks.running(), Some(1));
+        assert!(tasks.paused);
+    }
+
+    #[test]
+    fn cancelled_task_returns_to_its_slot_with_its_context_after_reload() {
+        let dir = Scratch::new();
+        let key = QueueKey {
+            workspace: dir.path().to_owned(),
+            thread: "restore-cancelled".into(),
+        };
+        let mut cancelled = task(2, Phase::Cancelled);
+        cancelled.files = vec![dir.path().join("voice.wav")];
+        cancelled.project = Some(dir.path().join("project"));
+        cancelled.timeline = Some("timeline-id".into());
+        cancelled.model = Some("selected-model".into());
+        cancelled.effort = Some("high".into());
+        let mut expected = cancelled.clone();
+        expected.phase = Phase::Waiting;
+        let mut queue = TaskQueue::new(Some(dir.path()));
+        queue.sync(Some(key.clone()));
+        assert!(queue.change(Tasks {
+            last_id: 4,
+            paused: true,
+            tasks: vec![
+                task(1, Phase::Failed),
+                cancelled,
+                task(3, Phase::Waiting),
+                task(4, Phase::Interrupted)
+            ],
+        }));
+
+        let mut next = queue.tasks.clone();
+        assert_eq!(next.next_index(), Some(2));
+        assert!(!next.restore_cancelled(1));
+        assert!(!next.restore_cancelled(3));
+        assert!(!next.restore_cancelled(4));
+        assert!(next.restore_cancelled(2));
+        assert!(!next.restore_cancelled(2));
+        assert!(queue.change(next));
+
+        let mut reopened = TaskQueue::new(Some(dir.path()));
+        reopened.sync(Some(key));
+        assert_eq!(reopened.tasks.tasks[1], expected);
+        assert_eq!(reopened.tasks.next_index(), Some(1));
+        assert_eq!(reopened.tasks.last_id, 4);
+        assert!(reopened.tasks.paused);
     }
 
     #[test]

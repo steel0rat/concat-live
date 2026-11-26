@@ -88,6 +88,15 @@ libc = "0.2"
 [target.'cfg(any(target_os = "macos", target_os = "android"))'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std", "NSDragging", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSView", "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std", "NSArray", "NSObject", "NSString", "NSURL",
+] }
+
 [target.'cfg(target_os = "ios")'.dependencies]
 slint = { version = "1.18", default-features = false, features = [
     "std",
@@ -132,6 +141,8 @@ slint = { version = "1.18", default-features = false, features = [
 ] }
 
 [dependencies]
+# Backend drag delivery and editing a TextInput through the same IME path as Slint.
+i-slint-core = { version = "=1.18.1", default-features = false }
 # The log facade. The window writes `log::warn!`; where that ends up is
 # concat-host's logs.rs, opened by whichever entry point started this run.
 log = "0.4"

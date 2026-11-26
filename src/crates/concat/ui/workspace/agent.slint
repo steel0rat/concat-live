@@ -3,7 +3,7 @@
 
 import { I18n } from "../i18n.slint";
 import { Theme } from "../theme/theme.slint";
-import { Focus } from "../util.slint";
+import { Focus, Payload } from "../util.slint";
 import { Check } from "../inspector/controls.slint";
 import { Glyph, Icon } from "../icons.slint";
 import { IconButton } from "../primitives/panel.slint";
@@ -68,7 +68,9 @@ export struct AgentQueueItem {
     pending: bool,
     can-move-up: bool,
     can-move-down: bool,
+    cancelled: bool,
     recoverable: bool,
+    drag-token: string,
 }
 
 export global Agent {
@@ -98,7 +100,10 @@ export global Agent {
     callback enqueue-draft();
     callback queue-set-paused(paused: bool);
     callback queue-move(id: string, offset: int);
+    callback queue-can-drop(source: string, target: string) -> bool;
+    callback queue-drop(source: string, target: string, after: bool) -> bool;
     callback queue-cancel(id: string);
+    callback queue-restore-cancelled(id: string);
     callback queue-restore(id: string);
     in property <[AgentMessageData]> messages;
     in property <[AgentApprovalData]> approvals;
@@ -134,6 +139,8 @@ export global Agent {
     in property <[string]> attachments;
     callback choose-files();
     callback remove-file(index: int);
+    pure callback can-drop-payload(data: data-transfer) -> bool;
+    callback drop-payload(data: data-transfer, x: length, y: length) -> bool;
     in property <string> timeline-label;
     in-out property <bool> include-timeline: true;
     in property <bool> has-range;
@@ -218,6 +225,32 @@ export global Agent {
     callback approval(id: string, accepted: bool);
 }
 
+component AgentTextMenu inherits ContextMenuArea {
+    in property <bool> has-selection;
+    in property <bool> has-text;
+    in property <bool> editable;
+    callback copy-text();
+    callback paste-text();
+    callback select-text();
+
+    Menu {
+        MenuItem {
+            title: I18n.t("common.copy");
+            enabled: root.has-selection;
+            activated => { root.copy-text(); }
+        }
+        if root.editable: MenuItem {
+            title: I18n.t("studio.paste");
+            activated => { root.paste-text(); }
+        }
+        MenuItem {
+            title: I18n.t("shortcuts.selectAll");
+            enabled: root.has-text;
+            activated => { root.select-text(); }
+        }
+    }
+}
+
 component AgentWords inherits TextInput {
     min-width: 0px;
     color: Theme.fg;
@@ -227,6 +260,15 @@ component AgentWords inherits TextInput {
     wrap: word-wrap;
     selection-background-color: Theme.accent;
     selection-foreground-color: Theme.on-accent;
+
+    AgentTextMenu {
+        width: parent.width;
+        height: parent.height;
+        has-selection: root.anchor-position-byte-offset != root.cursor-position-byte-offset;
+        has-text: root.text != "";
+        copy-text => { root.copy(); }
+        select-text => { root.focus(); root.select-all(); }
+    }
 }
 
 // Bound transient speech and errors so the composer stays inside the pane.
@@ -1282,13 +1324,51 @@ component ChatQueueRow inherits Rectangle {
             wrap: word-wrap;
         }
         actions := HorizontalLayout {
-            alignment: end;
+            alignment: stretch;
             spacing: 4px;
+            if root.task.pending: Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: Theme.r;
+                background: handle.has-hover || drag.dragging ? Theme.field-hover : Colors.transparent;
+
+                accessible-role: text;
+                accessible-label: I18n.t("agent.queueDragHint");
+
+                drag := DragArea {
+                    width: parent.width;
+                    height: parent.height;
+                    enabled: root.editable;
+                    data: Payload.of(root.task.drag-token);
+                    allow-copy: false;
+                    allow-move: true;
+
+                    handle := TouchArea {
+                        enabled: root.editable;
+                        mouse-cursor: MouseCursor.grab;
+                    }
+                    for dot[index] in 6: Rectangle {
+                        x: 10px + Math.mod(index, 2) * 6px;
+                        y: 7px + Math.floor(index / 2) * 5px;
+                        width: 3px;
+                        height: 3px;
+                        border-radius: 1.5px;
+                        background: handle.has-hover ? Theme.fg : Theme.fg-muted;
+                    }
+                }
+                Tip {
+                    text: I18n.t("agent.queueDragHint");
+                    active: handle.has-hover && !drag.dragging;
+                }
+            }
+            if root.task.pending: Rectangle { horizontal-stretch: 1; }
             if root.task.pending: ChatAction {
                 label: I18n.t("agent.queueMoveUp");
                 tip: I18n.t("agent.queueMoveUpHint");
                 glyph: Glyph.chevron-up;
                 square: true;
+                max-width: 28px;
+                horizontal-stretch: 0;
                 enabled: root.editable && root.task.can-move-up;
                 clicked => { Agent.queue-move(root.task.id, -1); }
                 changed focused => { if self.focused { root.reveal-actions(); } }
@@ -1298,6 +1378,8 @@ component ChatQueueRow inherits Rectangle {
                 tip: I18n.t("agent.queueMoveDownHint");
                 glyph: Glyph.chevron-down;
                 square: true;
+                max-width: 28px;
+                horizontal-stretch: 0;
                 enabled: root.editable && root.task.can-move-down;
                 clicked => { Agent.queue-move(root.task.id, 1); }
                 changed focused => { if self.focused { root.reveal-actions(); } }
@@ -1307,21 +1389,63 @@ component ChatQueueRow inherits Rectangle {
                 tip: I18n.t("agent.queueCancelHint");
                 glyph: Glyph.close;
                 square: true;
+                max-width: 28px;
+                horizontal-stretch: 0;
                 enabled: root.editable;
                 clicked => { Agent.queue-cancel(root.task.id); }
+                changed focused => { if self.focused { root.reveal-actions(); } }
+            }
+            if root.task.cancelled: ChatAction {
+                label: I18n.t("agent.queueReturn");
+                tip: I18n.t("agent.queueReturnHint");
+                min-width: 0px;
+                elide-label: true;
+                ghost: false;
+                horizontal-stretch: 1;
+                enabled: root.editable;
+                clicked => { Tips.close(); Agent.queue-restore-cancelled(root.task.id); }
                 changed focused => { if self.focused { root.reveal-actions(); } }
             }
             if root.task.recoverable: ChatAction {
                 label: I18n.t("agent.queueRestore");
                 tip: I18n.t("agent.queueRestoreHint");
-                min-width: 0px;
-                elide-label: true;
-                horizontal-stretch: 1;
+                glyph: root.task.cancelled ? Glyph.copy : Glyph.none;
+                square: root.task.cancelled;
+                min-width: root.task.cancelled ? 28px : 0px;
+                elide-label: !root.task.cancelled;
+                horizontal-stretch: root.task.cancelled ? 0 : 1;
                 enabled: root.editable;
                 clicked => { Tips.close(); Agent.queue-restore(root.task.id); }
                 changed focused => { if self.focused { root.reveal-actions(); } }
             }
         }
+    }
+
+    landing := DropArea {
+        width: root.width;
+        height: root.height;
+        enabled: root.editable && root.task.pending;
+        property <bool> after;
+
+        can-drop(event) => {
+            self.after = event.position.y >= self.height / 2;
+            return Agent.queue-can-drop(Payload.text(event.data), root.task.id)
+                ? DragAction.move : DragAction.none;
+        }
+
+        dropped(event) => {
+            return Agent.queue-drop(Payload.text(event.data), root.task.id, event.position.y >= self.height / 2)
+                ? DragAction.move : DragAction.none;
+        }
+    }
+
+    if landing.has-drag: Rectangle {
+        x: 4px;
+        y: landing.after ? parent.height - 2px : 0px;
+        width: parent.width - 8px;
+        height: 2px;
+        border-radius: 1px;
+        background: Theme.accent;
     }
 }
 
@@ -1352,6 +1476,7 @@ component ChatQueueView inherits VerticalLayout {
         min-width: 0px;
         min-height: 0px;
         vertical-stretch: 1;
+        interactive: false;
         content-width: self.width;
         content-height: Math.max(self.height, items.preferred-height);
         accessible-role: list;
@@ -1893,7 +2018,7 @@ component ChatConversation inherits Rectangle {
                     min-box: 40px;
                     max-box: 240px;
                     content-height: input.preferred-height;
-                    focused: input.has-focus;
+                    focused: input.has-focus || drop-zone.has-drag;
                     input := TextInput {
                         y: composer.pad-y;
                         // The viewport must follow the frame, never the text's implicit width.
@@ -1938,11 +2063,38 @@ component ChatConversation inherits Rectangle {
                             return reject;
                         }
                     }
+                    AgentTextMenu {
+                        y: input.y;
+                        width: input.width;
+                        height: input.height;
+                        has-selection: input.anchor-position-byte-offset != input.cursor-position-byte-offset;
+                        has-text: input.text != "";
+                        editable: !input.read-only;
+                        copy-text => { input.copy(); }
+                        paste-text => { input.focus(); input.paste(); }
+                        select-text => { input.focus(); input.select-all(); }
+                    }
                     if Agent.draft == "" && !input.has-focus: Text {
                         y: composer.pad-y;
                         text: I18n.t("chatUi.composer");
                         color: Theme.fg-dim;
                         font-size: Theme.fs-lg;
+                    }
+                }
+                drop-zone := DropArea {
+                    width: parent.width;
+                    height: parent.height;
+                    enabled: Agent.enabled && !Agent.maintenance && !Agent.chat-opening && Agent.dictation-phase == 0;
+                    can-drop(event) => {
+                        return Agent.can-drop-payload(event.data) ? DragAction.copy : DragAction.none;
+                    }
+                    dropped(event) => {
+                        if (!Agent.can-drop-payload(event.data)) { return DragAction.none; }
+                        input.focus();
+                        return Agent.drop-payload(event.data,
+                            self.absolute-position.x + event.position.x,
+                            self.absolute-position.y + event.position.y)
+                            ? DragAction.copy : DragAction.none;
                     }
                 }
             }

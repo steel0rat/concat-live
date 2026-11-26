@@ -142,7 +142,21 @@ pub(crate) fn install(app: &App) {
     global.on_enqueue_draft(|| with_pane(AgentPane::enqueue_draft));
     global.on_queue_set_paused(|paused| with_pane(|pane| pane.set_queue_paused(paused)));
     global.on_queue_move(|id, offset| with_pane(|pane| pane.move_queued(id.as_str(), offset)));
+    global.on_queue_can_drop(|source, target| {
+        PANE.with_borrow(|slot| {
+            slot.as_ref()
+                .is_some_and(|pane| pane.can_drop_queued(source.as_str(), target.as_str()))
+        })
+    });
+    global.on_queue_drop(|source, target, after| {
+        let mut saved = false;
+        with_pane(|pane| saved = pane.drop_queued(source.as_str(), target.as_str(), after));
+        saved
+    });
     global.on_queue_cancel(|id| with_pane(|pane| pane.cancel_queued(id.as_str())));
+    global.on_queue_restore_cancelled(|id| {
+        with_pane(|pane| pane.restore_cancelled_queued(id.as_str()));
+    });
     global.on_queue_restore(|id| with_pane(|pane| pane.restore_queued(id.as_str())));
     global.on_run_quick_action(|id| with_pane(|pane| pane.run_quick_action(id.as_str())));
     global.on_pin_quick_action(|| with_pane(|pane| pane.pin_quick_action(false)));
@@ -212,6 +226,28 @@ pub(crate) fn install(app: &App) {
     global.on_load_earlier(|| with_pane(AgentPane::load_earlier));
     global.on_choose_workspace(|| with_pane(AgentPane::choose_workspace));
     global.on_choose_files(|| with_pane(AgentPane::choose_files));
+    let drop_app = app.as_weak();
+    global.on_can_drop_payload(move |data| {
+        drop_app.upgrade().is_some_and(|app| !app.get_sheet_up())
+            && (data.has_file_paths()
+                || data
+                    .user_data()
+                    .is_some_and(|text| text.is::<crate::platform::DroppedText>()))
+    });
+    let drop_app = app.as_weak();
+    global.on_drop_payload(move |data, x, y| {
+        let Some(app) = drop_app.upgrade().filter(|app| !app.get_sheet_up()) else {
+            return false;
+        };
+        if let Ok(paths) = data.file_paths() {
+            let paths: Vec<_> = paths.map(Path::to_path_buf).collect();
+            with_pane(|pane| pane.attach_files(&paths));
+            return true;
+        }
+        data.user_data()
+            .and_then(|text| text.downcast::<crate::platform::DroppedText>().ok())
+            .is_some_and(|text| crate::platform::insert_dropped_text(app.window(), &text.0, x, y))
+    });
     global.on_remove_file(|index| with_pane(|pane| pane.remove_file(index)));
     global.on_mark_range(|start| with_pane(|pane| pane.mark_range(start)));
     global.on_clear_range(|| {

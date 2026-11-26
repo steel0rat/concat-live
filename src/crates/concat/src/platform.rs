@@ -20,6 +20,11 @@
 //! itself; see [`crate::wayland_drop`].
 
 use std::path::PathBuf;
+#[cfg(not(target_os = "android"))]
+use std::rc::Rc;
+
+#[cfg(target_os = "macos")]
+mod macos_drop;
 
 use slint::PlatformError;
 // The winit backend, and so these, exist everywhere but Android, which
@@ -115,6 +120,12 @@ fn reapply_ui_scale(delay: std::time::Duration) {
 
 type DropPosition = Option<(f32, f32)>;
 
+#[cfg(not(target_os = "android"))]
+type FileDrop = dyn Fn(Vec<PathBuf>, DropPosition);
+
+/// Text from an external drag, distinct from the editor's internal drag tokens.
+pub(crate) struct DroppedText(pub slint::SharedString);
+
 /// The window's raw events, seen before Slint routes them. Two jobs:
 ///
 /// Dropped files. winit reports one path per event, in a burst, and the
@@ -142,7 +153,11 @@ type DropPosition = Option<(f32, f32)>;
 struct DropHandler {
     pending: Vec<PathBuf>,
     drop_position: DropPosition,
-    on_dropped: Box<dyn Fn(Vec<PathBuf>, DropPosition)>,
+    on_dropped: Rc<FileDrop>,
+    #[cfg(target_os = "macos")]
+    native_drop_installed: bool,
+    #[cfg(target_os = "macos")]
+    modifiers: slint::winit_030::winit::keyboard::ModifiersState,
     /// Paths a Wayland drop delivered, from the listener's thread.
     arrived: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
     /// The Wayland listener, once the window is up and is a Wayland one;
@@ -223,7 +238,11 @@ impl DropHandler {
         Self {
             pending: Vec::new(),
             drop_position: None,
-            on_dropped: Box::new(on_dropped),
+            on_dropped: Rc::new(on_dropped),
+            #[cfg(target_os = "macos")]
+            native_drop_installed: false,
+            #[cfg(target_os = "macos")]
+            modifiers: Default::default(),
             arrived: Default::default(),
             wayland: None,
             wayland_tried: false,
@@ -242,64 +261,131 @@ impl DropHandler {
     }
 }
 
-/// Winit's Finder drop event carries the paths. Sample the mouse in the
-/// AppKit content view as the event arrives.
 #[cfg(target_os = "macos")]
-fn macos_drop_position(window: &WinitWindow, slint_window: &slint::Window) -> DropPosition {
-    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use std::ffi::{c_char, c_void};
+#[derive(Debug, PartialEq, Eq)]
+enum TextEditKey {
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
+}
 
-    // NSPoint has two CGFloats, both doubles on the supported Mac targets.
-    #[repr(C)]
-    struct Point {
-        x: f64,
-        y: f64,
+#[cfg(target_os = "macos")]
+fn text_edit_key(
+    logical: &slint::winit_030::winit::keyboard::Key,
+    physical: slint::winit_030::winit::keyboard::PhysicalKey,
+) -> Option<TextEditKey> {
+    use slint::winit_030::winit::keyboard::{Key, KeyCode, PhysicalKey};
+
+    if let Key::Character(value) = logical
+        && value.is_ascii()
+    {
+        return match value.as_str() {
+            "a" | "A" => Some(TextEditKey::SelectAll),
+            "c" | "C" => Some(TextEditKey::Copy),
+            "x" | "X" => Some(TextEditKey::Cut),
+            "v" | "V" => Some(TextEditKey::Paste),
+            _ => None,
+        };
     }
 
-    #[link(name = "objc")]
-    unsafe extern "C" {
-        fn sel_registerName(name: *const c_char) -> *const c_void;
-        fn objc_msgSend();
+    // Slint's standard shortcuts expect Latin letters even when the active
+    // input source sends Cyrillic. Keep the logical key for Latin layouts.
+    match physical {
+        PhysicalKey::Code(KeyCode::KeyA) => Some(TextEditKey::SelectAll),
+        PhysicalKey::Code(KeyCode::KeyC) => Some(TextEditKey::Copy),
+        PhysicalKey::Code(KeyCode::KeyX) => Some(TextEditKey::Cut),
+        PhysicalKey::Code(KeyCode::KeyV) => Some(TextEditKey::Paste),
+        _ => None,
     }
+}
 
-    let handle = window.window_handle().ok()?;
-    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-        return None;
+#[cfg(target_os = "macos")]
+fn handle_text_edit_key(
+    window: &slint::Window,
+    event: &slint::winit_030::winit::event::KeyEvent,
+) -> bool {
+    use slint::private_unstable_api::re_exports::{TextInput, WindowInner};
+
+    let Some(action) = text_edit_key(&event.logical_key, event.physical_key) else {
+        return false;
     };
-    let view = handle.ns_view.as_ptr();
-    // SAFETY: the event loop is on AppKit's main thread and the window
-    // handle keeps the NSView live. Each send uses the selector's signature.
-    let point = unsafe {
-        let send = objc_msgSend as unsafe extern "C" fn();
-        let get_window: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
-            std::mem::transmute(send);
-        let get_location: unsafe extern "C" fn(*mut c_void, *const c_void) -> Point =
-            std::mem::transmute(send);
-        let convert: unsafe extern "C" fn(
-            *mut c_void,
-            *const c_void,
-            Point,
-            *const c_void,
-        ) -> Point = std::mem::transmute(send);
-        let ns_window = get_window(view, sel_registerName(c"window".as_ptr()));
-        if ns_window.is_null() {
-            return None;
+    let inner = WindowInner::from_pub(window);
+    let focused = inner.focus_item.borrow().upgrade();
+    if let Some(item) = focused.filter(|item| item.is_visible())
+        && let Some(input) = item.downcast::<TextInput>()
+    {
+        let input = input.as_pin_ref();
+        let adapter = inner.window_adapter();
+        match action {
+            TextEditKey::SelectAll => input.select_all(&adapter, &item),
+            TextEditKey::Copy if !input.is_password() => input.copy(&adapter, &item),
+            TextEditKey::Cut if !input.read_only() && !input.is_password() => {
+                input.cut(&adapter, &item)
+            }
+            TextEditKey::Paste if !input.read_only() => input.paste(&adapter, &item),
+            _ => {}
         }
-        let point = get_location(
-            ns_window,
-            sel_registerName(c"mouseLocationOutsideOfEventStream".as_ptr()),
-        );
-        convert(
-            view,
-            sel_registerName(c"convertPoint:fromView:".as_ptr()),
-            point,
-            std::ptr::null(),
-        )
+        return true;
+    }
+
+    use slint::platform::WindowEvent;
+    use slint::winit_030::winit::keyboard::Key;
+    if matches!(&event.logical_key, Key::Character(value) if value.is_ascii()) {
+        return false;
+    }
+    // The editor's timeline uses the same Command chords when no field
+    // owns the keyboard. Send its keymap the standard key name.
+    let text = match action {
+        TextEditKey::SelectAll => "a",
+        TextEditKey::Copy => "c",
+        TextEditKey::Cut => "x",
+        TextEditKey::Paste => "v",
+    }
+    .into();
+    window.dispatch_event(if event.repeat {
+        WindowEvent::KeyPressRepeated { text }
+    } else {
+        WindowEvent::KeyPressed { text }
+    });
+    true
+}
+
+/// Inserts dropped text at the pointer through Slint's normal edit and undo path.
+pub(crate) fn insert_dropped_text(
+    window: &slint::Window,
+    text: &slint::SharedString,
+    x: f32,
+    y: f32,
+) -> bool {
+    use i_slint_core::input::{InternalKeyEvent, KeyEventType};
+    use slint::private_unstable_api::re_exports::{LogicalPoint, TextInput, WindowInner};
+
+    let inner = WindowInner::from_pub(window);
+    let Some(item) = inner.focus_item.borrow().upgrade() else {
+        return false;
     };
-    // winit's view is flipped to match Slint's top-left origin. AppKit
-    // points follow the display's scale, while Slint can apply UI zoom too.
-    let scale = window.scale_factor() / f64::from(slint_window.scale_factor());
-    Some(((point.x * scale) as f32, (point.y * scale) as f32))
+    let Some(input) = item.downcast::<TextInput>() else {
+        return false;
+    };
+    let input = input.as_pin_ref();
+    if input.read_only() || text.is_empty() {
+        return false;
+    }
+    let adapter = inner.window_adapter();
+    let origin = item.map_to_window(LogicalPoint::default());
+    let local = LogicalPoint::new((x - origin.x).max(0.0), (y - origin.y).max(0.0));
+    let (offset, _) = input.byte_offset_for_position(local, &adapter, &item);
+    let offset = i32::try_from(offset).unwrap_or(i32::MAX);
+    input.set_selection_offsets(&adapter, &item, offset, offset);
+
+    let mut event = InternalKeyEvent {
+        event_type: KeyEventType::CommitComposition,
+        ..Default::default()
+    };
+    event.key_event.text = text.clone();
+    window.dispatch_event(slint::platform::WindowEvent::internal(event));
+    true
 }
 
 /// Whether a press at (`x`, `y`), in logical pixels of `window`, lands
@@ -345,6 +431,13 @@ impl CustomApplicationHandler for DropHandler {
             self.fitted = true;
             fit_to_screen(window);
         }
+        #[cfg(target_os = "macos")]
+        if !self.native_drop_installed
+            && let (Some(native), Some(window)) = (winit_window, slint_window)
+        {
+            self.native_drop_installed =
+                macos_drop::install(native, window, Rc::clone(&self.on_dropped));
+        }
         if !self.wayland_tried
             && let Some(window) = winit_window
         {
@@ -369,13 +462,31 @@ impl CustomApplicationHandler for DropHandler {
             _ => {}
         }
         match event {
+            #[cfg(target_os = "macos")]
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            #[cfg(target_os = "macos")]
+            WindowEvent::Focused(false) => self.modifiers = Default::default(),
+            #[cfg(target_os = "macos")]
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } if event.state == ElementState::Pressed
+                && self.modifiers.super_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.control_key()
+                && !self.modifiers.shift_key()
+                && slint_window.is_some_and(|window| handle_text_edit_key(window, event)) =>
+            {
+                return EventResult::PreventDefault;
+            }
             WindowEvent::ScaleFactorChanged { .. } => reapply_ui_scale(std::time::Duration::ZERO),
             WindowEvent::DroppedFile(path) => {
                 #[cfg(target_os = "macos")]
                 if self.pending.is_empty() {
                     self.drop_position = winit_window
                         .zip(slint_window)
-                        .and_then(|(window, slint)| macos_drop_position(window, slint));
+                        .and_then(|(window, slint)| macos_drop::mouse_position(window, slint));
                 }
                 self.pending.push(path.clone());
             }
