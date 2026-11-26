@@ -117,7 +117,7 @@ impl PauseScan {
         self.peak = self.peak.max(magnitude);
         self.energy += u64::from(magnitude * magnitude);
         self.frames += 1;
-        if self.frames % BLOCK_FRAMES != 0 {
+        if !self.frames.is_multiple_of(BLOCK_FRAMES) {
             return None;
         }
         let at = self.frames - BLOCK_FRAMES;

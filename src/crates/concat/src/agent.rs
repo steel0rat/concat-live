@@ -1666,10 +1666,10 @@ impl AgentPane {
         };
         let folder = receipt.before.folder.clone();
         crate::host::on_ui(move |studio, _, _| {
-            if !studio
+            if studio
                 .session
                 .as_ref()
-                .is_some_and(|session| Path::new(session.path()) == folder)
+                .is_none_or(|session| Path::new(session.path()) != folder)
             {
                 studio.notify(&crate::i18n::t("chatUi.openOriginalForEdit"), false);
                 return;

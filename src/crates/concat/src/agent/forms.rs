@@ -100,10 +100,10 @@ pub(crate) fn handle_shortcut(action: &str) -> bool {
                 else {
                     return;
                 };
-                if !pane
+                if pane
                     .context
                     .as_ref()
-                    .is_some_and(|context| context.project.is_some())
+                    .is_none_or(|context| context.project.is_none())
                     || !pane.quick_actions.as_ref().is_some_and(|actions| {
                         actions.prompt(id).is_some() || actions.template_fields(id).is_some()
                     })
