@@ -10,6 +10,8 @@ import { Tip } from "../primitives/tooltip.slint";
 import { NumberField } from "../primitives/number-field.slint";
 import { Select } from "../primitives/select.slint";
 import { Pane, PaneHeader } from "pane.slint";
+import { ReferenceOpenButton } from "reference-pane.slint";
+import { ObjectFollowButton, ObjectFollowRegion, ObjectFollowStatus, ObjectFollowUi } from "object-follow-overlay.slint";
 import { PaneKind, PaneSwitcher } from "pane-switcher.slint";
 import { ClipKind, StageGuideData, StageItemData } from "../timeline/model.slint";
 import { ContextMenu, MenuMetrics, MenuRow } from "../primitives/context-menu.slint";
@@ -129,6 +131,11 @@ component RatioPicker inherits Rectangle {
             root.active = root.current;
             list.show();
         }
+    }
+
+    Tip {
+        text: I18n.t("previewPane.aspectTip");
+        active: trigger.has-hover && !root.open;
     }
 
     list := PopupWindow {
@@ -843,7 +850,7 @@ export component PreviewPane inherits Rectangle {
 
             // The output, stated rather than implied. Tabular-ish and dim: it
             // is a fact about the project, not a control.
-            VerticalLayout {
+            if root.width >= 315px: VerticalLayout {
                 alignment: center;
                 Text {
                     text: "\{root.output-width} × \{root.output-height} · \{Math.round(root.frame-rate)} fps";
@@ -852,6 +859,15 @@ export component PreviewPane inherits Rectangle {
                     font-size: Theme.fs;
                     vertical-alignment: center;
                 }
+            }
+
+            if ObjectFollowUi.can-start || ObjectFollowUi.selecting || ObjectFollowUi.running: VerticalLayout {
+                alignment: center;
+                ObjectFollowButton { }
+            }
+            VerticalLayout {
+                alignment: center;
+                ReferenceOpenButton { pane-seat: root.pane-seat; }
             }
 
             VerticalLayout {
@@ -1081,6 +1097,7 @@ export component PreviewPane inherits Rectangle {
             // sibling rather than a child because the stage clips, and a grip
             // sits half outside the edge it belongs to.
             overlay := StageOverlay {
+                visible: root.bare || !ObjectFollowUi.selecting;
                 x: stage.x;
                 y: stage.y;
                 width: stage.width;
@@ -1105,6 +1122,20 @@ export component PreviewPane inherits Rectangle {
                     frame-menu.request-y = self.absolute-position.y - root.absolute-position.y + y;
                     root.frame-token += 1;
                 }
+            }
+
+            if !root.bare && ObjectFollowUi.selecting: ObjectFollowRegion {
+                x: stage.x;
+                y: stage.y;
+                width: stage.width;
+                height: stage.height;
+            }
+
+            if !root.bare && (ObjectFollowUi.selecting || ObjectFollowUi.running): ObjectFollowStatus {
+                x: 8px;
+                y: 8px;
+                width: Math.max(0px, parent.width - 16px);
+                height: 28px;
             }
 
             // A look shown over the picture from the library, not laid down:
@@ -1157,6 +1188,10 @@ export component PreviewPane inherits Rectangle {
                             end-touch := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => { root.preview-ended(); }
+                            }
+                            Tip {
+                                text: I18n.t("previewPane.dismissLookTip");
+                                active: end-touch.has-hover;
                             }
                         }
                     }
@@ -1245,6 +1280,8 @@ export component PreviewPane inherits Rectangle {
                         alignment: center;
                         NumberField {
                             width: 116px;
+                            accessible-name: I18n.t("previewPane.timecode");
+                            tip: I18n.t("previewPane.timecodeTip");
                             value <=> root.shown-frames;
                             minimum: 0;
                             maximum: root.playhead-free ? 1000000000 : root.total-frames;
@@ -1253,8 +1290,7 @@ export component PreviewPane inherits Rectangle {
                             // speed a hand expects, not fly a hundred at once.
                             px-per-step: 3px;
                             format(v) => {
-                                return Fmt.frames-timecode(v / root.frame-rate,
-                                    root.frame-rate);
+                                return Fmt.frame-count-timecode(v, root.frame-rate);
                             }
                             parse(text) => {
                                 return Fmt.parse-frames(text, root.frame-rate);
@@ -1281,12 +1317,14 @@ export component PreviewPane inherits Rectangle {
                     IconButton {
                         glyph: Glyph.skip-back;
                         label: I18n.t("common.goToStart");
+                        tip: I18n.t("previewPane.startTip");
                         enabled: !root.at-start;
                         clicked => { root.seek(0); }
                     }
                     IconButton {
                         glyph: Glyph.step-back;
                         label: I18n.t("previewPane.previousFrame");
+                        tip: I18n.t("previewPane.previousTip");
                         enabled: !root.at-start;
                         clicked => { root.step(-1); }
                     }
@@ -1296,6 +1334,7 @@ export component PreviewPane inherits Rectangle {
                     IconButton {
                         glyph: root.playing ? Glyph.pause : Glyph.play;
                         label: root.playing ? I18n.t("previewPane.pause") : I18n.t("previewPane.play");
+                        tip: root.playing ? I18n.t("previewPane.pauseTip") : I18n.t("previewPane.playTip");
                         icon-size: 16px;
                         accent: true;
                         clicked => { root.play-toggled(); }
@@ -1304,12 +1343,14 @@ export component PreviewPane inherits Rectangle {
                     IconButton {
                         glyph: Glyph.step-forward;
                         label: I18n.t("previewPane.nextFrame");
+                        tip: I18n.t("previewPane.nextTip");
                         enabled: !root.at-end;
                         clicked => { root.step(1); }
                     }
                     IconButton {
                         glyph: Glyph.skip-forward;
                         label: I18n.t("common.goToEnd");
+                        tip: I18n.t("previewPane.endTip");
                         enabled: !root.at-end;
                         clicked => { root.seek(root.duration); }
                     }
@@ -1341,6 +1382,7 @@ export component PreviewPane inherits Rectangle {
                             snug: true;
                             width: self.natural-width;
                             current: root.quality-index;
+                            tip: I18n.t("previewPane.qualityTip");
                             options: [I18n.t("common.full"), I18n.t("previewPane.half"), I18n.t("previewPane.quarter")];
                             details: ["1:1", "1:2", "1:4"];
                             changed(index) => { root.quality-changed(index); }
@@ -1355,6 +1397,7 @@ export component PreviewPane inherits Rectangle {
                         IconButton {
                             glyph: Glyph.fit;
                             label: I18n.t("previewPane.fitFramePane");
+                            tip: I18n.t("previewPane.fitTip");
                             enabled: !viewport.fitted;
                             clicked => { viewport.fit(); }
                         }

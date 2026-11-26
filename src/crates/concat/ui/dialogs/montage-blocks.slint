@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Concat Live contributors
+
+import { I18n } from "../i18n.slint";
+import { Theme } from "../theme/theme.slint";
+import { Glyph } from "../icons.slint";
+import { DialogSection, Field, Modal } from "../primitives/modal.slint";
+import { Tip } from "../primitives/tooltip.slint";
+import { Focus } from "../util.slint";
+import { ChatAction } from "../workspace/agent.slint";
+
+export struct MontageBlockCard {
+    id: string,
+    name: string,
+    detail: string,
+}
+
+export global MontageBlocks {
+    in property <bool> available;
+    in property <bool> open;
+    in property <bool> busy;
+    in property <bool> can-save;
+    in-out property <string> name;
+    in property <string> error;
+    in property <string> info;
+    in property <[MontageBlockCard]> blocks;
+    in property <[string]> dependencies;
+    callback open-library();
+    callback closed();
+    callback save-selection(include-dependencies: bool);
+    callback insert-block(id: string);
+}
+
+export component MontageBlockDialog inherits Modal {
+    open: MontageBlocks.open;
+    title: I18n.t("blocks.title");
+    glyph: Glyph.shapes;
+    surface-width: 500px;
+    dismissable: !MontageBlocks.busy;
+    closed => { MontageBlocks.closed(); }
+
+    VerticalLayout {
+        DialogSection {
+            title: I18n.t("blocks.new");
+            first: true;
+
+            if !MontageBlocks.can-save: Text {
+                text: I18n.t("blocks.noSelection");
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+            if MontageBlocks.can-save: Rectangle {
+                height: name-label.preferred-height;
+                accessible-role: text;
+                accessible-label: I18n.t("blocks.name");
+                accessible-description: I18n.t("blocks.nameTip");
+                name-label := Text {
+                    text: I18n.t("blocks.name");
+                    color: Theme.fg-muted;
+                    font-size: Theme.fs;
+                }
+                name-hover := TouchArea { }
+                Tip {
+                    text: I18n.t("blocks.nameTip");
+                    active: name-hover.has-hover;
+                }
+            }
+            if MontageBlocks.can-save: Field {
+                value: MontageBlocks.name;
+                placeholder: I18n.t("blocks.name");
+                max-length: 120;
+                accessible-role: text-input;
+                accessible-label: I18n.t("blocks.name");
+                accessible-description: I18n.t("blocks.nameTip");
+                accessible-value: MontageBlocks.name;
+                edited(text) => { if !MontageBlocks.busy { MontageBlocks.name = text; } }
+            }
+            if MontageBlocks.dependencies.length > 0: Text {
+                text: I18n.t("blocks.dependencies");
+                color: Theme.fg;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+            for dependency in MontageBlocks.dependencies: Text {
+                text: dependency;
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+            if MontageBlocks.can-save: ChatAction {
+                label: MontageBlocks.dependencies.length > 0
+                    ? I18n.t("blocks.includeAndSave") : I18n.t("blocks.save");
+                tip: MontageBlocks.dependencies.length > 0
+                    ? I18n.t("blocks.includeAndSaveTip") : I18n.t("blocks.saveTip");
+                enabled: !MontageBlocks.busy && MontageBlocks.name != "";
+                primary: true;
+                ghost: false;
+                elide-label: true;
+                horizontal-stretch: 1;
+                clicked => {
+                    Focus.release();
+                    MontageBlocks.save-selection(MontageBlocks.dependencies.length > 0);
+                }
+            }
+            if MontageBlocks.info != "": Text {
+                text: MontageBlocks.info;
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+            if MontageBlocks.error != "": Text {
+                text: MontageBlocks.error;
+                color: Theme.danger;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+        }
+
+        DialogSection {
+            title: I18n.t("blocks.savedBlocks");
+            if !MontageBlocks.busy && MontageBlocks.blocks.length == 0: Text {
+                text: I18n.t("blocks.empty");
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+
+            for block in MontageBlocks.blocks: HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text {
+                        text: block.name;
+                        min-width: 0px;
+                        color: Theme.fg;
+                        font-weight: Theme.weight-title;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: block.detail;
+                        min-width: 0px;
+                        color: Theme.fg-muted;
+                        font-size: Theme.fs-sm;
+                        overflow: elide;
+                    }
+                }
+                ChatAction {
+                    label: I18n.t("blocks.insert");
+                    accessible-name: I18n.t1("blocks.insertNamed", block.name);
+                    tip: I18n.t("blocks.insertTip");
+                    enabled: !MontageBlocks.busy;
+                    ghost: false;
+                    clicked => { MontageBlocks.insert-block(block.id); }
+                }
+            }
+
+            ChatAction {
+                label: I18n.t("blocks.close");
+                tip: I18n.t("blocks.closeTip");
+                ghost: false;
+                enabled: !MontageBlocks.busy;
+                clicked => { MontageBlocks.closed(); }
+            }
+        }
+    }
+}

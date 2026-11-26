@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // SPDX-FileCopyrightText: 2026 Concat contributors
 
+import { I18n } from "../i18n.slint";
 import { Theme } from "../theme/theme.slint";
+import { Focus } from "../util.slint";
+import { Check } from "../inspector/controls.slint";
 import { Glyph, Icon } from "../icons.slint";
 import { IconButton } from "../primitives/panel.slint";
 import { Select } from "../primitives/select.slint";
@@ -9,7 +12,10 @@ import { LevelMeter } from "../primitives/level-meter.slint";
 import { Button, Field } from "../primitives/modal.slint";
 import { ResizeBox } from "../primitives/resize-box.slint";
 import { ThinScrollbar } from "../primitives/scrollbar.slint";
+import { Tip, Tips } from "../primitives/tooltip.slint";
+import { PauseCutData, TimelineNoteData } from "../timeline/model.slint";
 import { Pane, PaneHeader } from "pane.slint";
+import { ProjectBriefEditor } from "project-brief.slint";
 import { PaneKind, PaneSwitcher } from "pane-switcher.slint";
 
 export struct AgentMessageData {
@@ -18,6 +24,9 @@ export struct AgentMessageData {
     text: string,
     streaming: bool,
     failed: bool,
+    context: string,
+    edit-links: [string],
+    has-checkpoint: bool,
 }
 
 export struct AgentApprovalData {
@@ -32,6 +41,34 @@ export struct AgentSavedChatData {
     workspace: string,
     active: bool,
     has-draft: bool,
+}
+
+export struct AgentQuickActionData {
+    id: string,
+    label: string,
+    pinned: bool,
+}
+
+export struct AgentParameterData {
+    name: string,
+    value: string,
+}
+
+export struct AgentEditTrackData {
+    id: string,
+    label: string,
+    selected: bool,
+}
+
+export struct AgentQueueItem {
+    id: string,
+    prompt: string,
+    status: string,
+    detail: string,
+    pending: bool,
+    can-move-up: bool,
+    can-move-down: bool,
+    recoverable: bool,
 }
 
 export global Agent {
@@ -50,12 +87,25 @@ export global Agent {
     callback chat-filter-edited(query: string);
     callback open-chat(id: string);
     callback load-earlier();
+    in property <bool> queue-open;
+    in property <bool> queue-paused;
+    in property <bool> queue-can-enqueue;
+    in property <bool> queue-can-run;
+    in property <int> queue-count;
+    in property <[AgentQueueItem]> queue-items;
+    in property <string> queue-error;
+    callback toggle-queue();
+    callback enqueue-draft();
+    callback queue-set-paused(paused: bool);
+    callback queue-move(id: string, offset: int);
+    callback queue-cancel(id: string);
+    callback queue-restore(id: string);
     in property <[AgentMessageData]> messages;
     in property <[AgentApprovalData]> approvals;
     in-out property <string> draft;
     in property <bool> busy;
     in property <bool> maintenance;
-    in property <string> status: "Describe what you want to create or edit";
+    in property <string> status: I18n.t("chatUi.emptyPrompt");
     in property <string> error;
     in property <string> project-name;
     in property <bool> has-project;
@@ -64,8 +114,8 @@ export global Agent {
     in property <[string]> effort-options;
     in-out property <int> model-index: -1;
     in-out property <int> effort-index: -1;
-    in property <string> model-placeholder: "Connect to Codex";
-    in property <string> effort-placeholder: "Default";
+    in property <string> model-placeholder: I18n.t("chatUi.connect");
+    in property <string> effort-placeholder: I18n.t("chatUi.defaultEffort");
     callback model-selected(index: int);
     callback effort-selected(index: int);
     in property <bool> dictation-available;
@@ -81,6 +131,85 @@ export global Agent {
     callback dictation-stop();
     callback dictation-cancel();
     callback choose-workspace();
+    in property <[string]> attachments;
+    callback choose-files();
+    callback remove-file(index: int);
+    in property <string> timeline-label;
+    in-out property <bool> include-timeline: true;
+    in property <bool> has-range;
+    in property <bool> edit-scope-open;
+    in property <bool> edit-scope-active;
+    in property <bool> edit-scope-can-save;
+    in property <bool> edit-scope-limit-range;
+    in property <bool> edit-scope-range-ready;
+    in property <[AgentEditTrackData]> edit-scope-tracks;
+    in property <string> edit-scope-summary;
+    in property <string> edit-scope-range-label;
+    in property <string> edit-scope-error;
+    callback toggle-edit-scope();
+    callback edit-scope-track(id: string, included: bool);
+    callback toggle-edit-scope-range(enabled: bool);
+    callback save-edit-scope();
+    callback clear-edit-scope();
+    in property <[AgentQuickActionData]> quick-actions;
+    in property <bool> quick-ready;
+    callback run-quick-action(id: string);
+    in property <bool> cutaway-ready;
+    callback suggest-cutaways();
+    callback pin-quick-action();
+    callback pin-template();
+    in property <[AgentParameterData]> parameter-fields;
+    in property <string> parameter-title;
+    in property <string> parameter-scope;
+    in property <string> parameter-error;
+    in property <bool> parameter-can-send;
+    callback parameter-edited(index: int, value: string);
+    callback submit-parameters();
+    callback cancel-parameters();
+    in property <bool> brief-open;
+    in property <bool> brief-can-save;
+    in property <string> brief-error;
+    in-out property <string> brief-goal;
+    in-out property <string> brief-audience;
+    in-out property <string> brief-style;
+    callback toggle-brief();
+    callback save-brief();
+    callback unpin-quick-action(id: string);
+    in property <[PauseCutData]> pause-cuts;
+    in property <int> pause-selected-count;
+    in property <int> pause-audition: -1;
+    in property <bool> pause-can-apply;
+    callback set-pause-included(id: int, included: bool);
+    callback jump-to-pause(id: int);
+    callback audition-pause(id: int);
+    callback apply-pause-cuts();
+    callback discard-pause-cuts();
+    in property <[TimelineNoteData]> notes;
+    in property <bool> notes-open;
+    in property <string> note-target;
+    in property <string> notes-error;
+    in property <bool> notes-can-send;
+    in-out property <string> note-draft;
+    in property <int> note-focus;
+    in-out property <int> note-edit-id;
+    in-out property <string> note-edit-draft;
+    callback toggle-notes();
+    callback add-note(text: string) -> bool;
+    callback edit-note(id: int, text: string) -> bool;
+    callback select-note(id: int, selected: bool);
+    callback jump-to-note(id: int);
+    callback review-note(id: int, accepted: bool);
+    callback remove-note(id: int);
+    callback send-notes();
+    in property <string> undoable-message;
+    callback mark-range(start: bool);
+    callback clear-range();
+    callback jump-to-edit(id: string, index: int);
+    callback restore-turn(id: string, copy: bool);
+    in-out property <length> drop-left;
+    in-out property <length> drop-top;
+    in-out property <length> drop-width;
+    in-out property <length> drop-height;
     callback draft-edited(text: string);
     callback submitted();
     callback interrupt();
@@ -137,16 +266,25 @@ component AgentTextViewport inherits Flickable {
     }
 }
 
-component ChatAction inherits Rectangle {
+export component ChatAction inherits Rectangle {
     in property <string> label;
+    in property <string> accessible-name: root.label;
+    in property <string> tip: root.square ? root.label : "";
     in property <bool> enabled: true;
     in property <bool> ghost: true;
+    in property <bool> primary;
+    in property <bool> elide-label;
+    in property <Glyph> glyph: Glyph.none;
+    in property <bool> square;
+    out property <bool> focused: keys.has-focus;
     callback clicked();
     min-width: action.min-width;
     min-height: action.min-height;
     max-height: action.max-height;
     accessible-role: button;
-    accessible-label: root.label;
+    accessible-label: root.accessible-name;
+    accessible-description: root.tip != root.accessible-name ? root.tip : "";
+    accessible-enabled: root.enabled;
     accessible-action-default => {
         if root.enabled { root.clicked(); }
     }
@@ -163,12 +301,822 @@ component ChatAction inherits Rectangle {
     action := Button {
         width: parent.width;
         height: parent.height;
-        label: root.label;
+        label: root.elide-label ? "" : root.label;
         enabled: root.enabled;
         ghost: root.ghost;
+        primary: root.primary;
+        glyph: root.glyph;
+        square: root.square;
+        tip: root.tip;
         border-width: keys.has-focus ? 1px : 0px;
         border-color: Theme.accent;
         clicked => { root.clicked(); }
+    }
+    if root.elide-label: Text {
+        x: 8px;
+        width: Math.max(0px, root.width - 16px);
+        height: root.height;
+        text: root.label;
+        overflow: elide;
+        vertical-alignment: center;
+        color: Theme.fg;
+        opacity: root.enabled ? 1.0 : 0.45;
+        font-size: Theme.fs;
+        font-weight: Theme.weight-title;
+    }
+}
+
+component NoteInput inherits Rectangle {
+    in-out property <string> value;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <int> focus-request;
+    callback submitted();
+    callback edited(text: string);
+
+    init => { if root.focus-request > 0 { input.focus(); } }
+    changed focus-request => { if root.focus-request > 0 { input.focus(); } }
+
+    min-width: 0px;
+    min-height: frame.min-box;
+    max-height: frame.max-box;
+    preferred-height: Math.clamp(frame.box-height, frame.min-box, frame.max-box);
+    vertical-stretch: 0;
+
+    frame := ResizeBox {
+        width: parent.width;
+        height: parent.height;
+        min-box: 44px;
+        max-box: 120px;
+        box-height: 64px;
+        focused: input.has-focus;
+        content-height: input.preferred-height;
+
+        input := TextInput {
+            y: frame.pad-y;
+            width: Math.max(0px, frame.width - 2 * frame.pad-x);
+            height: Math.max(self.preferred-height, frame.view-height);
+            text <=> root.value;
+            accessible-label: root.label;
+            edited => { root.edited(self.text); }
+            enabled: root.enabled;
+            color: Theme.fg;
+            font-size: Theme.fs-lg;
+            single-line: false;
+            wrap: word-wrap;
+            selection-background-color: Theme.accent;
+            selection-foreground-color: Theme.on-accent;
+            cursor-position-changed(at) => { frame.reveal(at.y, self.font-size * 1.4); }
+            key-pressed(event) => {
+                if (event.text == Key.Return && (event.modifiers.control || event.modifiers.meta)) {
+                    root.submitted();
+                    return accept;
+                }
+                return reject;
+            }
+        }
+        if root.value == "" && !input.has-focus: Text {
+            y: frame.pad-y;
+            text: root.label;
+            color: Theme.fg-dim;
+            font-size: Theme.fs-lg;
+        }
+    }
+}
+
+component TimelineNoteRow inherits Rectangle {
+    in property <TimelineNoteData> note;
+    in property <bool> can-edit;
+    property <bool> may-change: root.can-edit && !root.note.working;
+    min-height: body.preferred-height;
+    min-width: 0px;
+    border-radius: Theme.r;
+    border-width: 1px;
+    border-color: root.note.selected ? Theme.accent : Theme.line;
+    background: Theme.field;
+
+    body := VerticalLayout {
+        padding: 7px;
+        spacing: 5px;
+        HorizontalLayout {
+            spacing: 4px;
+            if root.note.status == 0: ChatAction {
+                label: (root.note.selected ? I18n.t1("chatUi.deselectNote", "" + root.note.id) : I18n.t1("chatUi.selectNote", "" + root.note.id));
+                glyph: root.note.selected ? Glyph.check : Glyph.none;
+                square: true;
+                ghost: false;
+                enabled: root.may-change;
+                clicked => { Agent.select-note(root.note.id, !root.note.selected); }
+            }
+            ChatAction {
+                label: root.note.label;
+                accessible-name: I18n.t1("chatUi.goNote", "" + root.note.id);
+                min-width: 0px;
+                horizontal-stretch: 1;
+                elide-label: true;
+                enabled: !Agent.maintenance;
+                clicked => { Agent.jump-to-note(root.note.id); }
+            }
+            Text {
+                text: root.note.working ? I18n.t("chatUi.noteWorking")
+                    : root.note.status == 1 ? I18n.t("chatUi.noteReview")
+                    : root.note.status == 2 ? I18n.t("chatUi.noteDone") : I18n.t("chatUi.noteOpen");
+                color: root.note.working ? Theme.accent
+                    : root.note.status == 1 ? Theme.warn
+                    : root.note.status == 2 ? Theme.green : Theme.fg-muted;
+                font-size: Theme.fs-sm;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            min-width: 0px;
+            text: root.note.text;
+            color: Theme.fg;
+            font-size: Theme.fs;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 3px;
+            ChatAction {
+                label: I18n.t("chatUi.editNote");
+                tip: I18n.t("chatUi.editNoteTip");
+                accessible-name: I18n.t1("chatUi.editNoteNumber", "" + root.note.id);
+                enabled: root.may-change && Agent.note-edit-id == 0;
+                clicked => {
+                    Agent.note-edit-id = root.note.id;
+                    Agent.note-edit-draft = root.note.text;
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            if root.note.status == 1: ChatAction {
+                label: I18n.t("chatUi.approveNote");
+                tip: I18n.t("chatUi.approveNoteTip");
+                accessible-name: I18n.t1("chatUi.approveNoteNumber", "" + root.note.id);
+                enabled: root.may-change;
+                clicked => { Agent.review-note(root.note.id, true); }
+            }
+            if root.note.status > 0: ChatAction {
+                label: I18n.t("chatUi.reopenNote");
+                tip: I18n.t("chatUi.reopenNoteTip");
+                accessible-name: I18n.t1("chatUi.reopenNoteNumber", "" + root.note.id);
+                enabled: root.may-change;
+                clicked => { Agent.review-note(root.note.id, false); }
+            }
+            ChatAction {
+                label: I18n.t1("chatUi.removeNote", "" + root.note.id);
+                tip: I18n.t("chatUi.removeNoteTip");
+                glyph: Glyph.trash;
+                square: true;
+                enabled: root.may-change;
+                clicked => {
+                    let id = root.note.id;
+                    Agent.remove-note(id);
+                    if (Agent.notes-error == "" && Agent.note-edit-id == id) {
+                        Agent.note-edit-id = 0;
+                        Agent.note-edit-draft = "";
+                    }
+                }
+            }
+        }
+    }
+}
+
+component TimelineNotesView inherits VerticalLayout {
+    property <bool> can-edit: Agent.enabled && Agent.has-project && !Agent.maintenance;
+    min-width: 0px;
+    min-height: 0px;
+    preferred-height: 0px;
+    vertical-stretch: 1;
+    padding-left: 12px;
+    padding-right: 12px;
+    padding-bottom: 10px;
+    spacing: 8px;
+
+    function add() {
+        if (root.can-edit && Agent.note-draft != "" && Agent.add-note(Agent.note-draft)) {
+            Agent.note-draft = "";
+        }
+    }
+    function save() {
+        if (root.can-edit && Agent.note-edit-draft != ""
+            && Agent.edit-note(Agent.note-edit-id, Agent.note-edit-draft)) {
+            root.cancel-edit();
+        }
+    }
+    function cancel-edit() {
+        Agent.note-edit-id = 0;
+        Agent.note-edit-draft = "";
+    }
+
+    if Agent.notes-error != "": AgentTextViewport {
+        value: Agent.notes-error;
+        ink: Theme.danger;
+    }
+
+    viewport := Flickable {
+        min-width: 0px;
+        min-height: 0px;
+        preferred-height: 0px;
+        vertical-stretch: 1;
+        content-width: self.width;
+        content-height: Math.max(self.height, items.preferred-height);
+
+        items := VerticalLayout {
+            width: Math.max(0px, viewport.width - 8px);
+            spacing: 5px;
+            alignment: start;
+            if Agent.notes.length == 0: Text {
+                text: I18n.t("chatUi.notesEmpty");
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+            for note in Agent.notes: TimelineNoteRow {
+                note: note;
+                can-edit: root.can-edit;
+            }
+        }
+        ThinScrollbar {
+            x: parent.width - self.width;
+            y: -viewport.content-y;
+            height: viewport.height;
+            viewport: viewport.height;
+            content: viewport.content-height;
+            offset: -viewport.content-y;
+            scrolled(to) => { viewport.content-y = -to; }
+        }
+    }
+
+    if Agent.note-edit-id > 0: VerticalLayout {
+        spacing: 5px;
+        Text {
+            text: I18n.t1("chatUi.editNoteNumber", "" + Agent.note-edit-id);
+            color: Theme.fg-muted;
+            font-size: Theme.fs;
+        }
+        NoteInput {
+            value <=> Agent.note-edit-draft;
+            label: I18n.t("chatUi.noteEditText");
+            focus-request: Agent.note-focus;
+            enabled: root.can-edit;
+            submitted => { root.save(); }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 5px;
+            ChatAction {
+                label: I18n.t("chatUi.cancelEdit");
+                tip: I18n.t("chatUi.cancelEditTip");
+                clicked => { root.cancel-edit(); }
+            }
+            ChatAction {
+                label: I18n.t("chatUi.saveNote");
+                tip: I18n.t("chatUi.saveNoteTip");
+                primary: true;
+                enabled: root.can-edit && Agent.note-edit-draft != "";
+                clicked => { root.save(); }
+            }
+        }
+    }
+    if Agent.note-edit-id == 0: VerticalLayout {
+        spacing: 5px;
+        Text {
+            text: Agent.note-target;
+            min-width: 0px;
+            overflow: elide;
+            color: Theme.fg-muted;
+            font-size: Theme.fs;
+        }
+        HorizontalLayout {
+            spacing: 4px;
+            ChatAction {
+                label: I18n.t("chatUi.setIn");
+                tip: I18n.t("chatUi.setInTip");
+                enabled: root.can-edit;
+                clicked => { Agent.mark-range(true); }
+            }
+            ChatAction {
+                label: I18n.t("chatUi.setOut");
+                tip: I18n.t("chatUi.setOutTip");
+                enabled: root.can-edit && Agent.has-range;
+                clicked => { Agent.mark-range(false); }
+            }
+            if Agent.has-range: ChatAction {
+                label: I18n.t("chatUi.clearRange");
+                tip: I18n.t("chatUi.clearRangeTip");
+                enabled: root.can-edit;
+                clicked => { Agent.clear-range(); }
+            }
+        }
+        NoteInput {
+            value <=> Agent.note-draft;
+            label: I18n.t("chatUi.noteText");
+            focus-request: Agent.note-focus;
+            enabled: root.can-edit;
+            submitted => { root.add(); }
+        }
+        HorizontalLayout {
+            spacing: 5px;
+            ChatAction {
+                label: I18n.t("chatUi.addNote");
+                tip: I18n.t("chatUi.addNoteTip");
+                primary: true;
+                enabled: root.can-edit && Agent.note-draft != "";
+                clicked => { root.add(); }
+            }
+            ChatAction {
+                label: I18n.t("chatUi.sendNotes");
+                tip: I18n.t("chatUi.sendNotesTip");
+                min-width: 0px;
+                horizontal-stretch: 1;
+                elide-label: true;
+                enabled: root.can-edit && Agent.notes-can-send;
+                clicked => { Agent.send-notes(); }
+            }
+        }
+    }
+}
+
+component ChatPauseReview inherits Rectangle {
+    property <bool> can-edit: Agent.enabled && !Agent.maintenance && !Agent.busy
+        && !Agent.chat-opening && Agent.dictation-phase == 0;
+    min-width: 0px;
+    min-height: contents.preferred-height;
+    border-radius: Theme.r;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.field;
+
+    contents := VerticalLayout {
+        padding: 8px;
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: I18n.t("chatUi.reviewPauses");
+                color: Theme.fg;
+                font-size: Theme.fs;
+                font-weight: Theme.weight-title;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                min-width: 0px;
+                overflow: elide;
+            }
+            Text {
+                text: Agent.pause-selected-count + " of " + Agent.pause-cuts.length + " selected";
+                color: Theme.fg-muted;
+                font-size: Theme.fs-sm;
+                vertical-alignment: center;
+            }
+        }
+        rows := Flickable {
+            min-width: 0px;
+            min-height: 0px;
+            max-height: 92px;
+            preferred-height: Math.min(self.max-height, cuts.preferred-height);
+            vertical-stretch: 0;
+            content-width: self.width;
+            content-height: Math.max(self.height, cuts.preferred-height);
+            cuts := VerticalLayout {
+                spacing: 4px;
+                width: Math.max(0px, rows.width - 8px);
+                for cut in Agent.pause-cuts: HorizontalLayout {
+                    spacing: 4px;
+                    ChatAction {
+                        label: (cut.included ? I18n.t1("chatUi.excludeCut", cut.label) : I18n.t1("chatUi.includeCut", cut.label));
+                        glyph: cut.included ? Glyph.check : Glyph.none;
+                        square: true;
+                        ghost: false;
+                        enabled: root.can-edit && Agent.pause-audition < 0;
+                        clicked => { Agent.set-pause-included(cut.id, !cut.included); }
+                    }
+                    ChatAction {
+                        label: I18n.t1("chatUi.goCut", cut.label);
+                        min-width: 0px;
+                        horizontal-stretch: 1;
+                        elide-label: true;
+                        enabled: root.can-edit && Agent.pause-audition < 0;
+                        clicked => { Agent.jump-to-pause(cut.id); }
+                    }
+                    ChatAction {
+                        property <bool> playing: Agent.pause-audition == cut.id;
+                        label: self.playing ? I18n.t("chatUi.stopListening") : I18n.t1("chatUi.listenCut", cut.label);
+                        glyph: self.playing ? Glyph.stop : Glyph.play;
+                        square: true;
+                        enabled: root.can-edit;
+                        clicked => { Agent.audition-pause(cut.id); }
+                    }
+                }
+            }
+            ThinScrollbar {
+                x: parent.width - self.width;
+                y: -rows.content-y;
+                height: rows.height;
+                viewport: rows.height;
+                content: rows.content-height;
+                offset: -rows.content-y;
+                scrolled(to) => { rows.content-y = -to; }
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 4px;
+            ChatAction {
+                label: I18n.t("chatUi.discardCuts");
+                tip: I18n.t("chatUi.discardCutsTip");
+                enabled: root.can-edit;
+                clicked => { Agent.discard-pause-cuts(); }
+            }
+            ChatAction {
+                label: I18n.t("chatUi.applyCuts");
+                tip: I18n.t("chatUi.applyCutsTip");
+                primary: true;
+                ghost: false;
+                enabled: root.can-edit && Agent.pause-can-apply && Agent.pause-selected-count > 0;
+                clicked => { Agent.apply-pause-cuts(); }
+            }
+        }
+    }
+}
+
+component ChatQuickActions inherits VerticalLayout {
+    property <bool> can-edit: Agent.enabled && !Agent.maintenance && !Agent.busy && !Agent.chat-opening;
+    property <bool> can-run: root.can-edit && Agent.quick-ready;
+    // The three built-ins precede the saved actions in the shared model.
+    property <int> built-in-count: 3;
+    min-width: 0px;
+    spacing: 4px;
+
+    if Agent.has-project && Agent.quick-actions.length >= root.built-in-count: HorizontalLayout {
+        spacing: 4px;
+        for position in root.built-in-count: ChatAction {
+            property <AgentQuickActionData> action: Agent.quick-actions[position];
+            label: self.action.label;
+            tip: self.action.id == "captions" ? I18n.t("chatUi.tipCaptions")
+                : self.action.id == "trim-pauses" ? I18n.t("chatUi.tipTrimPauses")
+                : I18n.t("chatUi.tipVertical");
+            ghost: false;
+            min-width: 0px;
+            horizontal-stretch: 1;
+            elide-label: true;
+            enabled: root.can-run;
+            clicked => { Agent.run-quick-action(self.action.id); }
+        }
+    }
+
+    if Agent.has-project && Agent.cutaway-ready: ChatAction {
+        label: I18n.t("agent.cutaways");
+        tip: I18n.t("agent.cutawaysTip");
+        enabled: root.can-edit;
+        min-width: 0px;
+        elide-label: true;
+        ghost: false;
+        clicked => { Agent.suggest-cutaways(); }
+    }
+
+    if Agent.quick-actions.length > root.built-in-count: pins := Flickable {
+        min-width: 0px;
+        min-height: 0px;
+        max-height: 62px;
+        preferred-height: Math.min(62px, list.preferred-height);
+        vertical-stretch: 0;
+        content-width: self.width;
+        content-height: Math.max(self.height, list.preferred-height);
+
+        list := VerticalLayout {
+            width: Math.max(0px, pins.width - 8px);
+            spacing: 4px;
+            for position in Agent.quick-actions.length - root.built-in-count: HorizontalLayout {
+                property <AgentQuickActionData> action: Agent.quick-actions[position + root.built-in-count];
+                spacing: 4px;
+                ChatAction {
+                    label: parent.action.label;
+                    tip: I18n.t("chatUi.pinnedTip");
+                    ghost: false;
+                    min-width: 0px;
+                    horizontal-stretch: 1;
+                    elide-label: true;
+                    enabled: root.can-run;
+                    clicked => { Agent.run-quick-action(parent.action.id); }
+                }
+                ChatAction {
+                    label: I18n.t1("chatUi.unpin", parent.action.label);
+                    tip: I18n.t("chatUi.unpinTip");
+                    glyph: Glyph.close;
+                    square: true;
+                    enabled: root.can-edit;
+                    clicked => { Agent.unpin-quick-action(parent.action.id); }
+                }
+            }
+        }
+        ThinScrollbar {
+            x: parent.width - self.width;
+            y: -pins.content-y;
+            height: pins.height;
+            viewport: pins.height;
+            content: pins.content-height;
+            offset: -pins.content-y;
+            scrolled(to) => { pins.content-y = -to; }
+        }
+    }
+
+    if Agent.has-project && !Agent.quick-ready: Text {
+        text: I18n.t("chatUi.selectTimelineTarget");
+        min-width: 0px;
+        color: Theme.fg-muted;
+        font-size: Theme.fs-sm;
+        wrap: word-wrap;
+    }
+    if Agent.draft != "": HorizontalLayout {
+        alignment: end;
+        spacing: 4px;
+        ChatAction {
+            label: I18n.t("chatUi.pinDraft");
+            tip: I18n.t("chatUi.pinDraftTip");
+            enabled: root.can-edit;
+            clicked => { Agent.pin-quick-action(); }
+        }
+        ChatAction {
+            label: I18n.t("chatUi.pinTemplate");
+            tip: I18n.t("chatUi.pinTemplateTip");
+            enabled: root.can-edit;
+            clicked => { Agent.pin-template(); }
+        }
+    }
+}
+
+component PinnedCommandParameters inherits VerticalLayout {
+    min-width: 0px;
+    min-height: 0px;
+    vertical-stretch: 1;
+    padding: 10px;
+    spacing: 7px;
+
+    Text {
+        text: Agent.parameter-title;
+        color: Theme.fg;
+        font-size: Theme.fs-lg;
+        wrap: word-wrap;
+    }
+    Text {
+        text: Agent.parameter-scope;
+        color: Theme.fg-muted;
+        font-size: Theme.fs;
+        overflow: elide;
+    }
+    if Agent.parameter-error != "": AgentTextViewport {
+        value: Agent.parameter-error;
+        ink: Theme.danger;
+    }
+
+    viewport := Flickable {
+        min-height: 0px;
+        vertical-stretch: 1;
+        content-width: self.width;
+        content-height: Math.max(self.height, fields.preferred-height);
+
+        fields := VerticalLayout {
+            width: Math.max(0px, viewport.width - 8px);
+            alignment: start;
+            spacing: 7px;
+            for field[index] in Agent.parameter-fields: VerticalLayout {
+                spacing: 3px;
+                Text {
+                    text: field.name;
+                    color: Theme.fg-muted;
+                    font-size: Theme.fs;
+                    wrap: word-wrap;
+                }
+                NoteInput {
+                    value: field.value;
+                    label: field.name;
+                    enabled: !Agent.maintenance && !Agent.busy;
+                    edited(text) => { Agent.parameter-edited(index, text); }
+                    submitted => {
+                        if (Agent.parameter-can-send) { Agent.submit-parameters(); }
+                    }
+                }
+            }
+        }
+        ThinScrollbar {
+            x: parent.width - self.width;
+            y: -viewport.content-y;
+            height: viewport.height;
+            viewport: viewport.height;
+            content: viewport.content-height;
+            offset: -viewport.content-y;
+            scrolled(to) => { viewport.content-y = -to; }
+        }
+    }
+    HorizontalLayout {
+        alignment: end;
+        spacing: 5px;
+        ChatAction {
+            label: I18n.t("chatUi.cancel");
+            accessible-name: I18n.t("chatUi.cancelParameters");
+            clicked => { Agent.cancel-parameters(); }
+        }
+        ChatAction {
+            label: I18n.t("chatUi.runCommand");
+            tip: I18n.t("chatUi.runCommandTip");
+            primary: true;
+            enabled: Agent.parameter-can-send;
+            clicked => { Agent.submit-parameters(); }
+        }
+    }
+}
+
+component EditScopeCheck inherits Rectangle {
+    in property <string> label;
+    in property <string> tip;
+    in property <bool> checked;
+    in property <bool> enabled;
+    out property <bool> focused: keys.has-focus;
+    callback toggled(checked: bool);
+
+    min-width: 0px;
+    min-height: Math.max(28px, row.preferred-height);
+    vertical-stretch: 0;
+    border-radius: Theme.r;
+    background: touch.has-hover && root.enabled ? Theme.field-hover : Theme.field;
+    border-width: root.focused ? 1px : 0px;
+    border-color: Theme.accent;
+    opacity: root.enabled ? 1.0 : 0.45;
+    accessible-role: checkbox;
+    accessible-label: root.label;
+    accessible-description: root.tip;
+    accessible-enabled: root.enabled;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        if (root.enabled) { root.toggled(!root.checked); }
+    }
+    forward-focus: keys;
+
+    row := HorizontalLayout {
+        padding: 5px;
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+
+        VerticalLayout {
+            alignment: center;
+
+            Check {
+                checked: root.checked;
+                enabled: false;
+                opacity: 1;
+            }
+        }
+        Text {
+            text: root.label;
+            min-width: 0px;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            color: Theme.fg;
+            font-size: Theme.fs;
+        }
+    }
+    keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                root.toggled(!root.checked);
+                return accept;
+            }
+            return reject;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            keys.focus();
+            root.toggled(!root.checked);
+        }
+    }
+    if root.tip != "": Tip {
+        text: root.tip;
+        active: touch.has-hover;
+    }
+}
+
+component ChatEditScope inherits VerticalLayout {
+    property <bool> editable: Agent.enabled && !Agent.maintenance && !Agent.busy
+        && !Agent.chat-opening && Agent.dictation-phase == 0;
+
+    min-width: 0px;
+    min-height: 0px;
+    vertical-stretch: 1;
+    padding: 10px;
+    spacing: 6px;
+
+    function reveal(y: length, h: length) {
+        if (y + viewport.content-y < 0px || h > viewport.height) {
+            viewport.content-y = Math.max(-y, viewport.height - viewport.content-height);
+        } else if (y + h + viewport.content-y > viewport.height) {
+            viewport.content-y = viewport.height - y - h;
+        }
+    }
+
+    if Agent.edit-scope-error != "": AgentTextViewport {
+        value: Agent.edit-scope-error;
+        ink: Theme.danger;
+    }
+
+    viewport := Flickable {
+        min-height: 0px;
+        vertical-stretch: 1;
+        content-width: self.width;
+        content-height: Math.max(self.height, fields.preferred-height);
+
+        fields := VerticalLayout {
+            width: Math.max(0px, viewport.width - 8px);
+            alignment: start;
+            spacing: 6px;
+
+            if Agent.edit-scope-active && Agent.edit-scope-summary != "": Text {
+                text: Agent.edit-scope-summary;
+                color: Theme.accent;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: I18n.t("agent.scopeTracks");
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                font-weight: Theme.weight-title;
+                wrap: word-wrap;
+            }
+            for track in Agent.edit-scope-tracks: EditScopeCheck {
+                label: track.label;
+                checked: track.selected;
+                enabled: root.editable;
+                changed focused => { if self.focused { root.reveal(self.y, self.height); } }
+                toggled(included) => { Agent.edit-scope-track(track.id, included); }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.line;
+            }
+
+            EditScopeCheck {
+                label: I18n.t("agent.scopeLimitRange");
+                tip: I18n.t("agent.scopeNeedRange");
+                checked: Agent.edit-scope-limit-range;
+                enabled: root.editable;
+                changed focused => { if self.focused { root.reveal(self.y, self.height); } }
+                toggled(enabled) => { Agent.toggle-edit-scope-range(enabled); }
+            }
+            if Agent.edit-scope-limit-range: Text {
+                text: Agent.edit-scope-range-label != ""
+                    ? Agent.edit-scope-range-label : I18n.t("agent.scopeNeedRange");
+                color: Agent.edit-scope-range-ready ? Theme.fg : Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+            if Agent.edit-scope-limit-range: HorizontalLayout {
+                spacing: 5px;
+                ChatAction {
+                    label: I18n.t("agent.scopeSetIn");
+                    enabled: root.editable;
+                    clicked => { Agent.mark-range(true); }
+                }
+                ChatAction {
+                    label: I18n.t("agent.scopeSetOut");
+                    enabled: root.editable && Agent.has-range;
+                    clicked => { Agent.mark-range(false); }
+                }
+            }
+        }
+
+        ThinScrollbar {
+            x: parent.width - self.width;
+            y: -viewport.content-y;
+            height: viewport.height;
+            viewport: viewport.height;
+            content: viewport.content-height;
+            offset: -viewport.content-y;
+            scrolled(to) => { viewport.content-y = -to; }
+        }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        spacing: 6px;
+        if Agent.edit-scope-active: ChatAction {
+            label: I18n.t("agent.scopeClear");
+            enabled: root.editable;
+            clicked => { Agent.clear-edit-scope(); Focus.release(); }
+        }
+        ChatAction {
+            label: I18n.t("common.apply");
+            primary: true;
+            enabled: root.editable && Agent.edit-scope-can-save;
+            clicked => { Agent.save-edit-scope(); Focus.release(); }
+        }
     }
 }
 
@@ -207,7 +1155,7 @@ component SavedChatRow inherits Rectangle {
                 horizontal-stretch: 1;
             }
             if root.chat.has-draft: Text {
-                text: "Draft";
+                text: I18n.t("chatUi.draft");
                 color: Theme.accent;
                 font-size: Theme.fs-sm;
             }
@@ -242,7 +1190,7 @@ component ChatHistoryView inherits VerticalLayout {
 
     Field {
         value: Agent.chat-query;
-        placeholder: "Search chats";
+        placeholder: I18n.t("chatUi.searchChats");
         edited(query) => {
             Agent.chat-query = query;
             Agent.chat-filter-edited(query);
@@ -253,9 +1201,9 @@ component ChatHistoryView inherits VerticalLayout {
         ink: Theme.danger;
     }
     if Agent.history-loading || Agent.chat-opening || (Agent.saved-chats.length == 0 && Agent.history-error == ""): Text {
-        text: Agent.chat-opening ? "Opening chat…"
-            : Agent.history-loading ? "Loading chats…"
-            : Agent.chat-query != "" ? "No matching chats" : "No saved chats yet";
+        text: Agent.chat-opening ? I18n.t("chatUi.openingChat")
+            : Agent.history-loading ? I18n.t("chatUi.loadingChats")
+            : Agent.chat-query != "" ? I18n.t("chatUi.noMatchingChats") : I18n.t("chatUi.noSavedChats");
         font-size: Theme.fs;
         color: Theme.fg-muted;
         wrap: word-wrap;
@@ -289,6 +1237,209 @@ component ChatHistoryView inherits VerticalLayout {
     }
 }
 
+component ChatQueueRow inherits Rectangle {
+    in property <AgentQueueItem> task;
+    in property <bool> editable;
+    callback action-focused(y: length, height: length);
+
+    min-width: 0px;
+    min-height: body.preferred-height;
+    vertical-stretch: 0;
+    border-radius: Theme.r;
+    background: Theme.field;
+    accessible-role: list-item;
+
+    function reveal-actions() {
+        root.action-focused(actions.absolute-position.y - root.absolute-position.y, actions.height);
+    }
+
+    body := VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+        Text {
+            text: root.task.status;
+            min-width: 0px;
+            color: Theme.fg-muted;
+            font-size: Theme.fs-sm;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.task.prompt;
+            min-width: 0px;
+            max-height: 58px;
+            overflow: elide;
+            color: Theme.fg;
+            font-size: Theme.fs-lg;
+            wrap: word-wrap;
+        }
+        if root.task.detail != "": Text {
+            text: root.task.detail;
+            min-width: 0px;
+            max-height: 48px;
+            overflow: elide;
+            color: Theme.fg-muted;
+            font-size: Theme.fs;
+            wrap: word-wrap;
+        }
+        actions := HorizontalLayout {
+            alignment: end;
+            spacing: 4px;
+            if root.task.pending: ChatAction {
+                label: I18n.t("agent.queueMoveUp");
+                tip: I18n.t("agent.queueMoveUpHint");
+                glyph: Glyph.chevron-up;
+                square: true;
+                enabled: root.editable && root.task.can-move-up;
+                clicked => { Agent.queue-move(root.task.id, -1); }
+                changed focused => { if self.focused { root.reveal-actions(); } }
+            }
+            if root.task.pending: ChatAction {
+                label: I18n.t("agent.queueMoveDown");
+                tip: I18n.t("agent.queueMoveDownHint");
+                glyph: Glyph.chevron-down;
+                square: true;
+                enabled: root.editable && root.task.can-move-down;
+                clicked => { Agent.queue-move(root.task.id, 1); }
+                changed focused => { if self.focused { root.reveal-actions(); } }
+            }
+            if root.task.pending: ChatAction {
+                label: I18n.t("agent.queueCancel");
+                tip: I18n.t("agent.queueCancelHint");
+                glyph: Glyph.close;
+                square: true;
+                enabled: root.editable;
+                clicked => { Agent.queue-cancel(root.task.id); }
+                changed focused => { if self.focused { root.reveal-actions(); } }
+            }
+            if root.task.recoverable: ChatAction {
+                label: I18n.t("agent.queueRestore");
+                tip: I18n.t("agent.queueRestoreHint");
+                min-width: 0px;
+                elide-label: true;
+                horizontal-stretch: 1;
+                enabled: root.editable;
+                clicked => { Tips.close(); Agent.queue-restore(root.task.id); }
+                changed focused => { if self.focused { root.reveal-actions(); } }
+            }
+        }
+    }
+}
+
+component ChatQueueView inherits VerticalLayout {
+    property <bool> editable: Agent.enabled && !Agent.maintenance && !Agent.chat-opening;
+
+    min-width: 0px;
+    min-height: 0px;
+    preferred-height: 0px;
+    vertical-stretch: 1;
+    padding: 10px;
+    spacing: 7px;
+
+    function reveal(y: length, h: length) {
+        if (y + viewport.content-y < 0px || h > viewport.height) {
+            viewport.content-y = Math.max(-y, viewport.height - viewport.content-height);
+        } else if (y + h + viewport.content-y > viewport.height) {
+            viewport.content-y = viewport.height - y - h;
+        }
+    }
+
+    if Agent.queue-error != "": AgentTextViewport {
+        value: Agent.queue-error;
+        ink: Theme.danger;
+    }
+
+    viewport := Flickable {
+        min-width: 0px;
+        min-height: 0px;
+        vertical-stretch: 1;
+        content-width: self.width;
+        content-height: Math.max(self.height, items.preferred-height);
+        accessible-role: list;
+        accessible-label: I18n.t("agent.queueTitle");
+
+        items := VerticalLayout {
+            width: Math.max(0px, viewport.width - 8px);
+            alignment: start;
+            spacing: 6px;
+            if Agent.queue-items.length == 0: Text {
+                text: I18n.t("agent.queueEmpty");
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+            for item in Agent.queue-items: ChatQueueRow {
+                task: item;
+                editable: root.editable;
+                action-focused(y, height) => { root.reveal(self.y + y, height); }
+            }
+        }
+        ThinScrollbar {
+            x: parent.width - self.width;
+            y: -viewport.content-y;
+            height: viewport.height;
+            viewport: viewport.height;
+            content: viewport.content-height;
+            offset: -viewport.content-y;
+            scrolled(to) => { viewport.content-y = -to; }
+        }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        spacing: 6px;
+        ChatAction {
+            label: Agent.queue-paused ? I18n.t("agent.queueResume") : I18n.t("agent.queuePause");
+            tip: Agent.queue-paused ? I18n.t("agent.queueResumeHint") : I18n.t("agent.queuePauseHint");
+            min-width: 0px;
+            horizontal-stretch: 1;
+            elide-label: true;
+            enabled: root.editable && (!Agent.queue-paused || Agent.queue-can-run);
+            ghost: false;
+            clicked => { Tips.close(); Agent.queue-set-paused(!Agent.queue-paused); }
+        }
+        if Agent.busy && !Agent.chat-opening: ChatAction {
+            label: I18n.t("agent.queueInterrupt");
+            tip: I18n.t("agent.queueInterruptHint");
+            glyph: Glyph.stop;
+            square: true;
+            enabled: root.editable;
+            clicked => { Agent.interrupt(); }
+        }
+    }
+}
+
+component ChatSendActions inherits HorizontalLayout {
+    in property <bool> show-queue-action;
+
+    alignment: end;
+    spacing: 6px;
+    if root.show-queue-action && Agent.busy && !Agent.chat-opening: ChatAction {
+        label: I18n.t("agent.queueInterrupt");
+        tip: I18n.t("agent.queueInterruptHint");
+        glyph: Glyph.stop;
+        square: true;
+        enabled: !Agent.maintenance;
+        clicked => { Agent.interrupt(); }
+    }
+    if root.show-queue-action: ChatAction {
+        label: I18n.t("agent.queueEnqueue");
+        tip: I18n.t("agent.queueEnqueueHint");
+        min-width: 0px;
+        preferred-width: 116px;
+        elide-label: true;
+        ghost: false;
+        enabled: Agent.queue-can-enqueue;
+        clicked => { Tips.close(); Agent.enqueue-draft(); }
+    }
+    Button {
+        label: I18n.t("chatUi.send");
+        tip: I18n.t("chatUi.sendTip");
+        primary: true;
+        enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0 && Agent.draft != "";
+        clicked => { Agent.submitted(); }
+    }
+}
+
 component ChatConversation inherits Rectangle {
     min-width: 0px;
     min-height: 0px;
@@ -297,6 +1448,21 @@ component ChatConversation inherits Rectangle {
     clip: true;
     property <int> voice-phase: Agent.dictation-phase;
     property <bool> had-dictation;
+    property <bool> show-queue-action: Agent.enabled && Agent.dictation-phase == 0 && Agent.draft != "";
+    property <length> composer-left: composer-frame.absolute-position.x;
+    property <length> composer-top: composer-frame.absolute-position.y;
+    property <length> composer-width: composer-frame.width;
+    property <length> composer-height: composer-frame.height;
+    changed composer-left => { Agent.drop-left = root.composer-left; }
+    changed composer-top => { Agent.drop-top = root.composer-top; }
+    changed composer-width => { Agent.drop-width = root.composer-width; }
+    changed composer-height => { Agent.drop-height = root.composer-height; }
+    init => {
+        Agent.drop-left = root.composer-left;
+        Agent.drop-top = root.composer-top;
+        Agent.drop-width = root.composer-width;
+        Agent.drop-height = root.composer-height;
+    }
     changed voice-phase => {
         if (root.voice-phase != 0) {
             root.had-dictation = true;
@@ -313,7 +1479,7 @@ component ChatConversation inherits Rectangle {
             padding-right: 12px;
             Text {
                 min-width: 0px;
-                text: "Project · " + Agent.project-name;
+                text: I18n.t1("chatUi.projectLabel", Agent.project-name);
                 overflow: elide;
                 font-size: Theme.fs;
                 color: Theme.fg-muted;
@@ -326,7 +1492,7 @@ component ChatConversation inherits Rectangle {
             padding-bottom: 6px;
             spacing: 6px;
             Text {
-                text: Agent.workspace-path == "" ? "Choose a working folder" : Agent.workspace-path;
+                text: Agent.workspace-path == "" ? I18n.t("chatUi.workingFolderNeeded") : Agent.workspace-path;
                 color: Theme.fg-muted;
                 font-size: Theme.fs;
                 min-width: 0px;
@@ -335,7 +1501,8 @@ component ChatConversation inherits Rectangle {
                 overflow: elide;
             }
             Button {
-                label: "Choose folder";
+                label: I18n.t("chatUi.chooseFolder");
+                tip: I18n.t("chatUi.chooseFolderTip");
                 ghost: true;
                 enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
                 clicked => { Agent.choose-workspace(); }
@@ -351,11 +1518,14 @@ component ChatConversation inherits Rectangle {
             content-width: self.width;
             content-height: Math.max(self.height, history.preferred-height);
             property <length> previous-height;
+            property <bool> showing-review;
             changed content-height => {
-                if (-self.content-y + self.height >= self.previous-height - 24px) {
+                if (-self.content-y + self.height >= self.previous-height - 24px
+                    || (!self.showing-review && Agent.pause-cuts.length > 0)) {
                     self.content-y = Math.min(0px, self.height - self.content-height);
                 }
                 self.previous-height = self.content-height;
+                self.showing-review = Agent.pause-cuts.length > 0;
             }
             history := VerticalLayout {
                 width: transcript.width;
@@ -363,7 +1533,8 @@ component ChatConversation inherits Rectangle {
                 spacing: 12px;
                 alignment: start;
                 if Agent.has-earlier: ChatAction {
-                    label: Agent.earlier-loading ? "Loading earlier…" : "Earlier messages";
+                    label: Agent.earlier-loading ? I18n.t("chatUi.loadingEarlier") : I18n.t("chatUi.earlierMessages");
+                    tip: I18n.t("chatUi.earlierMessagesTip");
                     ghost: true;
                     enabled: Agent.connected && !Agent.maintenance && !Agent.busy
                         && !Agent.earlier-loading && Agent.dictation-phase == 0;
@@ -371,8 +1542,8 @@ component ChatConversation inherits Rectangle {
                 }
                 if Agent.messages.length == 0: Text {
                     text: Agent.has-project
-                        ? "Describe the edit you want. Codex works on the project visible in this window."
-                        : "Describe the video you want to make. Codex works in the selected folder.";
+                        ? I18n.t("chatUi.editIntro")
+                        : I18n.t("chatUi.landingIntro");
                     color: Theme.fg-muted;
                     font-size: Theme.fs-lg;
                     wrap: word-wrap;
@@ -394,8 +1565,28 @@ component ChatConversation inherits Rectangle {
                             text: message.text;
                             color: message.failed ? Theme.danger : Theme.fg;
                         }
+                        if message.context != "": Text {
+                            text: message.context;
+                            min-width: 0px;
+                            wrap: word-wrap;
+                            color: Theme.fg-muted;
+                            font-size: Theme.fs-sm;
+                        }
+                        for link[index] in message.edit-links: ChatAction {
+                            min-width: 0px;
+                            label: link;
+                            enabled: Agent.has-project && !Agent.maintenance;
+                            clicked => { Agent.jump-to-edit(message.id, index); }
+                        }
+                        if message.has-checkpoint: ChatAction {
+                            property <bool> restore-in-place: Agent.undoable-message == message.id;
+                            label: self.restore-in-place ? I18n.t("chatUi.undoTurn") : I18n.t("chatUi.openBeforeCopy");
+                            enabled: !Agent.busy && !Agent.maintenance && Agent.dictation-phase == 0;
+                            clicked => { Agent.restore-turn(message.id, !self.restore-in-place); }
+                        }
                     }
                 }
+                if Agent.has-project && Agent.pause-cuts.length > 0: ChatPauseReview { }
             }
             ThinScrollbar {
                 x: parent.width - self.width - 1px;
@@ -439,11 +1630,13 @@ component ChatConversation inherits Rectangle {
                             alignment: end;
                             spacing: 8px;
                             Button {
-                                label: "Deny";
+                                label: I18n.t("chatUi.deny");
+                                tip: I18n.t("chatUi.denyTip");
                                 clicked => { Agent.approval(request.id, false); }
                             }
                             Button {
-                                label: "Allow once";
+                                label: I18n.t("chatUi.allowOnce");
+                                tip: I18n.t("chatUi.allowOnceTip");
                                 primary: true;
                                 clicked => { Agent.approval(request.id, true); }
                             }
@@ -469,11 +1662,24 @@ component ChatConversation inherits Rectangle {
                 value: Agent.error;
                 ink: Theme.danger;
             }
-            if Agent.dictation-phase == 0: Text {
-                text: !Agent.enabled ? "Chat is available in Live mode" : Agent.maintenance ? "Installing update…" : Agent.status;
-                color: Theme.fg-muted;
-                font-size: Theme.fs;
-                wrap: word-wrap;
+            if Agent.dictation-phase == 0: HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: !Agent.enabled ? I18n.t("chatUi.liveRequired") : Agent.maintenance ? I18n.t("chatUi.installingUpdate") : Agent.status;
+                    min-width: 0px;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    color: Theme.fg-muted;
+                    font-size: Theme.fs;
+                    wrap: word-wrap;
+                }
+                if Agent.enabled: ChatAction {
+                    label: Agent.queue-count > 0
+                        ? I18n.t1("agent.queueOpenCount", Agent.queue-count) : I18n.t("agent.queueOpen");
+                    tip: I18n.t("agent.queueOpenHint");
+                    enabled: !Agent.maintenance && !Agent.chat-opening;
+                    clicked => { Tips.close(); Agent.toggle-queue(); Focus.release(); }
+                }
             }
             if Agent.dictation-phase != 0: VerticalLayout {
                 spacing: 6px;
@@ -489,8 +1695,8 @@ component ChatConversation inherits Rectangle {
                     }
                     Text {
                         text: Agent.dictation-status != "" ? Agent.dictation-status
-                            : Agent.dictation-phase == 1 ? "Preparing voice input…"
-                            : Agent.dictation-phase == 2 ? "Listening…" : "Finishing dictation…";
+                            : Agent.dictation-phase == 1 ? I18n.t("chatUi.dictationPreparing")
+                            : Agent.dictation-phase == 2 ? I18n.t("chatUi.dictationListening") : I18n.t("chatUi.dictationFinishing");
                         min-width: 0px;
                         horizontal-stretch: 1;
                         color: Agent.dictation-phase == 2 ? Theme.fg : Theme.fg-muted;
@@ -515,11 +1721,12 @@ component ChatConversation inherits Rectangle {
                     alignment: end;
                     spacing: 8px;
                     if Agent.dictation-phase == 2: dictation-stop-button := Button {
-                        label: "Stop";
+                        label: I18n.t("chatUi.stopDictation");
+                        tip: I18n.t("chatUi.stopDictationTip");
                         clicked => { Agent.dictation-stop(); }
                     }
                     dictation-cancel-button := Button {
-                        label: "Cancel";
+                        label: I18n.t("chatUi.cancel");
                         ghost: true;
                         clicked => { Agent.dictation-cancel(); }
                     }
@@ -540,12 +1747,13 @@ component ChatConversation inherits Rectangle {
                     spacing: 3px;
                     horizontal-stretch: 2;
                     Text {
-                        text: "Model";
+                        text: I18n.t("chatUi.model");
                         color: Theme.fg-muted;
                         font-size: Theme.fs-sm;
                     }
                     model-picker := Select {
                         options: Agent.model-options;
+                        tip: I18n.t("chatUi.modelTip");
                         current <=> Agent.model-index;
                         placeholder: Agent.model-placeholder;
                         enabled: Agent.enabled && !Agent.maintenance && !Agent.busy
@@ -557,18 +1765,114 @@ component ChatConversation inherits Rectangle {
                     spacing: 3px;
                     horizontal-stretch: 1;
                     Text {
-                        text: "Reasoning";
+                        text: I18n.t("chatUi.reasoning");
                         color: Theme.fg-muted;
                         font-size: Theme.fs-sm;
                     }
                     effort-picker := Select {
                         options: Agent.effort-options;
+                        tip: I18n.t("chatUi.effortTip");
                         current <=> Agent.effort-index;
                         placeholder: Agent.effort-placeholder;
                         enabled: Agent.enabled && !Agent.maintenance && !Agent.busy
                             && Agent.effort-options.length > 0;
                         changed(index) => { Agent.effort-selected(index); }
                     }
+                }
+            }
+            if Agent.has-project && Agent.dictation-phase == 0: VerticalLayout {
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 4px;
+                    ChatAction {
+                        label: Agent.include-timeline ? I18n.t("chatUi.timelineOn") : I18n.t("chatUi.timelineOff");
+                        tip: I18n.t("chatUi.timelineOnTip");
+                        clicked => { Agent.include-timeline = !Agent.include-timeline; }
+                    }
+                    Text {
+                        text: Agent.include-timeline ? Agent.timeline-label : "";
+                        min-width: 0px;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                        vertical-alignment: center;
+                        color: Theme.fg-muted;
+                        font-size: Theme.fs-sm;
+                    }
+                    ChatAction {
+                        label: I18n.t("agent.scopeTitle");
+                        tip: I18n.t("agent.scopeHint");
+                        ghost: !Agent.edit-scope-active;
+                        enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && !Agent.chat-opening;
+                        clicked => { Tips.close(); Agent.toggle-edit-scope(); Focus.release(); }
+                    }
+                }
+                if Agent.edit-scope-active && Agent.edit-scope-summary != "": Text {
+                    text: Agent.edit-scope-summary;
+                    min-width: 0px;
+                    overflow: elide;
+                    color: Theme.accent;
+                    font-size: Theme.fs-sm;
+                }
+                if Agent.include-timeline: HorizontalLayout {
+                    spacing: 4px;
+                    ChatAction {
+                        label: I18n.t("chatUi.setIn");
+                        tip: I18n.t("chatUi.setInTip");
+                        clicked => { Agent.mark-range(true); }
+                    }
+                    ChatAction {
+                        label: I18n.t("chatUi.setOut");
+                        tip: I18n.t("chatUi.setOutTip");
+                        enabled: Agent.has-range;
+                        clicked => { Agent.mark-range(false); }
+                    }
+                    if Agent.has-range: ChatAction {
+                        label: I18n.t("chatUi.clearRange");
+                        tip: I18n.t("chatUi.clearRangeTip");
+                        clicked => { Agent.clear-range(); }
+                    }
+                }
+            }
+            if Agent.enabled && Agent.dictation-phase == 0
+                && (Agent.has-project || Agent.quick-actions.length > 3 || Agent.draft != ""): ChatQuickActions { }
+            if Agent.attachments.length > 0 && Agent.dictation-phase == 0: attached := Flickable {
+                min-width: 0px;
+                min-height: 0px;
+                max-height: 66px;
+                preferred-height: Math.min(66px, files.preferred-height);
+                vertical-stretch: 0;
+                interactive: false;
+                content-width: self.width;
+                content-height: Math.max(self.height, files.preferred-height);
+                files := VerticalLayout {
+                    width: attached.width - 8px;
+                    spacing: 3px;
+                    for file[index] in Agent.attachments: HorizontalLayout {
+                        spacing: 5px;
+                        Text {
+                            text: file;
+                            font-size: Theme.fs;
+                            color: Theme.fg;
+                            min-width: 0px;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        IconButton {
+                            glyph: Glyph.close;
+                            label: I18n.t1("chatUi.removeAttachment", file);
+                            clicked => { Agent.remove-file(index); }
+                        }
+                    }
+                }
+                ThinScrollbar {
+                    x: parent.width - self.width - 1px;
+                    y: -attached.content-y;
+                    height: attached.height;
+                    viewport: attached.height;
+                    content: attached.content-height;
+                    offset: -attached.content-y;
+                    scrolled(to) => { attached.content-y = -to; }
                 }
             }
             composer-frame := Rectangle {
@@ -636,16 +1940,20 @@ component ChatConversation inherits Rectangle {
                     }
                     if Agent.draft == "" && !input.has-focus: Text {
                         y: composer.pad-y;
-                        text: "Ask Codex…";
+                        text: I18n.t("chatUi.composer");
                         color: Theme.fg-dim;
                         font-size: Theme.fs-lg;
                     }
                 }
             }
-            if Agent.busy && !Agent.chat-opening && Agent.dictation-phase == 0: HorizontalLayout {
+            if root.show-queue-action: ChatSendActions {
+                show-queue-action: true;
+            }
+            if Agent.busy && !Agent.chat-opening && Agent.dictation-phase == 0 && !root.show-queue-action: HorizontalLayout {
                 alignment: end;
                 Button {
-                    label: "Interrupt";
+                    label: I18n.t("chatUi.interrupt");
+                    tip: I18n.t("chatUi.interruptTip");
                     clicked => { Agent.interrupt(); }
                 }
             }
@@ -662,29 +1970,44 @@ component ChatConversation inherits Rectangle {
                 }
                 Rectangle { horizontal-stretch: 1; }
                 if Agent.busy && Agent.dictation-phase != 0: Button {
-                    label: "Interrupt";
+                    label: I18n.t("chatUi.interrupt");
+                    tip: I18n.t("chatUi.interruptTip");
                     clicked => { Agent.interrupt(); }
+                }
+                if Agent.dictation-phase == 0: IconButton {
+                    glyph: Glyph.plus;
+                    label: I18n.t("chatUi.attach");
+                    enabled: Agent.enabled && !Agent.maintenance && !Agent.chat-opening;
+                    clicked => { Agent.choose-files(); }
                 }
                 dictation-microphone := IconButton {
                     glyph: Glyph.mic;
                     label: Agent.dictation-available
-                        ? "Dictate a message"
-                        : "Voice input requires macOS 26 or later";
+                        ? I18n.t("chatUi.dictate")
+                        : I18n.t("chatUi.dictationUnavailable");
                     enabled: Agent.enabled && !Agent.maintenance && Agent.dictation-available && Agent.dictation-phase == 0;
                     clicked => { Agent.dictation-start(); input.focus(); }
                 }
-                Button {
-                    label: "Send";
-                    primary: true;
-                    enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0 && Agent.draft != "";
-                    clicked => { Agent.submitted(); }
-                }
+                if !root.show-queue-action: ChatSendActions { }
             }
         }
     }
 }
 
 export component AgentChat inherits Rectangle {
+    property <bool> showing-notes: Agent.has-project && Agent.notes-open;
+    property <bool> showing-brief: Agent.has-project && Agent.brief-open;
+    property <bool> showing-parameters: Agent.parameter-title != "" && Agent.dictation-phase == 0;
+    property <bool> showing-edit-scope: Agent.has-project && Agent.edit-scope-open
+        && !root.showing-notes && !root.showing-brief && !root.showing-parameters;
+    property <bool> showing-queue: Agent.queue-open && !root.showing-notes
+        && !root.showing-brief && !root.showing-parameters && !root.showing-edit-scope;
+    property <bool> showing-form: root.showing-notes || root.showing-brief
+        || root.showing-parameters || root.showing-edit-scope || root.showing-queue;
+    changed showing-form => {
+        if (self.showing-form) { Agent.drop-width = 0px; }
+    }
+
     min-width: 0px;
     min-height: 0px;
     max-height: 100000px;
@@ -699,9 +2022,14 @@ export component AgentChat inherits Rectangle {
             padding-bottom: 6px;
             spacing: 6px;
             Text {
-                text: Agent.history-open ? "Chats"
+                text: root.showing-notes ? I18n.t("chatUi.notes")
+                    : root.showing-brief ? I18n.t("chatUi.projectBrief")
+                    : root.showing-parameters ? I18n.t("chatUi.commandParameters")
+                    : root.showing-edit-scope ? I18n.t("agent.scopeTitle")
+                    : root.showing-queue ? I18n.t("agent.queueTitle")
+                    : Agent.history-open ? I18n.t("chatUi.chats")
                     : Agent.chat-title != "" ? Agent.chat-title
-                    : Agent.has-project ? Agent.project-name : "Working folder";
+                    : Agent.has-project ? Agent.project-name : I18n.t("chatUi.workingFolder");
                 min-width: 0px;
                 color: Theme.fg-muted;
                 font-size: Theme.fs;
@@ -709,27 +2037,68 @@ export component AgentChat inherits Rectangle {
                 overflow: elide;
                 horizontal-stretch: 1;
             }
-            history-button := ChatAction {
-                label: Agent.history-open ? "Back" : "History";
+            if root.showing-notes: ChatAction {
+                label: Agent.approvals.length > 0 ? I18n.t("chatUi.reviewApproval") : I18n.t("chatUi.backToChat");
+                accessible-name: I18n.t("chatUi.backToChat");
+                clicked => { Agent.toggle-notes(); }
+            }
+            if root.showing-brief: ChatAction {
+                label: Agent.approvals.length > 0 ? I18n.t("chatUi.reviewApproval") : I18n.t("chatUi.backToChat");
+                accessible-name: I18n.t("chatUi.backToChat");
+                clicked => { Agent.toggle-brief(); }
+            }
+            if root.showing-edit-scope: ChatAction {
+                label: I18n.t("agent.scopeBack");
+                clicked => { Agent.toggle-edit-scope(); Focus.release(); }
+            }
+            if root.showing-queue: ChatAction {
+                label: Agent.approvals.length > 0
+                    ? I18n.t("agent.queueReviewApproval") : I18n.t("agent.scopeBack");
+                tip: I18n.t("agent.queueBackHint");
+                clicked => { Tips.close(); Agent.toggle-queue(); Focus.release(); }
+            }
+            if !root.showing-form && Agent.has-project: ChatAction {
+                label: I18n.t("chatUi.brief");
+                tip: I18n.t("chatUi.briefTip");
+                accessible-name: I18n.t("chatUi.projectBrief");
+                enabled: Agent.enabled && !Agent.maintenance && Agent.dictation-phase == 0;
+                clicked => { Agent.toggle-brief(); }
+            }
+            if !root.showing-form: history-button := ChatAction {
+                label: Agent.history-open ? I18n.t("chatUi.back") : I18n.t("chatUi.history");
+                tip: I18n.t("chatUi.historyTip");
                 ghost: true;
                 enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
                 clicked => { Agent.toggle-history(); }
             }
-            ChatAction {
-                label: "New chat";
+            if !root.showing-form: ChatAction {
+                label: I18n.t("chatUi.newChat");
+                tip: I18n.t("chatUi.newChatTip");
                 ghost: true;
                 enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
                 clicked => { Agent.new-thread(); }
             }
-            if !Agent.connected: IconButton {
+            if !root.showing-form && !Agent.connected: IconButton {
                 glyph: Glyph.rotate;
-                label: "Reconnect Codex";
+                label: I18n.t("chatUi.reconnect");
                 enabled: Agent.enabled && !Agent.maintenance && !Agent.busy && Agent.dictation-phase == 0;
                 clicked => { Agent.reconnect(); }
             }
         }
-        if Agent.history-open: ChatHistoryView { }
-        if !Agent.history-open: ChatConversation { }
+        if root.showing-notes: TimelineNotesView { }
+        if !root.showing-notes && root.showing-brief: ProjectBriefEditor {
+            goal <=> Agent.brief-goal;
+            audience <=> Agent.brief-audience;
+            style <=> Agent.brief-style;
+            error: Agent.brief-error;
+            can-save: Agent.brief-can-save;
+            saved => { Agent.save-brief(); }
+        }
+        if !root.showing-notes && !root.showing-brief && root.showing-parameters: PinnedCommandParameters { }
+        if root.showing-edit-scope: ChatEditScope { }
+        if root.showing-queue: ChatQueueView { }
+        if !root.showing-form && Agent.history-open: ChatHistoryView { }
+        if !root.showing-form && !Agent.history-open: ChatConversation { }
     }
 }
 

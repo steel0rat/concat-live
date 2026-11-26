@@ -8,6 +8,7 @@ import { Glyph, Icon } from "../icons.slint";
 import { NumberField } from "../primitives/number-field.slint";
 import { ColorPicker } from "../primitives/color-picker.slint";
 import { IconButton } from "../primitives/panel.slint";
+import { Tip } from "../primitives/tooltip.slint";
 import { ClipField, ClipKeyData, Keyframes } from "../timeline/model.slint";
 
 // The clip inspector's controls: a horizontal fader, the Param row that
@@ -98,7 +99,7 @@ export global InspectorFmt {
                 : (v > 0 ? "+" : "") + InspectorFmt.fixed1(v) + " dB";
         }
         if (fmt == ParamFormat.height) {
-            return InspectorFmt.fixed1(v * 100) + "% of height";
+            return I18n.t1("controls.percentOfHeight", InspectorFmt.fixed1(v * 100));
         }
         if (fmt == ParamFormat.outline) {
             return v == 0 ? I18n.t("common.none") : InspectorFmt.fixed1(v * 100) + "%";
@@ -247,6 +248,7 @@ export component Rail inherits Rectangle {
 // when there is nowhere to go.
 component KeyButton inherits Rectangle {
     in property <Glyph> glyph;
+    in property <string> tip;
     in property <bool> filled;
     in property <bool> enabled: true;
     in property <color> tint: Theme.fg-dim;
@@ -271,6 +273,7 @@ component KeyButton inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
+    Tip { text: root.tip; active: touch.has-hover; }
 }
 
 // The keyframe cluster: step back, put one on or take it off, step forward.
@@ -302,12 +305,14 @@ export component KeyCluster inherits HorizontalLayout {
     spacing: 1px;
 
     prev := KeyButton {
+        tip: I18n.t("inspectorActionTips.previous");
         glyph: Glyph.chevron-left;
         enabled: root.live && root.state.prev;
         clicked => { root.step(-1); }
     }
 
     diamond := KeyButton {
+        tip: I18n.t("inspectorActionTips.keyframe");
         glyph: Glyph.keyframe;
         // Filled on a key, outlined on a keyed property between keys, and
         // plain grey on one that is still a constant. Three states because
@@ -320,6 +325,7 @@ export component KeyCluster inherits HorizontalLayout {
     }
 
     next := KeyButton {
+        tip: I18n.t("inspectorActionTips.next");
         glyph: Glyph.chevron-right;
         enabled: root.live && root.state.next;
         clicked => { root.step(1); }
@@ -420,6 +426,7 @@ export component Param inherits VerticalLayout {
     /// A sentence or two behind a "?" beside the label, on hover, for a
     /// knob whose meaning is not in its name.
     in property <string> help;
+    in property <string> tip: root.help;
 
     callback changed(value: float);
 
@@ -436,13 +443,14 @@ export component Param inherits VerticalLayout {
             font-size: Theme.fs;
             vertical-alignment: center;
 
-            TouchArea {
+            label-hover := TouchArea {
                 enabled: root.enabled;
                 double-clicked => {
                     root.value = root.default-value;
                     root.changed(root.default-value);
                 }
             }
+            if root.tip != "": Tip { text: root.tip; active: label-hover.has-hover; }
         }
 
         if root.help != "": Rectangle { width: 6px; }
@@ -692,6 +700,7 @@ export component ResetButton inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.reset(); }
     }
+    Tip { text: I18n.t("inspectorActionTips.reset"); active: touch.has-hover; }
 }
 
 export component Note inherits HorizontalLayout {

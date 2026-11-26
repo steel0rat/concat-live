@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
+
+import { I18n } from "../i18n.slint";
+import { Theme, Glyph, Tip } from "../primitives/primitives.slint";
+import { Button } from "../primitives/modal.slint";
+
+export global ObjectFollowUi {
+    in property <bool> can-start;
+    in property <bool> selecting;
+    in property <bool> running;
+    in property <float> progress;
+    callback begin();
+    callback cancel();
+    callback choose-region(x1: float, y1: float, x2: float, y2: float);
+}
+
+export component ObjectFollowButton inherits Button {
+    square: true;
+    glyph: ObjectFollowUi.selecting || ObjectFollowUi.running ? Glyph.close : Glyph.link;
+    label: ObjectFollowUi.selecting || ObjectFollowUi.running ? I18n.t("common.cancel") : I18n.t("objectFollow.start");
+    tip: ObjectFollowUi.selecting || ObjectFollowUi.running ? I18n.t("objectFollow.cancelHint") : I18n.t("objectFollow.startHint");
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.tip;
+    accessible-action-default => { root.clicked(); }
+
+    clicked => {
+        if (ObjectFollowUi.selecting || ObjectFollowUi.running) {
+            ObjectFollowUi.cancel();
+        } else {
+            ObjectFollowUi.begin();
+        }
+    }
+}
+
+export component ObjectFollowRegion inherits Rectangle {
+    property <float> first-x;
+    property <float> first-y;
+    property <float> last-x;
+    property <float> last-y;
+    property <bool> drawing;
+
+    accessible-role: region;
+    accessible-label: I18n.t("objectFollow.region");
+    accessible-description: I18n.t("objectFollow.regionHint");
+    forward-focus: keys;
+    init => { keys.focus(); }
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                ObjectFollowUi.cancel();
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+    }
+
+    function update-end(x: length, y: length) {
+        root.last-x = Math.max(0.0, Math.min(1.0, x / Math.max(1px, root.width)));
+        root.last-y = Math.max(0.0, Math.min(1.0, y / Math.max(1px, root.height)));
+    }
+
+    if root.drawing: Rectangle {
+        x: parent.width * Math.min(root.first-x, root.last-x);
+        y: parent.height * Math.min(root.first-y, root.last-y);
+        width: parent.width * Math.abs(root.first-x - root.last-x);
+        height: parent.height * Math.abs(root.first-y - root.last-y);
+        border-color: Theme.accent;
+        border-width: 2px;
+        background: Theme.accent.with-alpha(0.12);
+    }
+
+    pick := TouchArea {
+        mouse-cursor: crosshair;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                root.update-end(self.mouse-x, self.mouse-y);
+                root.first-x = root.last-x;
+                root.first-y = root.last-y;
+                root.drawing = true;
+                keys.focus();
+            } else if (event.kind == PointerEventKind.up && root.drawing) {
+                root.update-end(self.mouse-x, self.mouse-y);
+                root.drawing = false;
+                ObjectFollowUi.choose-region(root.first-x, root.first-y, root.last-x, root.last-y);
+            } else if (event.kind == PointerEventKind.cancel) {
+                root.drawing = false;
+            }
+        }
+        moved => {
+            if (root.drawing) { root.update-end(self.mouse-x, self.mouse-y); }
+        }
+    }
+
+    Tip {
+        active: pick.has-hover && !root.drawing;
+        text: I18n.t("objectFollow.regionHint");
+    }
+}
+
+export component ObjectFollowStatus inherits Rectangle {
+    min-height: 28px;
+    border-radius: Theme.r;
+    background: Theme.scrim;
+
+    Text {
+        x: 8px;
+        width: Math.max(0px, parent.width - 16px);
+        height: parent.height;
+        color: Theme.on-scrim;
+        font-size: Theme.fs-sm;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+        text: ObjectFollowUi.selecting ? I18n.t("objectFollow.regionHint")
+            : I18n.t1("objectFollow.progress", Math.round(ObjectFollowUi.progress * 100.0));
+    }
+}

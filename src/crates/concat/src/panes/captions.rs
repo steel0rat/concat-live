@@ -20,12 +20,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use concat_project::Command;
+use concat_project::caption_translations::{
+    Coverage, Error as TranslationError, Span, language_code,
+};
 use concat_project::model::{ClipKind, TextStyle};
 use concat_project::srt;
 use concat_speech::JobStage;
 use concat_speech::transcribe::Segment;
+use slint::{ComponentHandle, Model};
 
-use crate::host::{on_ui_in_project, spawn_in_project};
+use crate::host::{on_ui_in_project, spawn_long_in_project};
 use crate::i18n::{t, tf};
 use crate::panes::Msg;
 use crate::panes::pace::{Pace, Stage, Timings};
@@ -78,8 +82,32 @@ pub enum CaptionsMsg {
     ImportSrtFrom(PathBuf),
     /// Asks where to write the captions as SubRip.
     ExportSrt,
-    /// Where they go.
-    ExportSrtTo(PathBuf),
+    /// Writes the exact caption version that was chosen before the file dialog.
+    ExportSrtTo(PathBuf, PreparedSrt),
+    /// Chooses one of the active lane's export versions.
+    ChooseTranslationLanguage(i32),
+    /// Asks for a translated SubRip file for this language.
+    AskTranslation(String),
+    /// The file picked for an unchanged timeline.
+    ReadTranslation(TranslationFile),
+}
+
+/// The captions as chosen at the start of an export.
+#[derive(Clone, Debug)]
+pub struct PreparedSrt {
+    cues: Vec<srt::Cue>,
+    busiest: bool,
+}
+
+/// What was selected when the translation picker was opened.
+#[derive(Clone, Debug)]
+pub struct TranslationFile {
+    path: PathBuf,
+    language: String,
+    track_id: String,
+    timeline: String,
+    revision: u64,
+    epoch: u64,
 }
 
 /// The clip a transcription is running over, as the finished segments
@@ -129,6 +157,8 @@ pub struct CaptionsPane {
     /// `Preferences::caption_language`, so a person who captions in
     /// Indonesian says so once. An English-only model ignores it.
     pub language: Option<String>,
+    /// Selected SubRip language, independent of voice recognition.
+    export_language: Option<String>,
     /// 0 bottom, 1 centre, 2 top.
     pub placement: usize,
     /// 0 small, 1 medium, 2 large.
@@ -263,8 +293,14 @@ impl CaptionsPane {
                         let count = commands.len();
                         self.open = false;
                         if count == 0 {
+                            log::info!("captions: placed none · nothing was said in the clip");
                             studio.notify(&t("captions.nothingSaidClip"), true);
                         } else {
+                            log::info!(
+                                "captions: placed {count} captions from {:.2} s",
+                                subject.start
+                            );
+                            let _told = crate::studio::Asked::told();
                             studio.apply(Command::Batch {
                                 commands: font.into_iter().chain(commands).collect(),
                             });
@@ -296,7 +332,12 @@ impl CaptionsPane {
             ),
             CaptionsMsg::ImportSrtFrom(path) => self.import_srt(studio, &path),
             CaptionsMsg::ExportSrt => self.ask_export_srt(studio),
-            CaptionsMsg::ExportSrtTo(path) => self.export_srt(studio, &path),
+            CaptionsMsg::ExportSrtTo(path, export) => self.export_srt(studio, &path, export),
+            CaptionsMsg::ChooseTranslationLanguage(row) => {
+                self.pick_translation_language(studio, row)
+            }
+            CaptionsMsg::AskTranslation(language) => self.ask_translation(studio, &language),
+            CaptionsMsg::ReadTranslation(request) => self.read_translation(studio, request),
         }
     }
 
@@ -312,7 +353,10 @@ impl CaptionsPane {
         let cues = match cues {
             Ok(cues) => cues,
             Err(error) => {
-                log::warn!("captions: could not read {}: {error}", path.display());
+                log::warn!(
+                    "captions: reading the subtitles in {} failed: {error}; no captions were placed",
+                    crate::studio::file_name_of(&path.to_string_lossy())
+                );
                 self.message = tf("captions.couldNotReadSubtitles", &[&error]);
                 return;
             }
@@ -326,10 +370,163 @@ impl CaptionsPane {
         }
         let count = commands.len();
         self.open = false;
+        log::info!(
+            "captions: placed {count} captions from the subtitles in {}",
+            crate::studio::file_name_of(&path.to_string_lossy())
+        );
+        let _told = crate::studio::Asked::told();
         studio.apply(Command::Batch {
             commands: font.into_iter().chain(commands).collect(),
         });
         studio.notify(&tf("captions.addedCaptions", &[&count]), false);
+    }
+
+    fn pick_translation_language(&mut self, studio: &Studio, index: i32) {
+        if index == 0 {
+            self.export_language = None;
+            self.message.clear();
+            return;
+        }
+        let Some(lane) = export_lane(studio) else {
+            return;
+        };
+        if let Some((language, _)) = usize::try_from(index)
+            .ok()
+            .and_then(|row| row.checked_sub(1))
+            .and_then(|row| {
+                studio
+                    .timeline()
+                    .caption_translations
+                    .languages(studio.timeline(), &lane.track_id)
+                    .into_iter()
+                    .nth(row)
+            })
+        {
+            self.export_language = Some(language.to_owned());
+            self.message.clear();
+        }
+    }
+
+    fn ask_translation(&mut self, studio: &mut Studio, language: &str) {
+        studio.flush_commit();
+        let language = match language_code(language) {
+            Ok(language) => language,
+            Err(error) => {
+                self.message = translation_message(&error);
+                return;
+            }
+        };
+        let Some(lane) = export_lane(studio) else {
+            self.message = t("captionTranslations.emptyTrack");
+            return;
+        };
+        let timeline = studio.timeline().id.clone();
+        let revision = studio.edit_revision();
+        let epoch = crate::host::project_epoch();
+        crate::host::pick_files_then(
+            t("captionTranslations.import"),
+            Some((t("captions.subRipSubtitles"), &["srt"])),
+            move |studio, _, _, paths| {
+                if let Some(path) = paths.into_iter().next() {
+                    studio.handle(Msg::Captions(CaptionsMsg::ReadTranslation(
+                        TranslationFile {
+                            path,
+                            language,
+                            track_id: lane.track_id,
+                            timeline,
+                            revision,
+                            epoch,
+                        },
+                    )));
+                }
+            },
+        );
+    }
+
+    fn read_translation(&mut self, studio: &mut Studio, request: TranslationFile) {
+        if crate::host::project_epoch() != request.epoch
+            || studio.edit_revision() != request.revision
+            || studio.timeline().id != request.timeline
+        {
+            self.message = t("captionTranslations.changed");
+            return;
+        }
+        let text = match std::fs::read_to_string(&request.path) {
+            Ok(text) => text,
+            Err(error) => {
+                log::warn!("Subtitle translation could not be read: {error}");
+                self.message = if error.kind() == std::io::ErrorKind::InvalidData {
+                    t("captionTranslations.encoding")
+                } else {
+                    t("captionTranslations.cannotRead")
+                };
+                return;
+            }
+        };
+        let timeline = studio.timeline();
+        let mut checked = timeline.caption_translations.clone();
+        if let Err(error) =
+            checked.import_srt(timeline, &request.track_id, &request.language, &text)
+        {
+            self.message = translation_message(&error);
+            return;
+        }
+        let command = Command::ImportCaptionTranslation {
+            timeline_id: request.timeline,
+            track_id: request.track_id,
+            language: request.language.clone(),
+            srt: text,
+        };
+        if studio.try_apply(command).is_ok() {
+            self.export_language = Some(request.language.clone());
+            self.message.clear();
+            studio.notify(
+                &tf("captionTranslations.imported", &[&request.language]),
+                false,
+            );
+        } else {
+            self.message = t("captionTranslations.failed");
+        }
+    }
+
+    /// The SubRip export picker follows the same title lane as the existing export.
+    pub(crate) fn publish_translations(&self, studio: &Studio, app: &crate::ui::App) {
+        let ui = app.global::<crate::ui::CaptionTranslationControls>();
+        let lane = export_lane(studio);
+        ui.set_available(lane.is_some());
+        let timeline = studio.timeline();
+        let versions = lane
+            .as_ref()
+            .map(|lane| {
+                timeline
+                    .caption_translations
+                    .languages(timeline, &lane.track_id)
+            })
+            .unwrap_or_default();
+        let index = self.export_language.as_deref().and_then(|language| {
+            versions
+                .iter()
+                .position(|(current, _)| *current == language)
+        });
+        let mut labels: Vec<slint::SharedString> = vec![t("captionTranslations.original").into()];
+        labels.extend(
+            versions
+                .iter()
+                .map(|(language, _)| slint::SharedString::from(*language)),
+        );
+        if !ui.get_options().iter().eq(labels.iter().cloned()) {
+            ui.set_options(slint::ModelRc::new(slint::VecModel::from(labels)));
+        }
+        ui.set_current(index.map_or(0, |row| row.saturating_add(1) as i32));
+        let current = index.map(|row| versions[row].1);
+        ui.set_can_export(
+            current.is_none_or(|coverage| coverage.missing == 0 && coverage.stale == 0),
+        );
+        ui.set_coverage(
+            current
+                .map_or_else(String::new, translation_coverage)
+                .into(),
+        );
     }
 
     /// Asks where to write the captions, offering the project's folder
@@ -337,11 +534,35 @@ impl CaptionsPane {
     /// beside the project under a name nothing there has, and handed to
     /// the phone to put where its file manager shows it.
     fn ask_export_srt(&mut self, studio: &mut Studio) {
-        if export_lane(studio).is_none() {
+        studio.flush_commit();
+        let Some(lane) = export_lane(studio) else {
             self.message = t("captions.noCaptionsToExport");
             return;
-        }
-        let name = format!("{}.srt", file_stem(studio));
+        };
+        let timeline = studio.timeline();
+        let language = self.export_language.as_deref().filter(|lang| {
+            timeline
+                .caption_translations
+                .languages(timeline, &lane.track_id)
+                .into_iter()
+                .any(|(known, _)| known == *lang)
+        });
+        let cues = match timeline
+            .caption_translations
+            .export(timeline, &lane.track_id, language)
+        {
+            Ok(cues) => cues,
+            Err(error) => {
+                self.message = translation_message(&error);
+                return;
+            }
+        };
+        let export = PreparedSrt {
+            cues,
+            busiest: lane.busiest && srt::title_lanes(timeline) > 1,
+        };
+        let suffix = language.map_or_else(String::new, |lang| format!(".{lang}"));
+        let name = format!("{}{suffix}.srt", file_stem(studio));
         // No project, no project folder: Documents, as anywhere else a
         // file is written with nothing better to offer.
         let folder = studio
@@ -351,7 +572,7 @@ impl CaptionsPane {
             .unwrap_or_else(|| PathBuf::from(crate::studio::home_folder("Documents")));
         if cfg!(any(target_os = "android", target_os = "ios")) {
             let path = unique_path(&folder, &name);
-            self.export_srt(studio, &path);
+            self.export_srt(studio, &path, export);
             return;
         }
         let title = t("captions.exportSrt");
@@ -375,35 +596,35 @@ impl CaptionsPane {
                     },
                 )
             },
-            |studio, _, _, path| studio.handle(Msg::Captions(CaptionsMsg::ExportSrtTo(path))),
+            move |studio, _, _, path| {
+                studio.handle(Msg::Captions(CaptionsMsg::ExportSrtTo(path, export)))
+            },
         );
     }
 
     /// Writes the captions to `path` as SubRip, and says how many and
     /// where - on a phone, once the phone has put the file where it shows
     /// it.
-    fn export_srt(&mut self, studio: &mut Studio, path: &Path) {
-        let Some(lane) = export_lane(studio) else {
-            self.message = t("captions.noCaptionsToExport");
-            return;
-        };
-        let cues = srt::title_cues(studio.timeline(), Some(&lane.track_id));
+    fn export_srt(&mut self, studio: &mut Studio, path: &Path, export: PreparedSrt) {
+        let PreparedSrt { cues, busiest } = export;
         if let Err(error) = std::fs::write(path, srt::write(&cues)) {
-            log::warn!("captions: could not write {}: {error}", path.display());
+            log::warn!(
+                "captions: writing the subtitles to {} failed: {error}; nothing was exported",
+                crate::studio::file_name_of(&path.to_string_lossy())
+            );
             self.message = tf("captions.couldNotWriteSubtitles", &[&error]);
             return;
         }
         log::info!(
-            "captions: wrote {} cue(s) to {}",
+            "captions: exported {} captions to {}",
             cues.len(),
-            path.display()
+            crate::studio::file_name_of(&path.to_string_lossy())
         );
         self.open = false;
         let count = cues.len();
         // Which lane was written goes without saying when it was the
         // selected title's, or the only lane with titles; otherwise the
         // notice says it was the busiest, and how to pick another.
-        let busiest = lane.busiest && srt::title_lanes(studio.timeline()) > 1;
         let say = move |studio: &mut Studio, place: &str| {
             // Each key spelled out where it is used: scripts/locales.py
             // finds the strings the source asks for by reading it.
@@ -422,7 +643,10 @@ impl CaptionsPane {
                 crate::host::on_ui(move |studio, _, _| match result {
                     Ok(place) => say(studio, &place),
                     Err(error) => {
-                        log::warn!("captions: could not publish {}: {error}", written.display());
+                        log::warn!(
+                            "captions: wanted {} handed to the phone's files and it was not: {error}; it stays in the project's folder",
+                            crate::studio::file_name_of(&written.to_string_lossy())
+                        );
                         studio.notify(
                             &tf(
                                 "captions.couldNotPublishSubtitles",
@@ -533,6 +757,11 @@ impl CaptionsPane {
             .collect();
         let count = commands.len();
         self.open = false;
+        log::info!(
+            "captions: placed {count} captions from a script, from {:.2} s",
+            studio.playhead
+        );
+        let _told = crate::studio::Asked::told();
         studio.apply(Command::Batch {
             commands: font.into_iter().chain(commands).collect(),
         });
@@ -604,7 +833,7 @@ impl CaptionsPane {
         self.running = true;
         self.message.clear();
         let epoch = crate::host::project_epoch();
-        spawn_in_project(
+        spawn_long_in_project(
             move || {
                 transcriber.transcribe(&dirs, &request, move |stage| {
                     on_ui_in_project(epoch, move |studio, _, _| {
@@ -689,6 +918,70 @@ impl CaptionsPane {
             message: self.message.as_str().into(),
         }
     }
+}
+
+pub(crate) fn bind_translations(app: &crate::ui::App) {
+    let ui = app.global::<crate::ui::CaptionTranslationControls>();
+    ui.on_choose(|index| caption_message(CaptionsMsg::ChooseTranslationLanguage(index)));
+    ui.on_import_translation(|language| {
+        caption_message(CaptionsMsg::AskTranslation(language.to_string()))
+    });
+}
+
+fn caption_message(message: CaptionsMsg) {
+    crate::host::Shell::with(|shell, app| {
+        let mut studio = shell.studio.borrow_mut();
+        studio.handle(Msg::Captions(message));
+        studio.publish(&app, &shell.models);
+    });
+}
+
+fn translation_coverage(coverage: Coverage) -> String {
+    tf(
+        "captionTranslations.coverage",
+        &[&coverage.ready, &coverage.missing, &coverage.stale],
+    )
+}
+
+fn translation_message(error: &TranslationError) -> String {
+    match error {
+        TranslationError::InvalidLanguage => t("captionTranslations.invalidLanguage"),
+        TranslationError::MissingLanguage(_) => t("captionTranslations.noLanguage"),
+        TranslationError::EmptyTrack => t("captionTranslations.emptyTrack"),
+        TranslationError::EmptyImport => t("captionTranslations.emptyImport"),
+        TranslationError::InvalidSrt { line, reason } => {
+            log::warn!("Subtitle file line {line} could not be parsed: {reason}");
+            tf("captionTranslations.invalidSrt", &[line])
+        }
+        TranslationError::InvalidTimes => t("captionTranslations.invalidTimes"),
+        TranslationError::AmbiguousSource(span) => {
+            tf("captionTranslations.ambiguous", &[&translation_span(*span)])
+        }
+        TranslationError::RepeatedCue(span) => {
+            tf("captionTranslations.repeated", &[&translation_span(*span)])
+        }
+        TranslationError::UnmatchedCue(span) => {
+            tf("captionTranslations.unmatched", &[&translation_span(*span)])
+        }
+        TranslationError::UnknownClip(_) | TranslationError::RepeatedClip(_) => {
+            t("captionTranslations.changed")
+        }
+        TranslationError::EmptyTranslation(_) => t("captionTranslations.emptyCue"),
+        TranslationError::Incomplete(coverage) => translation_coverage(*coverage),
+    }
+}
+
+fn translation_span(span: Span) -> String {
+    let stamp = |ms: u64| {
+        format!(
+            "{:02}:{:02}:{:02},{:03}",
+            ms / 3_600_000,
+            ms / 60_000 % 60,
+            ms / 1_000 % 60,
+            ms % 1_000
+        )
+    };
+    format!("{} — {}", stamp(span.start_ms), stamp(span.end_ms))
 }
 
 /// English, as the language list names it.

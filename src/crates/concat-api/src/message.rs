@@ -225,6 +225,27 @@ pub enum Request {
         job: String,
     },
 
+    /// Submits candidate IDs to the embedded chat's active pause review.
+    /// Available only to the chat turn that requested the candidates.
+    #[serde(rename = "pause.reviewSubmit")]
+    PauseReviewSubmit {
+        /// The project folder.
+        path: String,
+        /// The candidate IDs supplied by the editor.
+        ids: Vec<u32>,
+    },
+
+    /// Reports completed notes in the current embedded chat batch.
+    #[serde(rename = "timeline.notesReport")]
+    TimelineNotesReport {
+        /// The project folder.
+        path: String,
+        /// The batch identifier supplied in the current request.
+        batch_id: String,
+        /// The supplied IDs of notes that are ready for the user's review.
+        ids: Vec<u32>,
+    },
+
     /// Composites the true frame at one instant. Written as a PNG to
     /// `output` when there is one, and handed back inline as a
     /// [`Picture`] otherwise, for a caller on the far side of a socket.

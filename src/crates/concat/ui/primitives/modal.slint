@@ -5,7 +5,9 @@ import { I18n } from "../i18n.slint";
 import { Theme } from "../theme/theme.slint";
 import { Glyph, Icon } from "../icons.slint";
 import { Tip } from "tooltip.slint";
+import { FocusRing } from "focus-ring.slint";
 import { Select } from "select.slint";
+import { IconButton } from "panel.slint";
 
 // The dialog layer this tree did not have.
 //
@@ -184,24 +186,12 @@ export component Modal inherits Rectangle {
                     // the job running, to be seen again when it is opened.
                     if root.dismissable || root.floating: VerticalLayout {
                         alignment: center;
-                        Rectangle {
-                            width: 26px;
-                            height: 26px;
-                            border-radius: Theme.r-sm;
-                            background: shut.has-hover ? Theme.field : Colors.transparent;
-
-                            Icon {
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
-                                glyph: Glyph.close;
-                                size: 13px;
-                                tint: shut.has-hover ? Theme.fg : Theme.fg-muted;
-                            }
-
-                            shut := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.closed(); }
-                            }
+                        IconButton {
+                            glyph: Glyph.close;
+                            label: I18n.t("common.closeSheet");
+                            tip: I18n.t1("common.closeSheetHint", root.title);
+                            icon-size: 13px;
+                            clicked => { root.closed(); }
                         }
                     }
                 }
@@ -268,6 +258,7 @@ export component Modal inherits Rectangle {
 export component Sheet inherits Rectangle {
     in property <bool> open;
     in property <string> title;
+    property <string> close-hint: I18n.t1("common.closeSheetHint", root.title);
     in property <Glyph> glyph;
     /// False while a job is running: the × is gone, not disabled.
     in property <bool> dismissable: true;
@@ -329,6 +320,22 @@ export component Sheet inherits Rectangle {
                             border-radius: Theme.r-sm;
                             background: shut.has-hover ? Theme.field : Colors.transparent;
 
+                            accessible-role: button;
+                            accessible-label: I18n.t("common.closeSheet");
+                            accessible-description: root.close-hint;
+                            accessible-action-default => { root.closed(); }
+                            forward-focus: close-keys;
+
+                            close-keys := FocusScope {
+                                key-pressed(event) => {
+                                    if (event.text == Key.Space || event.text == Key.Return) {
+                                        root.closed();
+                                        return EventResult.accept;
+                                    }
+                                    return EventResult.reject;
+                                }
+                            }
+
                             Icon {
                                 x: (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
@@ -341,6 +348,8 @@ export component Sheet inherits Rectangle {
                                 mouse-cursor: pointer;
                                 clicked => { root.closed(); }
                             }
+                            Tip { text: root.close-hint; active: shut.has-hover; }
+                            FocusRing { active: close-keys.has-focus; radius: Theme.r-sm; }
                         }
                     }
                 }
@@ -395,6 +404,7 @@ export component Button inherits Rectangle {
     /// sits beside a field and says what it does with its mark: the eye
     /// that shows a token. The label is not drawn; it is the tooltip.
     in property <bool> square;
+    in property <string> tip: root.square ? root.label : "";
 
     callback clicked();
 
@@ -462,10 +472,8 @@ export component Button inherits Rectangle {
         clicked => { root.clicked(); }
     }
 
-    // A mark alone says what it does once it has been learnt; the name
-    // under the pointer is how it is learnt.
-    if root.square: Tip {
-        text: root.label;
+    if root.tip != "": Tip {
+        text: root.tip;
         active: touch.has-hover;
     }
 }
@@ -774,6 +782,13 @@ export component DialogSection inherits VerticalLayout {
                     options: root.choices;
                     details: root.choice-details;
                     current: root.choice;
+                    placeholder: root.title;
+                    tip: root.hint;
+                    accessible-role: combobox;
+                    accessible-label: root.title;
+                    accessible-description: root.hint;
+                    accessible-value: root.choices[root.choice];
+                    accessible-action-default => { self.reveal(); }
                     changed(index) => { root.chose(index); }
                 }
             }
@@ -789,6 +804,24 @@ export component DialogSection inherits VerticalLayout {
                     border-radius: Theme.r-sm;
                     background: root.on ? Theme.accent : Theme.field-active;
 
+                    accessible-role: switch;
+                    accessible-label: root.title;
+                    accessible-description: root.hint;
+                    accessible-checkable: true;
+                    accessible-checked: root.on;
+                    accessible-action-default => { root.switched(!root.on); }
+                    forward-focus: switch-focus;
+
+                    switch-focus := FocusScope {
+                        key-pressed(event) => {
+                            if (event.text == Key.Space || event.text == Key.Return) {
+                                root.switched(!root.on);
+                                return EventResult.accept;
+                            }
+                            return EventResult.reject;
+                        }
+                    }
+
                     animate background { duration: 120ms; easing: cubic-bezier(0.4, 0, 0.2, 1); }
 
                     Rectangle {
@@ -802,10 +835,15 @@ export component DialogSection inherits VerticalLayout {
                         animate x { duration: 120ms; easing: cubic-bezier(0.4, 0, 0.2, 1); }
                     }
 
-                    TouchArea {
+                    switch-touch := TouchArea {
                         mouse-cursor: pointer;
                         clicked => { root.switched(!root.on); }
                     }
+                    if root.hint != "": Tip {
+                        text: root.hint;
+                        active: switch-touch.has-hover;
+                    }
+                    FocusRing { active: switch-focus.has-focus; radius: Theme.r-sm; }
                 }
             }
         }
@@ -840,17 +878,29 @@ export component DialogSection inherits VerticalLayout {
 // group starts at the same x, whatever its label says.
 export component DialogRow inherits HorizontalLayout {
     in property <string> label;
+    in property <string> help;
+    in property <length> label-width: 78px;
 
     min-height: 28px;
     spacing: 10px;
 
-    if root.label != "": Text {
-        width: 78px;
-        text: root.label;
-        color: Theme.fg-muted;
-        font-size: Theme.fs;
-        vertical-alignment: center;
-        overflow: elide;
+    if root.label != "": Rectangle {
+        width: root.label-width;
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: root.label;
+            color: Theme.fg-muted;
+            font-size: Theme.fs;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if root.help != "": TouchArea {
+            Tip {
+                text: root.help;
+                active: parent.has-hover;
+            }
+        }
     }
 
     HorizontalLayout {
@@ -866,6 +916,7 @@ export component Field inherits Rectangle {
     /// `edited`, and this is re-seeded from whatever the caller does with it.
     in property <string> value;
     in property <string> placeholder;
+    in property <string> tip;
     /// numbers, paths and names read better in the technical face
     in property <bool> technical;
     /// Drawn as dots, the way a password field is: for a token that is
@@ -929,6 +980,10 @@ export component Field inherits Rectangle {
         mouse-cursor: MouseCursor.text;
         clicked => { input.focus(); }
     }
+    Tip {
+        text: root.tip;
+        active: touch.has-hover && !input.has-focus;
+    }
 
     // The strip the text shows through. A TextInput never scrolls by
     // itself: a name longer than the field ran on past its right edge,
@@ -955,6 +1010,7 @@ export component Field inherits Rectangle {
             height: self.preferred-height;
             text <=> root.draft;
             input-type: root.secret ? InputType.password : InputType.text;
+            accessible-description: root.tip;
             color: Theme.fg;
             font-family: root.technical ? Theme.font-technical : Theme.font;
             font-size: Theme.fs;

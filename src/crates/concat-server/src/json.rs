@@ -10,6 +10,8 @@
 //! and the connection is closed. `auth` is the transport's word, not the
 //! API's: it never reaches the hub. The wire after it is exactly what
 //! `concat-cli api` reads and writes; see `concat_api::rpc`.
+//! An optional `params.clientId` labels subsequent calls on the connection
+//! after authentication.
 //!
 //! A caller that has not presented its token yet holds as little as it
 //! can: one thread and the socket it arrived on, for at most
@@ -49,6 +51,7 @@ use crate::{Connections, Hub, Subscriber, token};
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// The longest first line: the `auth` call is a few dozen bytes.
 pub const MAX_AUTH_LINE: usize = 4 * 1024;
+const MAX_CLIENT_ID: usize = 64;
 /// How long a caller has, in all, to present its token before the
 /// connection is closed.
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -265,11 +268,14 @@ fn connection<S: Socket>(mut stream: S, door: Door, id: u64, peer: Peer, pending
         return;
     };
     let (call, outcome) = handshake(&first, &door.token);
-    if let Err(error) = outcome {
-        door.throttle.failed(peer);
-        refuse(stream, call, error.code, error.message);
-        return;
-    }
+    let client_id = match outcome {
+        Ok(client_id) => client_id,
+        Err(error) => {
+            door.throttle.failed(peer);
+            refuse(stream, call, error.code, error.message);
+            return;
+        }
+    };
     door.throttle.succeeded(peer);
     drop(pending);
     let Some(_seat) = Place::take(&door.seats, MAX_CONNECTIONS) else {
@@ -333,7 +339,10 @@ fn connection<S: Socket>(mut stream: S, door: Door, id: u64, peer: Peer, pending
             continue;
         }
         let (id, response) = match Call::parse(&line) {
-            Ok(call) => (call.id, door.hub.call(call.request)),
+            Ok(call) => (
+                call.id,
+                door.hub.call_from(call.request, client_id.as_deref()),
+            ),
             Err((id, error)) => (id, Response::Error(error)),
         };
         if !outbox.send(Message::Reply { id, response }) {
@@ -393,9 +402,9 @@ fn read_line(reader: &mut impl BufRead, cap: usize) -> Option<String> {
     }
 }
 
-/// Reads the first line as the `auth` call and checks its token, in
-/// constant time.
-fn handshake(line: &str, token: &str) -> (Option<Id>, Result<(), ApiError>) {
+/// Reads the `auth` call, checks its token in constant time and returns
+/// any valid client identifier for the authenticated connection.
+fn handshake(line: &str, token: &str) -> (Option<Id>, Result<Option<String>, ApiError>) {
     let refuse = |id: Option<Id>, why: &str| {
         (
             id,
@@ -409,16 +418,29 @@ fn handshake(line: &str, token: &str) -> (Option<Id>, Result<(), ApiError>) {
     if object.get("method").and_then(Value::as_str) != Some("auth") {
         return refuse(id, "the first line is the auth call");
     }
-    let presented = object
-        .get("params")
+    let params = object.get("params");
+    let presented = params
         .and_then(|params| params.get("token"))
         .or_else(|| object.get("token"))
         .and_then(Value::as_str);
     if token::matches(presented.unwrap_or_default().as_bytes(), token.as_bytes()) {
-        (id, Ok(()))
+        let client_id = params
+            .and_then(|params| params.get("clientId"))
+            .and_then(Value::as_str)
+            .filter(|client_id| valid_client_id(client_id))
+            .map(str::to_owned);
+        (id, Ok(client_id))
     } else {
         refuse(id, "wrong token")
     }
+}
+
+pub(crate) fn valid_client_id(client_id: &str) -> bool {
+    !client_id.is_empty()
+        && client_id.len() <= MAX_CLIENT_ID
+        && client_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
 }
 
 /// The connection's one writer: a queue and the thread that drains it.
@@ -550,6 +572,33 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         condition()
+    }
+
+    #[test]
+    fn an_authenticated_connection_accepts_only_a_valid_client_identifier() {
+        let auth = |token, client_id: &str| {
+            serde_json::json!({
+                "id": 1,
+                "method": "auth",
+                "params": { "token": token, "clientId": client_id },
+            })
+            .to_string()
+        };
+        let (_, identified) = handshake(&auth(TOKEN, "agent-1"), TOKEN);
+        assert_eq!(
+            identified.expect("authenticates").as_deref(),
+            Some("agent-1")
+        );
+
+        for invalid in ["", "two words", "❋", &"a".repeat(MAX_CLIENT_ID + 1)] {
+            let (_, unlabeled) = handshake(&auth(TOKEN, invalid), TOKEN);
+            assert_eq!(unlabeled.expect("authenticates normally"), None);
+        }
+        let (_, refused) = handshake(&auth("wrong test token", "agent-1"), TOKEN);
+        assert_eq!(
+            refused.expect_err("wrong token").code,
+            ErrorCode::Unauthorized
+        );
     }
 
     #[test]

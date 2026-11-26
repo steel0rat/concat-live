@@ -1,0 +1,219 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Concat Live contributors
+
+import { I18n } from "../i18n.slint";
+import { Theme } from "../theme/theme.slint";
+import { Glyph } from "../icons.slint";
+import { DialogSection, Field, Modal } from "../primitives/modal.slint";
+import { Tip } from "../primitives/tooltip.slint";
+import { ChatAction } from "../workspace/agent.slint";
+
+export struct SectionRowData {
+    id: int,
+    name: string,
+    start: string,
+    timing: string,
+    attention: bool,
+}
+
+export global SectionPlanning {
+    in property <bool> available;
+    in property <bool> open;
+    in property <bool> can-follow;
+    in property <bool> can-export;
+    in property <string> timeline;
+    in property <string> cursor;
+    in property <string> error;
+    in property <[SectionRowData]> rows;
+    in property <int> editing-id;
+    in-out property <string> name;
+    in-out property <string> planned;
+    in-out property <bool> follow-clip;
+    callback toggle();
+    callback close();
+    callback new-section();
+    callback select(section: int);
+    callback jump(section: int);
+    callback remove(section: int);
+    callback save(move-start: bool);
+    callback export-chapters();
+}
+
+component SectionField inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <string> help;
+    in property <int> max-length;
+    callback edited(text: string);
+
+    spacing: 4px;
+    Rectangle {
+        height: caption.preferred-height;
+        accessible-role: text;
+        accessible-label: root.label;
+        accessible-description: root.help;
+
+        caption := Text {
+            text: root.label;
+            color: Theme.fg-muted;
+            font-size: Theme.fs;
+        }
+        hover := TouchArea { }
+        Tip {
+            text: root.help;
+            active: hover.has-hover;
+        }
+    }
+    Field {
+        value: root.value;
+        placeholder: root.label;
+        max-length: root.max-length;
+        edited(text) => { root.edited(text); }
+    }
+}
+
+export component SectionDialog inherits Modal {
+    open: SectionPlanning.open;
+    title: I18n.t("sections.title");
+    note: SectionPlanning.timeline;
+    glyph: Glyph.clock;
+    surface-width: 520px;
+    closed => { SectionPlanning.close(); }
+
+    VerticalLayout {
+        DialogSection {
+            first: true;
+            title: SectionPlanning.editing-id > 0 ? I18n.t("sections.edit") : I18n.t("sections.new");
+
+            HorizontalLayout {
+                spacing: 8px;
+                SectionField {
+                    horizontal-stretch: 2;
+                    label: I18n.t("sections.name");
+                    help: I18n.t("sections.nameTip");
+                    value: SectionPlanning.name;
+                    max-length: 120;
+                    edited(text) => { SectionPlanning.name = text; }
+                }
+                SectionField {
+                    horizontal-stretch: 1;
+                    label: I18n.t("sections.planned");
+                    help: I18n.t("sections.plannedTip");
+                    value: SectionPlanning.planned;
+                    max-length: 13;
+                    edited(text) => { SectionPlanning.planned = text; }
+                }
+            }
+
+            Text {
+                text: I18n.t1("sections.cursor", SectionPlanning.cursor);
+                color: Theme.fg-muted;
+                font-size: Theme.fs-sm;
+                wrap: word-wrap;
+            }
+            ChatAction {
+                label: SectionPlanning.follow-clip ? I18n.t("sections.followOn") : I18n.t("sections.followOff");
+                tip: I18n.t("sections.followTip");
+                ghost: false;
+                primary: SectionPlanning.follow-clip;
+                enabled: SectionPlanning.can-follow || SectionPlanning.follow-clip;
+                horizontal-stretch: 1;
+                elide-label: true;
+                clicked => { SectionPlanning.follow-clip = !SectionPlanning.follow-clip; }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                if SectionPlanning.editing-id > 0: ChatAction {
+                    label: I18n.t("common.cancel");
+                    tip: I18n.t("sections.cancelTip");
+                    ghost: false;
+                    clicked => { SectionPlanning.new-section(); }
+                }
+                if SectionPlanning.editing-id > 0: ChatAction {
+                    label: I18n.t("sections.moveStart");
+                    tip: I18n.t("sections.moveStartTip");
+                    ghost: false;
+                    elide-label: true;
+                    horizontal-stretch: 1;
+                    enabled: SectionPlanning.name != "";
+                    clicked => { SectionPlanning.save(true); }
+                }
+                ChatAction {
+                    label: I18n.t("studio.save");
+                    tip: I18n.t("sections.saveTip");
+                    ghost: false;
+                    primary: true;
+                    enabled: SectionPlanning.name != "";
+                    clicked => { SectionPlanning.save(false); }
+                }
+            }
+            if SectionPlanning.error != "": Text {
+                text: SectionPlanning.error;
+                color: Theme.danger;
+                font-size: Theme.fs-sm;
+                wrap: word-wrap;
+            }
+        }
+
+        DialogSection {
+            title: I18n.t("sections.timing");
+            if SectionPlanning.rows.length == 0: Text {
+                text: I18n.t("sections.empty");
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+
+            for section in SectionPlanning.rows: VerticalLayout {
+                spacing: 3px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    ChatAction {
+                        label: section.start + " · " + section.name;
+                        tip: I18n.t("sections.jumpTip");
+                        ghost: false;
+                        horizontal-stretch: 1;
+                        elide-label: true;
+                        clicked => { SectionPlanning.jump(section.id); }
+                    }
+                    ChatAction {
+                        label: I18n.t("sections.edit");
+                        tip: I18n.t("sections.editTip");
+                        ghost: false;
+                        clicked => { SectionPlanning.select(section.id); }
+                    }
+                    ChatAction {
+                        label: I18n.t("sections.remove");
+                        tip: I18n.t("sections.removeTip");
+                        square: true;
+                        glyph: Glyph.trash;
+                        clicked => { SectionPlanning.remove(section.id); }
+                    }
+                }
+                Text {
+                    text: section.timing;
+                    color: Theme.fg-muted;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+                if section.attention: Text {
+                    text: I18n.t("sections.checkRange");
+                    color: Theme.danger;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+            }
+
+            ChatAction {
+                label: I18n.t("sections.export");
+                tip: I18n.t("sections.exportTip");
+                ghost: false;
+                enabled: SectionPlanning.can-export;
+                horizontal-stretch: 1;
+                elide-label: true;
+                clicked => { SectionPlanning.export-chapters(); }
+            }
+        }
+    }
+}

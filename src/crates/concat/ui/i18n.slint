@@ -22,6 +22,12 @@ export global I18n {
 
     /// The translation of `key` in `lang`, or its English. Set by Rust.
     pure callback lookup(lang: string, key: string) -> string;
+    pure callback lookup-menu-help(lang: string, id: string) -> string;
+    lookup-menu-help(lang, id) => { return ""; }
+
+    public pure function menu-help(id: string) -> string {
+        return lookup-menu-help(lang, id);
+    }
     lookup(lang, key) => { return key; }
     /// The same, with `{0}` replaced by `a`.
     pure callback lookup1(lang: string, key: string, a: string) -> string;

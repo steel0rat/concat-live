@@ -51,6 +51,7 @@ pub mod compact;
 pub mod enhance;
 pub mod mask;
 pub mod models;
+pub mod object_follow;
 pub mod onnx;
 #[cfg(feature = "infer")]
 pub mod runtime;

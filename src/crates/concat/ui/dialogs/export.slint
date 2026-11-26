@@ -5,8 +5,12 @@ import { I18n } from "../i18n.slint";
 import { Theme } from "../theme/theme.slint";
 import { Glyph, Icon } from "../icons.slint";
 import { Button, CopyChip, DialogRow, DialogSection, Field, Progress } from "../primitives/modal.slint";
+import { StemExport } from "stems.slint";
+import { CoverFrameUi } from "cover-frame.slint";
+import { ChatAction } from "../workspace/agent.slint";
 import { NumberField } from "../primitives/number-field.slint";
 import { Select } from "../primitives/select.slint";
+import { Tip } from "../primitives/tooltip.slint";
 import { Switch } from "../inspector/controls.slint";
 import { PaneScroll } from "../workspace/pane.slint";
 import { Fmt } from "../util.slint";
@@ -87,8 +91,10 @@ export struct ExportData {
     /// "Rendering video"
     stage: string,
     eta: string,
-    /// why it failed, when it did
+    /// The description shown in the failure card.
     message: string,
+    /// The original message for the copy action.
+    diagnostic: string,
     done-size: string,
     /// nothing on the timeline to export
     empty: bool,
@@ -213,7 +219,7 @@ component PreviewSection inherits DialogSection {
             background: Theme.accent;
         }
 
-        TouchArea {
+        seek-bar := TouchArea {
             mouse-cursor: pointer;
             pointer-event(event) => {
                 if (event.kind == PointerEventKind.down) {
@@ -225,6 +231,10 @@ component PreviewSection inherits DialogSection {
                     root.seek(Math.clamp(self.mouse-x / self.width, 0, 1) * root.duration);
                 }
             }
+        }
+        Tip {
+            text: I18n.t("export.previewSeekTip");
+            active: seek-bar.has-hover;
         }
     }
 
@@ -278,6 +288,7 @@ component DestinationSection inherits DialogSection {
 
         if !root.phone: Button {
             label: I18n.t("export.browse");
+            tip: I18n.t("export.destinationTip");
             glyph: Glyph.import;
             clicked => { root.browse(); }
         }
@@ -307,6 +318,7 @@ component OutputSection inherits DialogSection {
 
     DialogRow {
         label: I18n.t("export.resolution");
+        help: I18n.t("export.resolutionTip");
         // The timeline's own size, which is the size it exports at: a
         // 9:16 edit is 1080 × 1920. A fact, not a choice.
         // https://github.com/jub0t/Concat/issues/109
@@ -324,8 +336,10 @@ component OutputSection inherits DialogSection {
 
     DialogRow {
         label: I18n.t("common.frameRate");
+        help: I18n.t("export.rateTip");
         Select {
             current: root.data.rate;
+            tip: I18n.t("export.rateTip");
             options: root.data.rates;
             details: root.data.rate-details;
             changed(index) => { root.rate-changed(index); }
@@ -336,8 +350,10 @@ component OutputSection inherits DialogSection {
     // to SDR for wherever HDR does not play.
     if root.data.hdr-timeline && root.data.deep-available: DialogRow {
         label: I18n.t("common.color");
+        help: I18n.t("export.colorTip");
         Select {
             current: root.data.hdr ? 0 : 1;
+            tip: I18n.t("export.colorTip");
             options: [root.data.hdr-label, "SDR"];
             details: [I18n.t("export.asTheTimeline"), I18n.t("export.toneMapped")];
             changed(index) => { root.hdr-changed(index == 0); }
@@ -350,8 +366,10 @@ component OutputSection inherits DialogSection {
     // carry.
     if !root.data.hdr: DialogRow {
         label: I18n.t("export.codec");
+        help: I18n.t("export.codecTip");
         Select {
             current: root.data.codec;
+            tip: I18n.t("export.codecTip");
             options: ["H.264", "HEVC", "AV1", "ProRes 4444", "VP9 alpha"];
             details: [
                 root.data.h264-encodable ? I18n.t("export.playsEverywhere") : I18n.t("export.notOnThisDevice"),
@@ -375,8 +393,10 @@ component OutputSection inherits DialogSection {
 
     if root.data.hdr: DialogRow {
         label: I18n.t("export.codec");
+        help: I18n.t("export.codecTip");
         Select {
             current: root.data.codec - 1;
+            tip: I18n.t("export.codecTip");
             options: ["HEVC", "AV1"];
             details: [
                 root.data.hevc-encodable ? I18n.t("export.halfTheSize") : I18n.t("export.notOnThisDevice"),
@@ -392,11 +412,14 @@ component OutputSection inherits DialogSection {
     // so the size on the Export button is the size written.
     if root.data.rate-controlled: DialogRow {
         label: I18n.t("export.bitrate");
+        help: I18n.t("export.bitrateTip");
         HorizontalLayout {
             alignment: end;
             NumberField {
                 width: 120px;
                 value: root.data.target;
+                accessible-name: I18n.t("export.bitrate");
+                tip: I18n.t("export.bitrateTip");
                 minimum: 0.5;
                 maximum: 400;
                 step: 0.5;
@@ -413,13 +436,22 @@ component OutputSection inherits DialogSection {
     // VP9 with alpha eight.
     if !root.data.hdr && root.data.deep-available && !root.data.keeps-alpha: DialogRow {
         label: I18n.t("export.tenBitColour");
+        help: I18n.t("export.depthTip");
         HorizontalLayout {
             alignment: end;
             VerticalLayout {
                 alignment: center;
-                Switch {
-                    checked: root.data.ten-bit;
-                    toggled(on) => { root.ten-bit-changed(on); }
+                depth := TouchArea {
+                    width: depth-switch.width;
+                    height: depth-switch.height;
+                    depth-switch := Switch {
+                        checked: root.data.ten-bit;
+                        toggled(on) => { root.ten-bit-changed(on); }
+                    }
+                    Tip {
+                        text: I18n.t("export.depthTip");
+                        active: depth.has-hover;
+                    }
                 }
             }
         }
@@ -470,7 +502,15 @@ component ExportFooter inherits VerticalLayout {
 
             VerticalLayout {
                 alignment: start;
-                CopyChip { text: root.data.message; }
+                copy := TouchArea {
+                    width: chip.width;
+                    height: chip.height;
+                    chip := CopyChip { text: root.data.diagnostic; }
+                    Tip {
+                        text: I18n.t("export.copyErrorTip");
+                        active: copy.has-hover;
+                    }
+                }
             }
         }
     }
@@ -509,6 +549,7 @@ component ExportFooter inherits VerticalLayout {
         alignment: start;
         Button {
             label: I18n.t("export.cancelExport");
+            tip: I18n.t("export.cancelTip");
             glyph: Glyph.close;
             ghost: true;
             clicked => { root.cancel(); }
@@ -539,11 +580,13 @@ component ExportFooter inherits VerticalLayout {
 
         if !root.phone: Button {
             label: I18n.t("export.showInFolder");
+            tip: I18n.t("export.findOutputTip");
             glyph: Glyph.import;
             clicked => { root.reveal(); }
         }
         Button {
             label: I18n.t("export.exportAgain");
+            tip: I18n.t("export.againTip");
             ghost: true;
             clicked => { root.again(); }
         }
@@ -552,16 +595,37 @@ component ExportFooter inherits VerticalLayout {
     if root.data.phase == ExportPhase.idle || root.data.phase == ExportPhase.failed:
     HorizontalLayout {
         alignment: root.narrow ? stretch : end;
-        Button {
-            block: true;
-            primary: true;
-            large: true;
+        start := TouchArea {
             min-width: root.narrow ? 0px : 320px;
-            glyph: Glyph.export;
-            label: root.data.empty ? I18n.t("export.nothingToExport")
-                : I18n.t("export.exportEstimate") + root.data.size-chosen;
-            enabled: !root.data.empty && root.data.name != "";
-            clicked => { root.begin(); }
+            min-height: start-button.min-height;
+            max-height: start-button.max-height;
+            horizontal-stretch: 1;
+            property <bool> can-start: !root.data.empty && root.data.name != "";
+            property <string> hint: root.data.empty ? I18n.t("export.emptyTip")
+                : root.data.name == "" ? I18n.t("export.nameTip")
+                : I18n.t("export.startTip");
+
+            start-button := Button {
+                block: true;
+                primary: true;
+                large: true;
+                glyph: Glyph.export;
+                label: root.data.empty ? I18n.t("export.nothingToExport")
+                    : I18n.t("export.exportEstimate") + root.data.size-chosen;
+                enabled: start.can-start;
+                accessible-role: button;
+                accessible-label: self.label;
+                accessible-description: start.hint;
+                accessible-enabled: self.enabled;
+                accessible-action-default => {
+                    if (start.can-start) { root.begin(); }
+                }
+                clicked => { root.begin(); }
+            }
+            Tip {
+                text: start.hint;
+                active: start.has-hover;
+            }
         }
     }
 }
@@ -680,6 +744,11 @@ export component ExportDialog inherits Rectangle {
                             height: 32px;
                             border-radius: Theme.r-sm;
                             background: shut.has-hover ? Theme.field : Colors.transparent;
+                            property <string> hint: I18n.t1("common.closeSheetHint", I18n.t("common.export"));
+                            accessible-role: button;
+                            accessible-label: I18n.t("common.closeSheet");
+                            accessible-description: self.hint;
+                            accessible-action-default => { root.closed(); }
 
                             Icon {
                                 x: (parent.width - self.width) / 2;
@@ -692,6 +761,10 @@ export component ExportDialog inherits Rectangle {
                             shut := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => { root.closed(); }
+                            }
+                            Tip {
+                                text: parent.hint;
+                                active: shut.has-hover;
                             }
                         }
                     }
@@ -832,6 +905,31 @@ export component ExportDialog inherits Rectangle {
                                 browse => { root.browse(); }
                             }
                         }
+                    }
+                }
+            }
+
+            if StemExport.available && !root.running: Measure {
+                padding: 12px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    ChatAction {
+                        label: I18n.t("stems.title");
+                        tip: I18n.t("stems.openTip");
+                        min-width: 0px;
+                        horizontal-stretch: 1;
+                        elide-label: true;
+                        ghost: false;
+                        clicked => { StemExport.open-library(); }
+                    }
+                    if CoverFrameUi.available: ChatAction {
+                        label: I18n.t("cover.title");
+                        tip: I18n.t("cover.openTip");
+                        min-width: 0px;
+                        horizontal-stretch: 1;
+                        elide-label: true;
+                        ghost: false;
+                        clicked => { CoverFrameUi.open-panel(); }
                     }
                 }
             }

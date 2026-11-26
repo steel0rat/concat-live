@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // SPDX-FileCopyrightText: 2026 Jareer Abdullah
 
+import { I18n } from "../i18n.slint";
 import { Theme } from "../theme/theme.slint";
 import { Fmt } from "../util.slint";
 import { NumberField } from "number-field.slint";
+import { Tip } from "tooltip.slint";
 
 // A colour picker of the kind a grading suite has, and nothing less: a
 // saturation-value square under a hue strip, an alpha strip when the colour
@@ -69,6 +71,16 @@ export component ColorPicker inherits VerticalLayout {
         root.emit(hsv(root.hue, root.sat, root.val, root.alpha ? root.alpha-v : 1));
     }
 
+    function set-hue(degrees: float) {
+        root.hue = Fmt.clamp(degrees / 360, 0, 0.99999) * 360;
+        root.compose();
+    }
+
+    function set-opacity(percent: float) {
+        root.alpha-v = Fmt.clamp(percent / 100, 0, 1);
+        root.compose();
+    }
+
     /// A colour picked whole - a swatch, a typed hex, a channel field -
     /// re-reads the dials from it.
     function adopt(next: color) {
@@ -99,6 +111,9 @@ export component ColorPicker inherits VerticalLayout {
         border-radius: Theme.r-sm;
         clip: true;
         background: @linear-gradient(90deg, #ffffff 0%, root.pure-hue 100%);
+        accessible-role: groupbox;
+        accessible-label: I18n.t("colorPicker.square");
+        accessible-description: I18n.t("colorPicker.squareHint");
 
         Rectangle {
             background: @linear-gradient(180deg, #00000000 0%, #000000 100%);
@@ -127,7 +142,7 @@ export component ColorPicker inherits VerticalLayout {
             }
         }
 
-        TouchArea {
+        square-touch := TouchArea {
             mouse-cursor: crosshair;
             pointer-event(event) => {
                 if (event.kind == PointerEventKind.down
@@ -138,6 +153,7 @@ export component ColorPicker inherits VerticalLayout {
                 }
             }
         }
+        Tip { text: I18n.t("colorPicker.squareHint"); active: square-touch.has-hover; }
     }
 
     // ── the hue strip ──
@@ -147,6 +163,18 @@ export component ColorPicker inherits VerticalLayout {
         background: @linear-gradient(90deg,
             #ff0000 0%, #ffff00 16.667%, #00ff00 33.333%, #00ffff 50%,
             #0000ff 66.667%, #ff00ff 83.333%, #ff0000 100%);
+        accessible-role: slider;
+        accessible-label: I18n.t("colorPicker.hue");
+        accessible-description: I18n.t("colorPicker.hueHint");
+        accessible-value: "\{Math.round(root.hue)}";
+        accessible-value-minimum: 0;
+        accessible-value-maximum: 360;
+        accessible-value-step: 1;
+        accessible-action-increment => { root.set-hue(root.hue + 1); }
+        accessible-action-decrement => { root.set-hue(root.hue - 1); }
+        accessible-action-set-value(text) => {
+            if (text.is-float()) { root.set-hue(text.to-float()); }
+        }
 
         Rectangle {
             x: root.hue / 360 * hue-strip.width - self.width / 2;
@@ -159,16 +187,16 @@ export component ColorPicker inherits VerticalLayout {
             background: root.pure-hue;
         }
 
-        TouchArea {
+        hue-touch := TouchArea {
             mouse-cursor: pointer;
             pointer-event(event) => {
                 if (event.kind == PointerEventKind.down
                     || (event.kind == PointerEventKind.move && self.pressed)) {
-                    root.hue = Fmt.clamp(self.mouse-x / self.width, 0, 0.99999) * 360;
-                    root.compose();
+                    root.set-hue(self.mouse-x / self.width * 360);
                 }
             }
         }
+        Tip { text: I18n.t("colorPicker.hueHint"); active: hue-touch.has-hover; }
     }
 
     // ── the alpha strip ──
@@ -176,6 +204,18 @@ export component ColorPicker inherits VerticalLayout {
         height: 12px;
         border-radius: 6px;
         clip: true;
+        accessible-role: slider;
+        accessible-label: I18n.t("common.opacity");
+        accessible-description: I18n.t("colorPicker.opacityHint");
+        accessible-value: "\{Math.round(root.alpha-v * 100)}";
+        accessible-value-minimum: 0;
+        accessible-value-maximum: 100;
+        accessible-value-step: 1;
+        accessible-action-increment => { root.set-opacity(root.alpha-v * 100 + 1); }
+        accessible-action-decrement => { root.set-opacity(root.alpha-v * 100 - 1); }
+        accessible-action-set-value(text) => {
+            if (text.is-float()) { root.set-opacity(text.to-float()); }
+        }
 
         // A checker under the ramp, so "clear" reads as clear rather than
         // as the panel.
@@ -202,16 +242,16 @@ export component ColorPicker inherits VerticalLayout {
             background: root.opaque;
         }
 
-        TouchArea {
+        alpha-touch := TouchArea {
             mouse-cursor: pointer;
             pointer-event(event) => {
                 if (event.kind == PointerEventKind.down
                     || (event.kind == PointerEventKind.move && self.pressed)) {
-                    root.alpha-v = Fmt.clamp(self.mouse-x / self.width, 0, 1);
-                    root.compose();
+                    root.set-opacity(self.mouse-x / self.width * 100);
                 }
             }
         }
+        Tip { text: I18n.t("colorPicker.opacityHint"); active: alpha-touch.has-hover; }
     }
 
     // ── the readout: a swatch of the colour and its hex, typed or read ──
@@ -225,6 +265,9 @@ export component ColorPicker inherits VerticalLayout {
             clip: true;
             border-width: 1px;
             border-color: Theme.line;
+            accessible-role: image;
+            accessible-label: I18n.t("colorPicker.preview");
+            accessible-description: I18n.t("colorPicker.previewHint");
 
             for cell in 20: Rectangle {
                 x: Math.floor(cell / 4) * 8px;
@@ -234,9 +277,11 @@ export component ColorPicker inherits VerticalLayout {
                 background: Math.mod(cell + Math.floor(cell / 4), 2) == 0 ? #c8c8c8 : #7a7a7a;
             }
             Rectangle { background: root.value; }
+            preview-hover := TouchArea { }
+            Tip { text: I18n.t("colorPicker.previewHint"); active: preview-hover.has-hover; }
         }
 
-        Rectangle {
+        hex-box := Rectangle {
             height: Theme.h;
             horizontal-stretch: 1;
             border-radius: Theme.r;
@@ -244,25 +289,33 @@ export component ColorPicker inherits VerticalLayout {
             border-width: 1px;
             border-color: hex.has-focus ? Theme.accent : Colors.transparent;
 
-            hex := TextInput {
-                x: 10px;
-                width: parent.width - 20px;
-                height: parent.height;
-                color: Theme.fg;
-                font-family: Theme.font-technical;
-                font-size: Theme.fs;
-                vertical-alignment: center;
-                single-line: true;
-                selection-background-color: Theme.accent;
-                selection-foreground-color: Theme.on-accent;
+            property <string> hex-hint: root.alpha
+                ? I18n.t("colorPicker.hexAlphaHint") : I18n.t("colorPicker.hexHint");
 
-                accepted => { root.adopt(Fmt.color-of(self.text, root.value)); }
-                changed has-focus => {
-                    if (!self.has-focus) {
-                        root.adopt(Fmt.color-of(self.text, root.value));
+            hex-hover := TouchArea {
+                hex := TextInput {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: parent.height;
+                    color: Theme.fg;
+                    font-family: Theme.font-technical;
+                    font-size: Theme.fs;
+                    vertical-alignment: center;
+                    single-line: true;
+                    accessible-label: I18n.t("colorPicker.hex");
+                    accessible-description: hex-box.hex-hint;
+                    selection-background-color: Theme.accent;
+                    selection-foreground-color: Theme.on-accent;
+
+                    accepted => { root.adopt(Fmt.color-of(self.text, root.value)); }
+                    changed has-focus => {
+                        if (!self.has-focus) {
+                            root.adopt(Fmt.color-of(self.text, root.value));
+                        }
                     }
                 }
             }
+            Tip { text: hex-box.hex-hint; active: hex-hover.has-hover; }
         }
     }
 
@@ -272,6 +325,8 @@ export component ColorPicker inherits VerticalLayout {
 
         red := NumberField {
             prefix: "R";
+            accessible-name: I18n.t("colorPicker.red");
+            tip: I18n.t1("colorPicker.channelHint", self.accessible-name);
             minimum: 0;
             maximum: 255;
             step: 1;
@@ -279,6 +334,8 @@ export component ColorPicker inherits VerticalLayout {
         }
         green := NumberField {
             prefix: "G";
+            accessible-name: I18n.t("colorPicker.green");
+            tip: I18n.t1("colorPicker.channelHint", self.accessible-name);
             minimum: 0;
             maximum: 255;
             step: 1;
@@ -286,6 +343,8 @@ export component ColorPicker inherits VerticalLayout {
         }
         blue := NumberField {
             prefix: "B";
+            accessible-name: I18n.t("colorPicker.blue");
+            tip: I18n.t1("colorPicker.channelHint", self.accessible-name);
             minimum: 0;
             maximum: 255;
             step: 1;
@@ -296,13 +355,12 @@ export component ColorPicker inherits VerticalLayout {
             width: root.alpha ? 58px : 0px;
             prefix: "A";
             suffix: "%";
+            accessible-name: I18n.t("common.opacity");
+            tip: I18n.t("colorPicker.opacityValueHint");
             minimum: 0;
             maximum: 100;
             step: 1;
-            changed(v) => {
-                root.alpha-v = v / 100;
-                root.compose();
-            }
+            changed(v) => { root.set-opacity(v); }
         }
     }
 
@@ -323,6 +381,14 @@ export component ColorPicker inherits VerticalLayout {
             background: entry;
             border-width: 1px;
             border-color: pick.has-hover ? Theme.fg : Theme.line;
+            property <string> code: Fmt.hex-of(entry, false);
+            accessible-role: button;
+            accessible-label: I18n.t1("colorPicker.swatch", self.code);
+            property <string> help: I18n.t1("colorPicker.swatchHint", self.code);
+            accessible-description: self.help;
+            accessible-action-default => {
+                root.adopt(root.alpha ? entry.with-alpha(root.alpha-v) : entry);
+            }
 
             pick := TouchArea {
                 mouse-cursor: pointer;
@@ -330,6 +396,7 @@ export component ColorPicker inherits VerticalLayout {
                     root.adopt(root.alpha ? entry.with-alpha(root.alpha-v) : entry);
                 }
             }
+            Tip { text: parent.help; active: pick.has-hover; }
         }
     }
 }

@@ -88,8 +88,18 @@ impl Studio {
                     .map(|session| std::path::PathBuf::from(session.path()));
                 crate::panes::settings::restart(project);
             }
+            #[cfg(target_os = "android")]
+            Some(Confirm::LastRunClosed) => {
+                if let Err(error) = crate::platform::share_log() {
+                    self.notify(&tf("settings.couldNotShareLog", &[&error]), true);
+                }
+            }
             Some(Confirm::QuitWithoutSaving { .. }) => {
-                log::warn!("close: quitting without saving, as asked");
+                crate::closing("by Quit without saving");
+                log::warn!(
+                    "close: {} could not be saved, and the person chose to leave without it; its unsaved edits are lost",
+                    self.project_name
+                );
                 self.release_project();
                 slint::quit_event_loop().ok();
             }
@@ -145,6 +155,16 @@ impl Studio {
                 cancel: t("settings.restartLater").into(),
                 calm: true,
                 glyph: crate::ui::Glyph::Reset,
+            },
+            #[cfg(target_os = "android")]
+            Confirm::LastRunClosed => crate::ui::ConfirmData {
+                open: true,
+                title: t("start.lastRunClosedTitle").into(),
+                message: t("start.lastRunClosed").into(),
+                action: t("settings.shareTheLog").into(),
+                cancel: t("relink.notNow").into(),
+                calm: true,
+                glyph: crate::ui::Glyph::Export,
             },
         }
     }
@@ -306,6 +326,10 @@ impl Studio {
             consider(clip.start as f32);
             consider((clip.start + clip.duration) as f32);
         }
+        // The song's beats, so a cut lands on the beat.
+        for beat in self.timeline_beats() {
+            consider(beat as f32);
+        }
         best
     }
 
@@ -369,21 +393,47 @@ impl Studio {
         &mut self,
         command: Command,
     ) -> Result<concat_host::session::EditorView, String> {
+        self.try_apply_with(command, Session::apply)
+    }
+
+    /// Runs the common GUI edit path with a check before the edit lands.
+    pub(crate) fn try_apply_checked(
+        &mut self,
+        command: Command,
+        check: impl FnOnce(&Project, &Project) -> Result<(), String>,
+    ) -> Result<concat_host::session::EditorView, String> {
+        self.try_apply_with(command, |session, command| {
+            session.apply_checked(command, check)
+        })
+    }
+
+    fn try_apply_with(
+        &mut self,
+        command: Command,
+        apply: impl FnOnce(&mut Session, Command) -> Result<concat_host::session::EditorView, String>,
+    ) -> Result<concat_host::session::EditorView, String> {
         self.end_burst();
-        log::info!("edit: {}", command_name(&command));
+        let words = command_words(&command);
+        Asked::log(format_args!("edit: {words}"));
         self.flush_commit();
         self.echo = None;
         self.last_commit = None;
         let session = self.session.as_mut().ok_or("no project is open")?;
         let chosen = matches!(command, Command::SetTimelineVideo { .. });
         let before = session.video().color_space;
-        let view = session.apply(command)?;
+        let view = apply(session, command).inspect_err(|error| {
+            log::warn!("edit: {words} was asked for and refused: {error}; nothing changed");
+        })?;
         let after = session.video().color_space;
         self.after_change();
         if !chosen {
             self.tell_of_hdr(before, after);
         }
         Ok(view)
+    }
+
+    pub(crate) fn edit_revision(&self) -> u64 {
+        self.revision
     }
 
     /// Whether switching the live window would replace unsaved work.
@@ -400,7 +450,12 @@ impl Studio {
         self.autosave.stop();
         let session = self.session.as_mut().ok_or("no project is open")?;
         let (path, document) = session.prepare_save(name);
-        self.project_name = session.settings().name;
+        let saved_name = session.settings().name;
+        if self.project_name != saved_name {
+            self.project_name = saved_name;
+            self.dirty = true;
+            self.revision += 1;
+        }
         Ok(crate::live::SaveSnapshot {
             path,
             document,
@@ -428,7 +483,8 @@ impl Studio {
     pub(super) fn apply_within(&mut self, gesture: &str, command: Command) -> Option<String> {
         // A knob's gesture, folded into one step; said at Debug, since a
         // dial turned is many of these.
-        log::debug!("edit: {} ({gesture})", command_name(&command));
+        let words = command_words(&command);
+        log::debug!("edit: {words} (part of one gesture)");
         self.echo = None;
         let session = self.session.as_mut()?;
         let before = session.video().color_space;
@@ -440,6 +496,7 @@ impl Studio {
                 view.created_id
             }
             Err(error) => {
+                log::warn!("edit: {words} was asked for and refused: {error}; nothing changed");
                 self.notify(&error, true);
                 None
             }
@@ -489,6 +546,20 @@ impl Studio {
         self.ensure_regions();
     }
 
+    /// Returns to the checkpoint of a chat turn as one editor operation.
+    pub(crate) fn restore_chat_edit(&mut self, project: Project, name: String) {
+        self.pause();
+        self.close_source();
+        self.echo = None;
+        self.words = None;
+        self.last_commit = None;
+        if let Some(session) = &mut self.session {
+            session.restore_project(project, name.clone());
+            self.project_name = name;
+            self.after_change();
+        }
+    }
+
     pub fn undo(&mut self) {
         self.flush_commit();
         self.echo = None;
@@ -497,7 +568,10 @@ impl Studio {
             && session.can_undo()
         {
             session.undo();
+            Asked::log(format_args!("edit: Undo"));
             self.after_change();
+        } else {
+            log::debug!("edit: Undo was asked for with nothing to undo");
         }
     }
 
@@ -509,7 +583,10 @@ impl Studio {
             && session.can_redo()
         {
             session.redo();
+            Asked::log(format_args!("edit: Redo"));
             self.after_change();
+        } else {
+            log::debug!("edit: Redo was asked for with nothing to redo");
         }
     }
 
@@ -540,8 +617,14 @@ impl Studio {
         );
     }
 
-    /// Writes the document, on a worker. `announce` says so on success;
-    /// a failure is always said.
+    /// Writes the document, on the save lane. `announce` says so on
+    /// success; a failure is always said.
+    ///
+    /// The snapshot is taken here, on the window's thread, with the edit
+    /// that asked for it already applied; the lane only writes it. It has
+    /// a thread of its own, so a save never waits behind an export or an
+    /// analysis, and a save still waiting when the next is asked for is
+    /// replaced by it - see `host::spawn_save`.
     pub fn save(&mut self, announce: bool) {
         let Some(session) = self.session.as_mut() else {
             return;
@@ -552,12 +635,37 @@ impl Studio {
         // worker happens to pick it up.
         let ticket = projects::ticket();
         self.dirty = false;
-        crate::host::spawn_in_project_publishing(
+        let name = self.project_name.clone();
+        let began = std::time::Instant::now();
+        crate::host::spawn_save(
+            path.clone(),
+            announce,
             move || projects::save_ordered(&path, &document, ticket),
-            move |studio, _, _, result| match result {
-                Ok(_) if announce => studio.notify(&t("studio.projectSaved"), false),
-                Ok(_) => {}
+            move |studio, _, _, result, announce| match result {
+                Ok(_) if announce => {
+                    log::info!(
+                        "project: saved {name} in {}",
+                        concat_log::span(began.elapsed())
+                    );
+                    studio.notify(&t("studio.projectSaved"), false);
+                }
+                Ok(_) => log::debug!(
+                    "project: autosaved {name} in {}",
+                    concat_log::span(began.elapsed())
+                ),
+                // The project stays marked as changed, so the next edit's
+                // autosave and the next Save both try again.
+                Err(error) if announce => {
+                    log::error!(
+                        "project: saving {name} failed: {error}; it stays marked unsaved and the next edit or Save tries again"
+                    );
+                    studio.dirty = true;
+                    studio.notify(&tf("studio.couldNotSave", &[&error]), true);
+                }
                 Err(error) => {
+                    log::warn!(
+                        "project: autosaving {name} failed: {error}; it stays marked unsaved and the next edit or Save tries again"
+                    );
                     studio.dirty = true;
                     studio.notify(&tf("studio.couldNotSave", &[&error]), true);
                 }

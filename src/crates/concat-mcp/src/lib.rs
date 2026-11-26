@@ -25,6 +25,9 @@ pub mod tools;
 
 pub use backend::{Backend, Headless, Mode, Window};
 
+/// Optional environment variable identifying the owner of a window MCP connection.
+pub const WINDOW_CLIENT_ID_ENV: &str = "CONCAT_MCP_CLIENT_ID";
+
 /// Serves MCP on standard input and output until the client closes its
 /// end, through the backend `mode` picks. Logs to standard error, which
 /// MCP clients show as the server's log; standard output carries nothing

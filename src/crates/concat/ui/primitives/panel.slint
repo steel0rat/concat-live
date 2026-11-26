@@ -231,8 +231,9 @@ export component IconButton inherits Rectangle {
     in property <string> text;
     in property <int> text-weight: 400;
     in property <bool> text-italic: false;
-    /// accessible name; also what a tooltip would show
+    /// Accessible name and fallback hover text.
     in property <string> label;
+    in property <string> tip: root.label;
     in property <bool> checked;
     in property <bool> enabled: true;
     /// Destructive action: the button states in red instead of the neutral
@@ -364,7 +365,7 @@ export component IconButton inherits Rectangle {
         // button still explains itself — which is the moment the explanation
         // is worth most.
         Tip {
-            text: root.label;
+            text: root.tip;
             active: touch.has-hover;
         }
 

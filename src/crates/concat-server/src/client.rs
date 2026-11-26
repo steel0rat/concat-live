@@ -33,6 +33,16 @@ impl Client {
     /// connect and the handshake, not the calls after it, which take as
     /// long as their method does.
     pub fn connect(address: SocketAddr, token: &str, patience: Duration) -> Result<Client, String> {
+        Self::connect_with_id(address, token, patience, None)
+    }
+
+    /// Connects with an optional identifier for attributing the caller's requests.
+    pub fn connect_with_id(
+        address: SocketAddr,
+        token: &str,
+        patience: Duration,
+        client_id: Option<&str>,
+    ) -> Result<Client, String> {
         let could_not = |error: &dyn std::fmt::Display| {
             format!("could not reach the Concat server at {address}: {error}")
         };
@@ -49,8 +59,12 @@ impl Client {
             next_id: 1,
             address,
         };
+        let mut params = json!({ "token": token });
+        if let Some(client_id) = client_id.filter(|id| crate::json::valid_client_id(id)) {
+            params["clientId"] = json!(client_id);
+        }
         client
-            .exchange("auth", json!({ "token": token }))
+            .exchange("auth", params)
             .map_err(|error| could_not(&error))?;
         client
             .reader

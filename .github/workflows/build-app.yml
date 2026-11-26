@@ -31,10 +31,9 @@ name: Build app
 #   set on the repository, and ad-hoc signed when they are not, so a build
 #   from a fork still opens (with Gatekeeper's warning).
 #
-# - Every bundle is launched before it is uploaded: `concat --version` and
-#   `concat --smoke` from the staged folder, on a machine with nothing else
-#   on the path (scripts/ci/smoke-*). On x86_64 the bundle is also started
-#   under Intel's emulator posing as an Ivy Bridge, and its binaries are
+# - Every bundle is launched and used to export a short project before
+#   upload (scripts/ci/smoke-*). The x86_64 Linux and Windows bundles also
+#   run under Intel's emulator posing as an Ivy Bridge. Their binaries are
 #   scanned for instructions newer than AVX (scripts/ci/isa-scan.sh): the
 #   x86_64 baseline is AVX, and twice now a release died at launch on
 #   older CPUs (#193, #313). A target whose bundle does not start fails,
@@ -42,15 +41,16 @@ name: Build app
 # - Every prebuilt dependency downloaded here is pinned to one file and its
 #   digest in scripts/ci/deps.lock, and every action to a commit.
 #
-# A caller may restrict the matrix to the two macOS packages. Other callers
-# retain the desktop targets, with fail-fast disabled.
+# A reusable caller can build only the two macOS packages or use the
+# full desktop matrix. Manual runs build the selected macOS architecture
+# and keep the smoke-tested bundle as an artifact of the run.
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Existing tag or commit to build
+        description: Tag, commit or branch to build (the selected ref when empty)
         type: string
-        required: true
+        default: ""
       macos_arch:
         description: macOS package to build without rebuilding the other architecture
         type: choice
@@ -161,8 +161,7 @@ jobs:
       #   GGML_BACKEND_DL. Nothing else in the bundle may hold AVX2: the
       #   instruction-set scan allows it in the Haswell-and-newer modules
       #   alone (scripts/ci/isa-allow.txt).
-      # - none (macOS x86_64): all four off, as before. It declares macOS 12,
-      #   which the 2013 Mac Pro runs, and that is an Ivy Bridge.
+      # - none (macOS x86_64): all four off, retaining the AVX baseline.
       #
       # Everything else is ARM, which reads none of these. The `haswell`
       # answer - built for Haswell outright - is kept for a target that
@@ -174,8 +173,8 @@ jobs:
       GGML_F16C: ${{ matrix.ggml == 'haswell' && 'ON' || 'OFF' }}
       GGML_BMI2: ${{ matrix.ggml == 'haswell' && 'ON' || 'OFF' }}
     steps:
-      # The ref release.yml names, which is its tag: without one a run
-      # started by hand builds main and publishes it under the tag's name.
+      # Release calls pass the validated tag. Manual runs use the selected
+      # ref unless an explicit ref is supplied.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
@@ -250,12 +249,11 @@ jobs:
         run: |
           set -euo pipefail
           stem="onnxruntime-linux-${{ matrix.ort }}-$ORT_VERSION"
-          scripts/ci/fetch.sh "onnxruntime-nuget-$ORT_VERSION" onnxruntime.zip
-          mkdir -p "$stem/lib"
-          unzip -jnq onnxruntime.zip 'runtimes/${{ matrix.arch == 'aarch64' && 'linux-arm64' || 'linux-x64' }}/native/libonnxruntime*.so' -d "$stem/lib"
-          test -f "$stem/lib/libonnxruntime.so"
-          # The NuGet filename is unversioned; the ELF SONAME is .so.1.
-          ln -s libonnxruntime.so "$stem/lib/libonnxruntime.so.1"
+          scripts/ci/onnxruntime.sh "linux-${{ matrix.ort }}"
+          test -f "$stem/lib/libonnxruntime.so.$ORT_VERSION"
+          # The layout carries the soname and the full version; the linker
+          # asks for the bare name.
+          ln -sf "libonnxruntime.so.$ORT_VERSION" "$stem/lib/libonnxruntime.so"
           {
             echo "ORT_LIB_LOCATION=$PWD/$stem/lib"
             echo "ORT_PREFER_DYNAMIC_LINK=1"
@@ -312,9 +310,8 @@ jobs:
 
       # ONNX Runtime on an Intel Mac. ort ships no build for
       # x86_64-apple-darwin, so the cutout's runtime is Microsoft's shared
-      # one - and that is built for macOS 13.4, while the app runs on 12.
-      # Linked at load time it closed the app at launch on 12 (#333), so
-      # it is not linked at all: ort is built with `load-dynamic` there,
+      # one. Keep the Intel runtime optional at launch, using ort's
+      # `load-dynamic` feature:
       # the bundle step copies the library into Frameworks, and the app
       # opens it at the first cutout or Chatterbox read, on a macOS new
       # enough for it. Apple silicon keeps ort's static build.
@@ -322,11 +319,10 @@ jobs:
         if: matrix.platform == 'macos' && matrix.arch == 'x86_64'
         run: |
           set -euo pipefail
-          scripts/ci/fetch.sh "onnxruntime-nuget-$ORT_INTEL_MAC_VERSION" onnxruntime.zip
-          mkdir -p onnxruntime
-          unzip -jnq onnxruntime.zip 'runtimes/osx-x64/native/libonnxruntime.dylib' -d onnxruntime
-          test -f onnxruntime/libonnxruntime.dylib
-          echo "ORT_MAC_DYLIB=$PWD/onnxruntime/libonnxruntime.dylib" >> "$GITHUB_ENV"
+          stem="onnxruntime-osx-x86_64-$ORT_INTEL_MAC_VERSION"
+          scripts/ci/onnxruntime.sh osx-x86_64
+          test -f "$stem/lib/libonnxruntime.$ORT_INTEL_MAC_VERSION.dylib"
+          echo "ORT_MAC_DYLIB=$PWD/$stem/lib/libonnxruntime.$ORT_INTEL_MAC_VERSION.dylib" >> "$GITHUB_ENV"
 
       # Both hosted macOS builds use thin LTO and sixteen codegen units.
       # ARM also exhausted sixty minutes after its dependencies compiled;
@@ -429,10 +425,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh "onnxruntime-nuget-$env:ORT_VERSION" onnxruntime.zip
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/onnxruntime.sh "${{ matrix.ort }}"
           if ($LASTEXITCODE -ne 0) { throw "the ONNX Runtime download failed" }
-          Expand-Archive onnxruntime.zip -DestinationPath onnxruntime
-          $lib = "$PWD\onnxruntime\runtimes\${{ matrix.ort }}\native"
+          $lib = "$PWD\onnxruntime-${{ matrix.ort }}-$env:ORT_VERSION\lib"
           if (-not (Test-Path "$lib\onnxruntime.lib")) { throw "$lib\onnxruntime.lib is not there" }
           if (-not (Test-Path "$lib\onnxruntime.dll")) { throw "$lib\onnxruntime.dll is not there" }
           "ORT_LIB_LOCATION=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -445,7 +440,7 @@ jobs:
       # CC, CXX, CMAKE_*, and GGML_* and ORT_* added to the default set),
       # so a change to any of them is a new key rather than a stale
       # target/ served under the old one.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src
           key: ${{ matrix.target }}
@@ -613,19 +608,34 @@ jobs:
             codesign --force --deep -s - "$app"
           fi
 
-          hdiutil create -volname "Concat Live" -srcfolder "$app" -format UDZO "$dmg"
+          # Spotlight or XProtect can hold the bundle open on hosted runners.
+          # Each attempt uses a fresh image path in case a failed one left a file.
+          for attempt in 1 2 3 4 5; do
+            attempt_dir=$(mktemp -d "$RUNNER_TEMP/concat-dmg.XXXXXX")
+            dmg_path="$attempt_dir/$dmg"
+            if hdiutil create -volname "Concat Live" -srcfolder "$app" -format UDZO "$dmg_path"; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::hdiutil could not make $dmg after $attempt tries"
+              exit 1
+            fi
+            echo "hdiutil failed (try $attempt); again in $((attempt * 5)) s"
+            sleep $((attempt * 5))
+          done
 
           if [ -n "${APPLE_ID}" ] && [ -n "${TEAM_ID}" ] && [ -n "${APP_PASSWORD}" ] && [ -n "${IDENTITY}" ]; then
-            codesign --force --timestamp -s "$IDENTITY" "$dmg"
-            xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$TEAM_ID" \
+            codesign --force --timestamp -s "$IDENTITY" "$dmg_path"
+            xcrun notarytool submit "$dmg_path" --apple-id "$APPLE_ID" --team-id "$TEAM_ID" \
               --password "$APP_PASSWORD" --wait
-            xcrun stapler staple "$dmg"
+            xcrun stapler staple "$dmg_path"
           fi
-          mkdir -p stage && mv "$dmg" stage/
+          mkdir -p stage
+          test ! -e "stage/$dmg"
+          mv "$dmg_path" stage/
 
-      # The bundle that went into the .dmg, launched: its signature holds,
-      # nothing in it loads from Homebrew, and `--version` and `--smoke`
-      # exit 0. See scripts/ci/smoke-macos.sh.
+      # Check the packaged bundle's signature and library paths, launch it
+      # and export a short project. See scripts/ci/smoke-macos.sh.
       - name: Smoke test (macOS)
         if: matrix.platform == 'macos'
         timeout-minutes: 10
@@ -654,6 +664,9 @@ jobs:
           # profile. In lib/ the rpath finds the libraries and
           # concat-speech's `cpu_backend` the modules.
           if [ "${{ matrix.ggml }}" = variants ]; then
+            # Newest first by time, which find does not sort by; the names
+            # are cargo's hashed folders, plain letters and digits.
+            # shellcheck disable=SC2012
             out=$(ls -dt "src/target/${{ matrix.target }}/app/build"/whisper-rs-sys-*/out/bin | head -1)
             out=${out%/bin}
             echo "whisper's build: $out"

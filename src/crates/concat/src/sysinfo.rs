@@ -3,7 +3,12 @@
 
 //! What Settings > About reports about this machine and this build.
 
+use std::rc::Rc;
+
+use slint::{ModelRc, VecModel};
+
 use crate::i18n::{t, tf};
+use crate::ui::{App, SystemFactData};
 
 pub fn os_description() -> String {
     #[cfg(target_os = "macos")]
@@ -74,8 +79,7 @@ pub fn os_description() -> String {
 ///
 /// One list, read twice: the rows on screen and the block that is copied are
 /// built from the same pairs, so a fact cannot be on the page and missing
-/// from the report. Gathered once — every line of it is fixed for the life of
-/// the process — and handed over as a model that is never replaced.
+/// from the report.
 pub fn system_facts() -> Vec<(String, String)> {
     let mut facts = vec![
         (
@@ -96,7 +100,9 @@ pub fn system_facts() -> Vec<(String, String)> {
         // https://github.com/jub0t/Concat/issues/135
         (
             t("sysinfo.graphics"),
-            crate::gpu::adapter_description().unwrap_or("none").into(),
+            crate::gpu::adapter_description()
+                .map(str::to_owned)
+                .unwrap_or_else(|| t("common.none")),
         ),
         (
             t("sysinfo.engine"),
@@ -105,10 +111,12 @@ pub fn system_facts() -> Vec<(String, String)> {
         (t("sysinfo.operatingSystem"), os_description()),
         (
             t("sysinfo.processor"),
-            format!(
-                "{} · {} threads",
-                std::env::consts::ARCH,
-                std::thread::available_parallelism().map_or(0, |count| count.get())
+            tf(
+                "sysinfo.processorThreads",
+                &[
+                    &std::env::consts::ARCH,
+                    &std::thread::available_parallelism().map_or(0, |count| count.get()),
+                ],
             ),
         ),
         (t("sysinfo.toolchain"), env!("BUILD_RUSTC").into()),
@@ -124,4 +132,25 @@ pub fn system_facts() -> Vec<(String, String)> {
         ));
     }
     facts
+}
+
+pub fn publish(app: &App) {
+    let facts = system_facts();
+    app.set_system_report(
+        facts
+            .iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into(),
+    );
+    app.set_system_facts(ModelRc::from(Rc::new(VecModel::from(
+        facts
+            .into_iter()
+            .map(|(label, value)| SystemFactData {
+                label: label.into(),
+                value: value.into(),
+            })
+            .collect::<Vec<_>>(),
+    ))));
 }

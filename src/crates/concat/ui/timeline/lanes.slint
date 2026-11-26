@@ -5,7 +5,7 @@ import { Wave } from "../primitives/wave.slint";
 import { Theme } from "../theme/theme.slint";
 import { Fmt, Payload } from "../util.slint";
 import { Glyph, Icon } from "../icons.slint";
-import { ClipData, ClipKind, DropData, TimelineTool, TrackData } from "model.slint";
+import { ClipData, ClipKind, DropData, PauseCutData, TimelineNoteData, TimelineTool, TrackData } from "model.slint";
 import { ContextMenu, MenuItemData } from "../primitives/context-menu.slint";
 
 // The lanes: the ruler, the banded track stack, the clips on it, the playhead
@@ -440,6 +440,45 @@ component Clip inherits Rectangle {
                 height: 1px;
                 background: Theme.wave-centre;
             }
+        }
+
+        // The song's beats, on a rail along the clip's floor rather than
+        // over its waveform - a video's too, on its sound band's floor, so
+        // after the band: a short quiet tick at each beat, a taller amber
+        // one at the first of a bar. Rust places them in a 1x1
+        // box stretched onto the clip, through its trim and speed, and
+        // thins them with the zoom; see studio/beats.rs.
+        if (root.item.beats != "" || root.item.bars != ""): Rectangle {
+            x: 0;
+            y: parent.height - Theme.beat-rail;
+            width: parent.width;
+            height: Theme.beat-rail;
+            background: Theme.beat-rail-ground;
+        }
+        if root.item.beats != "": Path {
+            x: 0;
+            y: parent.height - Theme.beat-rail * 0.5;
+            width: parent.width;
+            height: Theme.beat-rail * 0.5;
+            commands: root.item.beats;
+            viewbox-width: 1;
+            viewbox-height: 1;
+            // Stretched onto the clip, not kept square.
+            fit: fill;
+            stroke: Theme.beat-mark;
+            stroke-width: 1px;
+        }
+        if root.item.bars != "": Path {
+            x: 0;
+            y: parent.height - Theme.beat-rail;
+            width: parent.width;
+            height: Theme.beat-rail;
+            commands: root.item.bars;
+            viewbox-width: 1;
+            viewbox-height: 1;
+            fit: fill;
+            stroke: Theme.beat-bar;
+            stroke-width: 2px;
         }
 
         // The fade ramps, at the foot of the body: the knobs' while one
@@ -1273,6 +1312,8 @@ component Clip inherits Rectangle {
 export component Lanes inherits Rectangle {
     in property <[TrackData]> tracks;
     in property <[ClipData]> clips;
+    in property <[PauseCutData]> pause-cuts;
+    in property <[TimelineNoteData]> notes;
     in property <TimelineTool> tool: TimelineTool.select;
     in property <float> playhead;
     /// The selected clip's keys as instants; see `Editor.key-marks`.
@@ -1837,6 +1878,17 @@ export component Lanes inherits Rectangle {
             }
         }
 
+        for cut in root.pause-cuts: Rectangle {
+            x: Math.max(0px, root.at(cut.start));
+            y: root.ruler-height;
+            width: Math.max(1px, Math.min(root.width, root.at(cut.end)) - self.x);
+            height: root.lanes-h;
+            visible: root.at(cut.end) > 0px && self.x < root.width;
+            background: cut.included ? Theme.danger.with-alpha(0.17) : Colors.transparent;
+            border-width: 1px;
+            border-color: cut.included ? Theme.danger.with-alpha(0.72) : Theme.fg-dim.with-alpha(0.5);
+        }
+
         // ── the band being drawn ─────────────────────────────────────────
         if band.drawing: Rectangle {
             x: Math.min(band.from-x, band.to-x);
@@ -1986,6 +2038,21 @@ export component Lanes inherits Rectangle {
                 width: parent.width;
                 height: 1px;
                 background: Theme.line;
+            }
+
+            // Notes mark the ruler's foot underneath the normal scrub area.
+            for note in root.notes: Rectangle {
+                property <length> start-x: root.at(note.start);
+                property <length> end-x: Math.max(self.start-x + 6px, root.at(note.end));
+                x: Math.max(0px, self.start-x);
+                y: parent.height - self.height - 1px;
+                width: Math.max(0px, Math.min(parent.width, self.end-x) - self.x);
+                height: note.end > note.start ? 4px : 6px;
+                visible: self.width > 0px;
+                border-radius: 2px;
+                background: note.status == 1 ? Theme.warn
+                    : note.status == 2 ? Theme.green
+                    : Theme.accent.with-alpha(note.selected || note.working ? 1.0 : 0.75);
             }
 
             // The ruler is the scrub strip: pressed and dragged, the playhead

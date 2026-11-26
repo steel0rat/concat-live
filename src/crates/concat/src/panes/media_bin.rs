@@ -11,19 +11,44 @@
 //! controller's art store. An import probes on a worker and comes back
 //! as [`MediaMsg::Imported`], one batch of `AddMedia` commands.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use concat_host::media::{self, MediaSummary};
 use concat_project::Command;
 use concat_project::model::{self, MediaItem, MediaOrigin, Project};
+use slint::VecModel;
 
-use crate::format::wave_path;
+use crate::format::{WAVE_FLOOR, wave_path};
 use crate::host::{probe_error, spawn_in_project};
 use crate::i18n::{t, tf};
 use crate::panes::Msg;
 use crate::studio::Studio;
-use crate::ui::{MediaFilter, MediaItemData, MediaKind};
+use crate::ui::{IncomingFileData, MediaFilter, MediaItemData, MediaKind, MediaUseData};
+
+pub(crate) const MEDIA_EXTENSIONS: &[&str] = &[
+    "mp4", "mov", "mkv", "webm", "avi", "m4v", "mp3", "wav", "aac", "m4a", "flac", "ogg", "png",
+    "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "svg",
+];
+
+#[derive(Default)]
+pub(crate) struct MediaWorkflowState {
+    pub inbox_open: bool,
+    pub files: Vec<PathBuf>,
+    pub selected: HashSet<PathBuf>,
+    pub pending: HashSet<PathBuf>,
+    pub scan_busy: bool,
+    pub scan_done: bool,
+    pub scan_error: bool,
+    pub scan_generation: u64,
+    pub preview_generation: u64,
+    pub inbox_rows: Rc<VecModel<IncomingFileData>>,
+    pub uses_id: Option<String>,
+    pub uses_revision: Cell<Option<u64>>,
+    pub uses_rows: Rc<VecModel<MediaUseData>>,
+}
 
 /// Everything that can happen to the bin.
 #[derive(Clone, Debug)]
@@ -50,7 +75,7 @@ pub enum MediaMsg {
     /// Files picked, dropped or handed over by the platform.
     Import(Vec<PathBuf>),
     /// The import's worker is done probing.
-    Imported(Vec<Result<MediaSummary, String>>),
+    Imported(Vec<(PathBuf, Result<MediaSummary, String>)>),
     /// Everything selected goes on the timeline at the playhead.
     AddSelectedAtPlayhead,
     /// The phone's Add: what was picked, in the order it was picked, onto
@@ -71,6 +96,7 @@ pub struct MediaBin {
     rows: HashMap<String, i32>,
     next_row: i32,
     pub selected: HashSet<String>,
+    pub(crate) workflow: MediaWorkflowState,
     /// The selection in the order it was made, oldest first: the order a
     /// phone's picks are numbered and laid down in, as every phone
     /// editor's picker numbers them. May name what has since been let go
@@ -94,6 +120,7 @@ impl Default for MediaBin {
             rows: HashMap::new(),
             next_row: 1,
             selected: HashSet::new(),
+            workflow: MediaWorkflowState::default(),
             picked: Vec::new(),
             filter: MediaFilter::All,
             sort: 0,
@@ -170,8 +197,11 @@ impl MediaBin {
                 spawn_in_project(
                     move || {
                         paths
-                            .iter()
-                            .map(|path| media::probe(&path.to_string_lossy()))
+                            .into_iter()
+                            .map(|path| {
+                                let result = media::probe(&path.to_string_lossy());
+                                (path, result)
+                            })
                             .collect::<Vec<_>>()
                     },
                     |studio, _, _, results| studio.handle(Msg::Media(MediaMsg::Imported(results))),
@@ -180,11 +210,15 @@ impl MediaBin {
             MediaMsg::Imported(results) => {
                 let mut commands = Vec::new();
                 let mut failures = Vec::new();
-                for result in results {
+                for (path, result) in results {
+                    self.workflow.pending.remove(&path);
                     match result {
-                        Ok(summary) => commands.push(Command::AddMedia {
-                            item: summary.to_new_media(),
-                        }),
+                        Ok(summary) => {
+                            self.workflow.selected.remove(&path);
+                            commands.push(Command::AddMedia {
+                                item: summary.to_new_media(),
+                            });
+                        }
                         Err(error) => failures.push(error),
                     }
                 }
@@ -498,7 +532,9 @@ impl MediaBin {
                             }
                             _ => {
                                 let path: slint::SharedString =
-                                    wave_path(peaks, 0.0, duration, 64, 0.75).as_str().into();
+                                    wave_path(peaks, 0.0, duration, 64, 0.75, WAVE_FLOOR)
+                                        .as_str()
+                                        .into();
                                 waves.insert(item.id.clone(), (drawn_from, duration, path.clone()));
                                 path
                             }

@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Concat contributors
+
+import { I18n } from "../i18n.slint";
+import { Theme } from "../theme/theme.slint";
+import { Button } from "../primitives/modal.slint";
+import { ResizeBox } from "../primitives/resize-box.slint";
+import { ThinScrollbar } from "../primitives/scrollbar.slint";
+
+component BriefField inherits VerticalLayout {
+    in property <string> label;
+    in-out property <string> value;
+    out property <bool> focused: input.has-focus;
+    callback submitted();
+
+    spacing: 4px;
+    vertical-stretch: 0;
+
+    Text {
+        text: root.label;
+        color: Theme.fg-muted;
+        font-size: Theme.fs;
+        font-weight: Theme.weight-title;
+    }
+
+    Rectangle {
+        min-width: 0px;
+        min-height: frame.min-box;
+        preferred-height: Math.clamp(frame.box-height, frame.min-box, frame.max-box);
+        max-height: frame.max-box;
+        vertical-stretch: 0;
+
+        frame := ResizeBox {
+            width: parent.width;
+            height: parent.height;
+            min-box: 48px;
+            box-height: 64px;
+            max-box: 144px;
+            focused: input.has-focus;
+            content-height: input.preferred-height;
+
+            input := TextInput {
+                y: frame.pad-y;
+                width: Math.max(0px, frame.width - 2 * frame.pad-x);
+                height: Math.max(self.preferred-height, frame.view-height);
+                text <=> root.value;
+                accessible-label: root.label;
+                color: Theme.fg;
+                font-size: Theme.fs-lg;
+                single-line: false;
+                wrap: word-wrap;
+                selection-background-color: Theme.accent;
+                selection-foreground-color: Theme.on-accent;
+                cursor-position-changed(at) => { frame.reveal(at.y, self.font-size * 1.4); }
+                key-pressed(event) => {
+                    if (event.text == Key.Return && (event.modifiers.control || event.modifiers.meta)) {
+                        root.submitted();
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+        }
+    }
+}
+
+export component ProjectBriefEditor inherits VerticalLayout {
+    in-out property <string> goal;
+    in-out property <string> audience;
+    in-out property <string> style;
+    in property <string> error;
+    in property <bool> can-save;
+    callback saved();
+
+    min-width: 0px;
+    min-height: 0px;
+    vertical-stretch: 1;
+    padding: 8px;
+    spacing: 8px;
+
+    function reveal(y: length, h: length) {
+        if (y + viewport.content-y < 0px || h > viewport.height) {
+            viewport.content-y = Math.max(-y, viewport.height - viewport.content-height);
+        } else if (y + h + viewport.content-y > viewport.height) {
+            viewport.content-y = viewport.height - y - h;
+        }
+    }
+
+    function save() {
+        if root.can-save { root.saved(); }
+    }
+
+    viewport := Flickable {
+        min-height: 0px;
+        vertical-stretch: 1;
+        content-width: self.width;
+        content-height: Math.max(self.height, fields.preferred-height);
+
+        fields := VerticalLayout {
+            width: Math.max(0px, viewport.width - 8px);
+            spacing: 8px;
+
+            if root.error != "": Text {
+                text: root.error;
+                color: Theme.danger;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+                accessible-role: text;
+                accessible-label: root.error;
+            }
+
+            BriefField {
+                label: I18n.t("chatUi.briefGoal");
+                value <=> root.goal;
+                changed focused => { if self.focused { root.reveal(self.y, self.height); } }
+                submitted => { root.save(); }
+            }
+            BriefField {
+                label: I18n.t("chatUi.briefAudience");
+                value <=> root.audience;
+                changed focused => { if self.focused { root.reveal(self.y, self.height); } }
+                submitted => { root.save(); }
+            }
+            BriefField {
+                label: I18n.t("chatUi.briefStyle");
+                value <=> root.style;
+                changed focused => { if self.focused { root.reveal(self.y, self.height); } }
+                submitted => { root.save(); }
+            }
+        }
+
+        ThinScrollbar {
+            x: parent.width - self.width;
+            y: -viewport.content-y;
+            height: viewport.height;
+            viewport: viewport.height;
+            content: viewport.content-height;
+            offset: -viewport.content-y;
+            scrolled(to) => { viewport.content-y = -to; }
+        }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+
+        Button {
+            label: I18n.t("chatUi.saveBrief");
+            tip: I18n.t("chatUi.saveBriefTip");
+            primary: true;
+            enabled: root.can-save;
+            border-color: keys.has-focus ? Theme.fg : Theme.accent;
+            accessible-role: button;
+            accessible-label: self.label;
+            accessible-enabled: self.enabled;
+            accessible-action-default => { root.save(); }
+            clicked => { root.save(); }
+
+            keys := FocusScope {
+                enabled: root.can-save;
+                key-pressed(event) => {
+                    if (event.text == Key.Return || event.text == " ") {
+                        root.save();
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+        }
+    }
+}

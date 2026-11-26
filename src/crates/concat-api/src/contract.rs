@@ -74,7 +74,11 @@ fn reply_schema(method: &str, generator: &mut SchemaGenerator) -> Option<Value> 
         | "edit.redo"
         | "media.import"
         | "template.instantiate" => of::<EditorView>(generator),
-        "project.close" | "project.save" | "export.cancel" => of::<Done>(generator),
+        "project.close"
+        | "project.save"
+        | "export.cancel"
+        | "pause.reviewSubmit"
+        | "timeline.notesReport" => of::<Done>(generator),
         "project.list" => of::<Vec<ProjectInfo>>(generator),
         "project.document" => json!({
             "type": "object",

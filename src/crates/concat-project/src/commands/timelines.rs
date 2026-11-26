@@ -49,6 +49,8 @@ pub(super) fn apply(
                 tracks,
                 clips: Vec::new(),
                 linkage,
+                sections: Vec::new(),
+                caption_translations: Default::default(),
                 extra: Default::default(),
             }));
             project.active_timeline_id = id.clone();
@@ -96,6 +98,52 @@ pub(super) fn apply(
                 .iter_mut()
                 .find(|timeline| timeline.id == timeline_id)
                 .is_some_and(|timeline| assign(&mut Arc::make_mut(timeline).linkage, on));
+            Ok(Outcome {
+                created_id: None,
+                applied,
+            })
+        }
+
+        Command::SetTimelineSections {
+            timeline_id,
+            sections,
+        } => {
+            let sections = crate::sections::Section::normalized(sections)
+                .ok_or(CommandError::InvalidTimelineSections)?;
+            let applied = project
+                .timelines
+                .iter_mut()
+                .find(|timeline| timeline.id == timeline_id)
+                .is_some_and(|timeline| assign(&mut Arc::make_mut(timeline).sections, sections));
+            Ok(Outcome {
+                created_id: None,
+                applied,
+            })
+        }
+
+        Command::ImportCaptionTranslation {
+            timeline_id,
+            track_id,
+            language,
+            srt,
+        } => {
+            let Some(timeline) = project
+                .timelines
+                .iter_mut()
+                .find(|timeline| timeline.id == timeline_id)
+            else {
+                return Err(CommandError::InvalidCaptionTranslation(
+                    crate::caption_translations::Error::EmptyTrack,
+                ));
+            };
+            let mut translations = timeline.caption_translations.clone();
+            translations
+                .import_srt(timeline, &track_id, &language, &srt)
+                .map_err(CommandError::InvalidCaptionTranslation)?;
+            let applied = assign(
+                &mut Arc::make_mut(timeline).caption_translations,
+                translations,
+            );
             Ok(Outcome {
                 created_id: None,
                 applied,

@@ -24,7 +24,7 @@ use concat_host::updates::{self, Fixed, Installed, Release, Standing, Version};
 use slint::{ModelRc, SharedString, VecModel};
 
 use crate::close_window;
-use crate::host::{on_ui, spawn};
+use crate::host::{on_ui, spawn_long};
 use crate::i18n::{self, t, tf};
 use crate::keymap;
 use crate::panes::Msg;
@@ -175,7 +175,7 @@ impl ModelState {
             id: self.id.as_str().into(),
             name: self.name.as_str().into(),
             note: self.note.as_str().into(),
-            size: format!("{total:.0} MB").into(),
+            size: tf("settings.modelSize", &[&format!("{total:.0}")]).into(),
             accuracy: self.accuracy,
             installed: self.installed,
             active: self.active && self.installed,
@@ -395,7 +395,9 @@ impl SettingsPane {
                 if studio.live_enabled && cfg!(target_os = "macos") {
                     match updates::skill::current(&studio.host.dirs) {
                         Ok(skill) => self.installed_skill = skill,
-                        Err(error) => self.skill_status = error,
+                        Err(error) => {
+                            self.skill_status = tf("settings.skillLookupFailed", &[&error]);
+                        }
                     }
                     self.auto_timer.start(
                         slint::TimerMode::Repeated,
@@ -431,20 +433,33 @@ impl SettingsPane {
             }
             SettingsMsg::ShortcutCapture(id) => self.capturing = Some(id),
             SettingsMsg::ShortcutReset(id) => {
+                log::info!("settings: Shortcuts {id} reset");
                 self.capturing = None;
-                let lost = keymap::reset(&mut studio.prefs, &id);
+                let lost = keymap::reset_override(&mut studio.prefs, &id);
                 studio.prefs.save(&studio.host.dirs);
                 // The shipped chord came back off whoever was holding
                 // it, and that row now has no key until it is reset.
                 if let Some(lost) = lost {
-                    studio.notify(&tf("shortcuts.unboundNow", &[&keymap::name(lost)]), false);
+                    let name = keymap::name(&lost);
+                    if !name.is_empty() {
+                        studio.notify(&tf("shortcuts.unboundNow", &[&name]), false);
+                    }
                 }
             }
             SettingsMsg::ShortcutResetAll => {
+                log::info!("settings: Shortcuts all reset");
                 self.capturing = None;
                 keymap::reset_all(&mut studio.prefs);
                 studio.prefs.save(&studio.host.dirs);
             }
+            // A phone has no folder to show: the log goes to its share sheet.
+            #[cfg(target_os = "android")]
+            SettingsMsg::ShowLog => {
+                if let Err(error) = platform::share_log() {
+                    studio.notify(&i18n::tf("settings.couldNotShareLog", &[&error]), true);
+                }
+            }
+            #[cfg(not(target_os = "android"))]
             SettingsMsg::ShowLog => {
                 // The file this run is writing, when there is one, so the
                 // manager opens with it selected; the folder when there is
@@ -459,12 +474,15 @@ impl SettingsPane {
             SettingsMsg::LanguageChanged(index) => {
                 let index = index.max(0) as usize;
                 if let Some(language) = studio.languages.get(index).cloned() {
+                    log::info!("settings: Language {}", language.code);
                     self.language = index;
                     studio.prefs.locale = Some(language.code.clone());
                     // The words change on the publish that follows: Rust's
                     // on their way through `t`, the tree's through
                     // `I18n.lang`.
                     i18n::select(&language.code, &studio.host.dirs);
+                    crate::agent::refresh_language();
+                    on_ui(|_, app, _| crate::sysinfo::publish(app));
                 }
                 studio.prefs.save(&studio.host.dirs);
             }
@@ -472,6 +490,10 @@ impl SettingsPane {
                 let Some(level) = LOG_LEVELS.get(index.max(0) as usize) else {
                     return;
                 };
+                log::info!(
+                    "settings: Log level {}",
+                    LOG_LEVEL_NAMES[index.max(0) as usize]
+                );
                 studio.prefs.log_level = Some(concat_host::logs::level_name(*level).to_owned());
                 studio.prefs.save(&studio.host.dirs);
                 // Applied now, whatever the environment said: a person at
@@ -479,6 +501,7 @@ impl SettingsPane {
                 concat_host::logs::set_level(*level);
             }
             SettingsMsg::PlayheadStopsChanged(on) => {
+                log::info!("settings: Playhead stops at the end {}", on_off(on));
                 self.playhead_stops = on;
                 studio.prefs.playhead_stops_at_end = on;
                 studio.prefs.save(&studio.host.dirs);
@@ -488,6 +511,7 @@ impl SettingsPane {
                 studio.seek(at);
             }
             SettingsMsg::ProxiesChanged(on) => {
+                log::info!("settings: Proxies {}", on_off(on));
                 studio.prefs.proxies = on;
                 studio.prefs.save(&studio.host.dirs);
                 // On, the media already in the project gets its proxies
@@ -495,6 +519,7 @@ impl SettingsPane {
                 // off, playback reads the files from the next frame.
             }
             SettingsMsg::RememberLayoutChanged(on) => {
+                log::info!("settings: Remember layout {}", on_off(on));
                 studio.prefs.remember_layout = Some(on);
                 // Off forgets what was kept, so turning it on again starts
                 // from the arrangement on screen then, not a stale one.
@@ -507,6 +532,10 @@ impl SettingsPane {
                 }
             }
             SettingsMsg::GpuChanged(on) => {
+                log::info!(
+                    "settings: Draw on the GPU {} · from the next start",
+                    on_off(on)
+                );
                 studio.prefs.software_gpu = !on;
                 studio.prefs.software_after_crash = None;
                 studio.prefs.save(&studio.host.dirs);
@@ -515,24 +544,30 @@ impl SettingsPane {
                 studio.confirm = Some(crate::studio::Confirm::Restart);
             }
             SettingsMsg::MagneticChanged(on) => {
+                log::info!("settings: Magnetic timeline {}", on_off(on));
                 studio.prefs.set_magnetic(on);
                 studio.prefs.save(&studio.host.dirs);
             }
             SettingsMsg::DownloadSourceChanged(index) => {
                 let index = (index.max(0) as usize).min(SourcePreference::ALL.len() - 1);
                 self.download_source = index;
+                log::info!("settings: Downloads {}", DOWNLOAD_SOURCE_NAMES[index]);
                 studio.prefs.download_source = Some(SourcePreference::ALL[index].name().to_owned());
                 studio.prefs.save(&studio.host.dirs);
                 Self::apply_download_source(studio);
             }
             SettingsMsg::DownloadBaseEdited(text) => {
                 let base = text.trim().to_owned();
+                // Each keystroke lands here, and a mirror's address can
+                // carry a key: neither is the story.
+                log::debug!("settings: Downloads custom URL edited");
                 self.download_base = base.clone();
                 studio.prefs.download_base = (!base.is_empty()).then_some(base);
                 studio.prefs.save(&studio.host.dirs);
                 Self::apply_download_source(studio);
             }
             SettingsMsg::ServerEnabledChanged(on) => {
+                log::info!("settings: Scripts and apps {}", on_off(on));
                 self.change_server(studio, |server| server.enabled = on);
             }
             SettingsMsg::LiveWorkspaceChanged(path) => {
@@ -545,27 +580,35 @@ impl SettingsPane {
                 }
             }
             SettingsMsg::ServerHostEdited(text) => {
+                log::debug!("settings: Address edited");
                 self.change_server(studio, |server| {
                     let (_, port) = split_listen(&server.listen);
                     server.listen = join_listen(&text, port);
                 });
             }
             SettingsMsg::ServerPortEdited(port) => {
+                let port = port.clamp(0, 65535) as u16;
+                log::debug!("settings: Port {port}");
                 self.change_server(studio, |server| {
                     let (host, _) = split_listen(&server.listen);
-                    server.listen = join_listen(&host, port.clamp(0, 65535) as u16);
+                    server.listen = join_listen(&host, port);
                 });
             }
             SettingsMsg::ServerTokenEdited(text) => {
+                // Never the token itself.
+                log::debug!("settings: Token edited");
                 self.change_server(studio, |server| server.token = text.trim().to_owned());
             }
             SettingsMsg::ServerTokenGenerated => {
+                log::info!("settings: Token new");
                 self.change_server(studio, |server| server.token = new_token());
             }
             SettingsMsg::ModelActivated(id) => {
                 if self.is_transcriber(&id) {
+                    log::info!("settings: Models {id}");
                     studio.prefs.transcriber_model = Some(id);
                 } else {
+                    log::info!("settings: Voices {id}");
                     studio.prefs.tts_model = Some(id);
                 }
                 studio.prefs.save(&studio.host.dirs);
@@ -612,8 +655,12 @@ impl SettingsPane {
                 } else {
                     studio.host.speech.delete_model(&studio.host.dirs, &id)
                 };
-                if let Err(error) = result {
-                    studio.notify(&error, true);
+                match result {
+                    Ok(_) => log::info!("models: removed {id}"),
+                    Err(error) => {
+                        log::warn!("models: removing {id} failed: {error}; it stays installed");
+                        studio.notify(&error, true);
+                    }
                 }
                 self.refresh(studio);
             }
@@ -669,17 +716,15 @@ impl SettingsPane {
             SettingsMsg::AppPrepared { version, result } => {
                 match result {
                     Ok(prepared) if !self.install_cancel.load(Ordering::Relaxed) => {
+                        self.update_status = tf("settings.updateQueued", &[&version]);
                         self.pending_app = Some((version, prepared));
-                        self.update_status = format!(
-                            "Concat Live {version} загружен. Ожидаю завершения работы в редакторе."
-                        );
                     }
                     Ok(_) => self.install = None,
                     Err(_) if self.install_cancel.load(Ordering::Relaxed) => self.install = None,
                     Err(error) => {
                         self.install = None;
                         self.update_status =
-                            format!("Не удалось подготовить обновление {version}: {error}");
+                            tf("settings.updatePrepareFailed", &[&version, &error]);
                     }
                 }
                 self.apply_ready_update(studio);
@@ -688,19 +733,16 @@ impl SettingsPane {
                 self.checking_skill = false;
                 match result {
                     Ok(Some(skill)) => {
-                        self.skill_status = format!(
-                            "Навык {} загружен. Он подключится после текущего запроса.",
-                            skill.version
-                        );
+                        self.skill_status = tf("settings.skillQueued", &[&skill.version]);
                         self.pending_skill = Some(skill);
                     }
                     Ok(None) => {
                         self.skill_status = match &self.installed_skill {
-                            Some(skill) => format!("Установлена версия навыка {}.", skill.version),
-                            None => "Опубликованных обновлений навыка пока нет. Используется установленный в Codex навык.".into(),
+                            Some(skill) => tf("settings.skillInstalled", &[&skill.version]),
+                            None => t("settings.skillFallback"),
                         };
                     }
-                    Err(error) => self.skill_status = format!("Не удалось обновить навык: {error}"),
+                    Err(error) => self.skill_status = tf("settings.skillDownloadError", &[&error]),
                 }
                 self.apply_ready_update(studio);
             }
@@ -711,15 +753,15 @@ impl SettingsPane {
                     Ok(()) => match updates::skill::current(&studio.host.dirs) {
                         Ok(skill) => {
                             self.installed_skill = skill;
-                            self.skill_status = format!(
-                                "Навык {version} подключится со следующего запроса. Беседа сохранена."
-                            );
+                            self.skill_status = tf("settings.skillActivated", &[&version]);
                         }
-                        Err(error) => self.skill_status = error,
+                        Err(error) => {
+                            self.skill_status = tf("settings.skillLookupFailed", &[&error]);
+                        }
                     },
                     Err(error) => {
                         self.skill_status =
-                            format!("Не удалось подключить навык {version}: {error}")
+                            tf("settings.skillActivationFailed", &[&version, &error]);
                     }
                 }
                 self.apply_ready_update(studio);
@@ -782,21 +824,19 @@ impl SettingsPane {
                 self.applying = false;
                 match result {
                     Ok(Installed::InstallerRunning) => {
-                        log::info!("update: the installer for {version} is running; closing");
+                        log::info!(
+                            "update: the installer for {version} is running · Concat closes for it"
+                        );
                         studio.notify(&tf("settings.installerOpened", &[&version]), false);
-                        quit_for_switch(|_, _| {});
+                        quit_for_switch("for an update", |_, _| {});
                     }
                     Ok(Installed::Replaced) => {
                         // The bundle on disk is already the new build; what
                         // is left is to start it, and that waits on the
                         // project being saved.
-                        log::info!("update: {version} is in place; starting it");
+                        log::info!("update: {version} is in place · Concat starts it");
                         studio.notify(&tf("settings.versionInstalled", &[&version]), false);
-                        let project = studio
-                            .session
-                            .as_ref()
-                            .map(|session| PathBuf::from(session.path()));
-                        restart(project);
+                        restart_for("for an update");
                     }
                     Ok(Installed::Opened) => {
                         crate::agent::resume_after_update();
@@ -804,13 +844,16 @@ impl SettingsPane {
                     }
                     // A cancel is a choice, not a failure worth a toast.
                     Err(_) if self.install_cancel.load(Ordering::Relaxed) => {
-                        crate::agent::resume_after_update()
+                        crate::agent::resume_after_update();
+                        log::info!("update: switching to {version} cancelled");
                     }
                     Err(error) => {
                         crate::agent::resume_after_update();
-                        self.update_status = format!("Не удалось установить {version}: {error}");
-                        log::warn!("update: {version} could not be installed: {error}");
-                        studio.notify(&tf("settings.couldNotInstall", &[&version, &error]), true);
+                        self.update_status = tf("settings.couldNotInstall", &[&version, &error]);
+                        log::warn!(
+                            "update: installing {version} failed: {error}; this version stays"
+                        );
+                        studio.notify(&self.update_status, true);
                     }
                 }
             }
@@ -825,7 +868,7 @@ impl SettingsPane {
         }
         self.checking = true;
         self.update_status = t("settings.checkingForUpdates");
-        spawn(updates::fetch_releases, |studio, _, _, result| {
+        spawn_long(updates::fetch_releases, |studio, _, _, result| {
             studio.handle(Msg::Settings(SettingsMsg::UpdatesFetched(result)));
         });
     }
@@ -853,7 +896,11 @@ impl SettingsPane {
         self.install = Some((0.0, 0.0));
         let folder = updates::folder(&studio.host.dirs);
         let version = release.version;
-        spawn(
+        log::info!(
+            "update: switching to {version} · its {} package",
+            kind.key()
+        );
+        spawn_long(
             move || {
                 let result = updates::fetch_package(&release, kind).and_then(|package| {
                     let mut report = |received: u64, total: u64| {
@@ -902,9 +949,9 @@ impl SettingsPane {
             return;
         }
         self.checking_skill = true;
-        self.skill_status = "Проверяю опубликованные версии навыка…".into();
+        self.skill_status = t("settings.skillCheckInProgress");
         let dirs = studio.host.dirs.clone();
-        spawn(
+        spawn_long(
             move || {
                 let Some(manifest) = updates::skill::fetch_latest(Version::current())? else {
                     return Ok(None);
@@ -953,7 +1000,7 @@ impl SettingsPane {
             let version = skill.version;
             let dirs = studio.host.dirs.clone();
             self.applying = true;
-            spawn(
+            spawn_long(
                 move || updates::skill::activate(&dirs, &skill),
                 move |studio, _, _, result| {
                     studio.handle(Msg::Settings(SettingsMsg::SkillActivated {
@@ -980,15 +1027,14 @@ impl SettingsPane {
         if let Err(error) = saved {
             self.install = None;
             self.skipped_version = Some(version);
-            self.update_status =
-                format!("Обновление отложено: не удалось сохранить проект: {error}");
+            self.update_status = tf("settings.updateDeferred", &[&error]);
             studio.notify(&self.update_status, true);
             crate::agent::resume_after_update();
             return;
         }
         self.applying = true;
-        self.update_status = format!("Устанавливаю Concat Live {version}…");
-        spawn(
+        self.update_status = tf("settings.installingApp", &[&version]);
+        spawn_long(
             move || {
                 updates::install_prepared_app(&prepared).map(|backup| {
                     log::info!("update: previous app preserved at {}", backup.display());
@@ -1244,7 +1290,7 @@ impl SettingsPane {
         let dirs = studio.host.dirs.clone();
         let whisper = Arc::clone(&studio.host.transcriber);
         let speech = Arc::clone(&studio.host.speech);
-        spawn(
+        spawn_long(
             move || {
                 let report = |progress: concat_speech::DownloadProgress| {
                     let msg = SettingsMsg::ModelProgress {
@@ -1281,26 +1327,33 @@ impl SettingsPane {
     /// The sheet as Slint shows it.
     pub fn data(&self, studio: &Studio) -> SettingsData {
         let server_prefs = self.server_prefs(&studio.prefs);
+        let shortcut_row = |id: &str, label: String| ShortcutData {
+            id: id.into(),
+            label: label.into(),
+            keys: keymap::label(&studio.prefs, id).into(),
+            custom: studio.prefs.keybinds.contains_key(id),
+        };
+        let mut shortcuts: Vec<_> = keymap::ACTIONS
+            .iter()
+            .map(|action| shortcut_row(action.id, keymap::name(action.id)))
+            .collect();
+        if studio.live_enabled && self.open && self.tab == SHORTCUTS_PAGE {
+            shortcuts.extend(
+                [keymap::AGENT_DICTATION, keymap::AGENT_NEW_NOTE]
+                    .map(|id| shortcut_row(id, keymap::name(id))),
+            );
+            shortcuts.extend(
+                crate::agent::pinned_shortcuts()
+                    .into_iter()
+                    .map(|(id, title)| {
+                        shortcut_row(&format!("agent-{id}"), keymap::pinned_name(&title))
+                    }),
+            );
+        }
         SettingsData {
             open: self.open,
             tab: self.tab,
-            // The keymap's rows as the page draws them: the chord each
-            // action is on now, and whether that moved from the one it
-            // ships on — which is the row's cue to offer its reset.
-            shortcuts: ModelRc::from(Rc::new(VecModel::from(
-                keymap::ACTIONS
-                    .iter()
-                    .map(|action| ShortcutData {
-                        id: action.id.into(),
-                        label: keymap::name(action.id).into(),
-                        keys: keymap::bound(&studio.prefs, action.id)
-                            .map(keymap::display)
-                            .unwrap_or_default()
-                            .into(),
-                        custom: studio.prefs.keybinds.contains_key(action.id),
-                    })
-                    .collect::<Vec<_>>(),
-            ))),
+            shortcuts: ModelRc::from(Rc::new(VecModel::from(shortcuts))),
             capturing: self.capturing.clone().unwrap_or_default().into(),
             language: self.language as i32,
             log_level: LOG_LEVELS
@@ -1313,6 +1366,7 @@ impl SettingsPane {
             layout_switchable: !crate::platform::phone(),
             gpu: !studio.prefs.draws_in_software(),
             gpu_switchable: cfg!(any(windows, target_os = "linux", target_os = "macos")),
+            shares_log: cfg!(target_os = "android"),
             magnetic: studio.prefs.magnetic(),
             download_source: self.download_source as i32,
             download_base: self.download_base.as_str().into(),
@@ -1351,7 +1405,7 @@ impl SettingsPane {
                 .installed_skill
                 .as_ref()
                 .map(|skill| skill.version.to_string())
-                .unwrap_or_else(|| "Из каталога Codex".into())
+                .unwrap_or_else(|| t("settings.skillFromCodex"))
                 .into(),
             skill_update_status: self.skill_status.as_str().into(),
             checking: self.checking || self.checking_skill,
@@ -1399,33 +1453,36 @@ fn fixed_note(why: Fixed) -> String {
     }
 }
 
-/// Saves and closes the project, then quits - running `after`, the start of
-/// a build already replaced on disk, only once the project has been written.
-///
-/// A switch is only worth making if the save lands first. The relaunch of a
-/// replaced build used to be scheduled before the save, so a save that then
-/// failed started the new build over a window that still held the old
-/// session. Now a failed save starts nothing and quits nothing: the window
-/// stays up with `close_project`'s reason, and the bundle already on disk
-/// can be started by hand.
-/// Saves, quits and starts Concat again on `project`; see
-/// `updates::restart`. A save that fails keeps the window, as any close.
-pub(crate) fn restart(_project: Option<std::path::PathBuf>) {
-    log::info!("close: restarting Concat Live");
-    quit_for_switch(move |project, roots| {
+/// Saves, quits and relaunches Concat with the active project and workspace.
+/// Their paths are captured after the wait for the editor to become idle.
+pub(crate) fn restart(_project: Option<PathBuf>) {
+    restart_for("restarting for a setting");
+}
+
+fn restart_for(how: &'static str) {
+    quit_for_switch(how, |project, roots| {
         if let Err(error) = updates::restart_with_roots(project.as_deref(), &roots) {
-            log::warn!("restart: could not start Concat again: {error}");
+            log::warn!(
+                "close: could not arrange the start after closing: {error}; start Concat by hand"
+            );
         }
     });
 }
 
-fn quit_for_switch(after: impl FnOnce(Option<PathBuf>, Vec<PathBuf>) + Send + 'static) {
+/// A restart waits for the project save. If saving fails, the current
+/// window and session remain open and there is no second process.
+fn quit_for_switch(
+    how: &'static str,
+    after: impl FnOnce(Option<PathBuf>, Vec<PathBuf>) + Send + 'static,
+) {
     on_ui(move |studio, app, models| {
         if crate::host::native_dialog_open() || studio.busy_for_update() {
-            slint::Timer::single_shot(Duration::from_millis(250), move || quit_for_switch(after));
+            slint::Timer::single_shot(Duration::from_millis(250), move || {
+                quit_for_switch(how, after);
+            });
             return;
         }
-        log::info!("close: quitting for a version switch");
+        crate::closing(how);
         let project = studio
             .session
             .as_ref()
@@ -1442,7 +1499,7 @@ fn quit_for_switch(after: impl FnOnce(Option<PathBuf>, Vec<PathBuf>) + Send + 's
         );
         if let Err(error) = outcome {
             crate::agent::resume_after_update();
-            log::warn!("close: not switching, project could not be saved: {error}");
+            log::debug!("close: not switching, project could not be saved: {error}");
             studio.offer_quit_without_saving(error);
             studio.refresh_art();
             studio.publish(app, models);
@@ -1455,6 +1512,24 @@ fn quit_for_switch(after: impl FnOnce(Option<PathBuf>, Vec<PathBuf>) + Send + 's
 /// The log level row's choices, in the order the sheet lists them:
 /// errors only, warnings, normal, debug, everything.
 /// https://github.com/jub0t/Concat/issues/223
+/// [`LOG_LEVELS`] as the sheet names them, for the log's line.
+const LOG_LEVEL_NAMES: [&str; 5] = ["Errors only", "Warnings", "Normal", "Debug", "Everything"];
+
+/// The download sources as the sheet names them, in
+/// [`SourcePreference::ALL`]'s order, for the log's line.
+const DOWNLOAD_SOURCE_NAMES: [&str; 5] = [
+    "Automatic",
+    "Concat's mirror",
+    "hf-mirror.com",
+    "Original source",
+    "Custom URL",
+];
+
+/// A switch's state as the log says it.
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
 const LOG_LEVELS: [log::LevelFilter; 5] = [
     log::LevelFilter::Error,
     log::LevelFilter::Warn,

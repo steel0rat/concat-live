@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
+
+import { I18n } from "../i18n.slint";
+import { Theme, Glyph, Icon, Tip } from "../primitives/primitives.slint";
+import { Button } from "../primitives/modal.slint";
+import { PaneScroll } from "pane.slint";
+
+export struct IncomingFileData {
+    path: string,
+    name: string,
+    selected: bool,
+    pending: bool,
+}
+
+export struct MediaUseData {
+    timeline-id: string,
+    timeline-name: string,
+    clip-id: string,
+    label: string,
+    timecode: string,
+}
+
+export global MediaWorkflow {
+    in property <bool> inbox-open;
+    in property <string> folder;
+    in property <bool> loading;
+    in property <bool> scan-error;
+    in property <int> selected-count;
+    in property <[IncomingFileData]> incoming-files;
+    in property <bool> uses-open;
+    in property <bool> can-show-uses;
+    in property <string> uses-name;
+    in property <[MediaUseData]> uses;
+
+    callback open-inbox();
+    callback close();
+    callback choose-folder();
+    callback refresh-inbox();
+    callback toggle-file(string);
+    callback preview-file(string);
+    callback import-selected();
+    callback open-selected-uses();
+    callback jump-to-use(string, string);
+}
+
+export component WorkflowButton inherits Button {
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.tip;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) { root.clicked(); }
+    }
+    forward-focus: keys;
+
+    keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                root.clicked();
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+    }
+}
+
+component WorkflowHeading inherits HorizontalLayout {
+    in property <string> title;
+    spacing: 6px;
+
+    WorkflowButton {
+        square: true;
+        label: I18n.t("mediaBin.backToMedia");
+        glyph: Glyph.chevron-left;
+        tip: I18n.t("mediaBin.backToMediaHint");
+        clicked => { MediaWorkflow.close(); }
+    }
+
+    Text {
+        horizontal-stretch: 1;
+        text: root.title;
+        color: Theme.fg;
+        font-size: Theme.fs-lg;
+        font-weight: Theme.weight-title;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+component WorkflowNote inherits Text {
+    color: Theme.fg-muted;
+    font-size: Theme.fs-sm;
+    wrap: word-wrap;
+}
+
+component IncomingFileRow inherits HorizontalLayout {
+    in property <IncomingFileData> file;
+    spacing: 4px;
+
+    Rectangle {
+        height: 28px;
+        horizontal-stretch: 1;
+        border-radius: Theme.r;
+        background: root.file.selected ? Theme.well : choice.has-hover ? Theme.field-hover : Colors.transparent;
+        opacity: root.file.pending ? 0.55 : 1.0;
+        accessible-role: checkbox;
+        accessible-label: root.file.name;
+        accessible-description: I18n.t("mediaBin.incomingSelectHint");
+        accessible-enabled: !root.file.pending;
+        accessible-checkable: true;
+        accessible-checked: root.file.selected;
+        accessible-action-default => {
+            if (!root.file.pending) { MediaWorkflow.toggle-file(root.file.path); }
+        }
+
+        HorizontalLayout {
+            padding-left: 6px;
+            padding-right: 5px;
+            spacing: 6px;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 14px;
+                    height: 14px;
+                    border-radius: Theme.r-xs;
+                    border-width: 1px;
+                    border-color: root.file.selected ? Theme.accent : Theme.line-strong;
+                    background: root.file.selected ? Theme.accent : Colors.transparent;
+
+                    if root.file.selected: Icon {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        glyph: Glyph.check;
+                        size: 11px;
+                        tint: Theme.on-accent;
+                    }
+                }
+            }
+
+            Text {
+                horizontal-stretch: 1;
+                text: root.file.pending
+                    ? root.file.name + " · " + I18n.t("mediaBin.incomingImporting")
+                    : root.file.name;
+                vertical-alignment: center;
+                color: Theme.fg;
+                font-size: Theme.fs;
+                overflow: elide;
+            }
+        }
+
+        choice := TouchArea {
+            mouse-cursor: root.file.pending ? default : pointer;
+            clicked => {
+                if (!root.file.pending) {
+                    MediaWorkflow.toggle-file(root.file.path);
+                }
+            }
+        }
+
+        Tip {
+            active: choice.has-hover;
+            text: root.file.name + "\n" + (root.file.pending
+                ? I18n.t("mediaBin.incomingImporting") : I18n.t("mediaBin.incomingSelectHint"));
+        }
+    }
+
+    WorkflowButton {
+        square: true;
+        glyph: Glyph.eye;
+        label: I18n.t("common.preview") + " · " + root.file.name;
+        tip: I18n.t("mediaBin.incomingPreviewHint");
+        enabled: !root.file.pending;
+        clicked => { MediaWorkflow.preview-file(root.file.path); }
+    }
+}
+
+export component InboxView inherits VerticalLayout {
+    padding: 8px;
+    spacing: 6px;
+
+    Timer {
+        interval: 2s;
+        running: MediaWorkflow.folder != "";
+        triggered => { MediaWorkflow.refresh-inbox(); }
+    }
+
+    WorkflowHeading { title: I18n.t("mediaBin.incoming"); }
+
+    HorizontalLayout {
+        spacing: 4px;
+        WorkflowButton {
+            block: true;
+            glyph: Glyph.folder;
+            label: I18n.t("mediaBin.chooseIncomingFolder");
+            tip: I18n.t("mediaBin.incomingChooseHint");
+            clicked => { MediaWorkflow.choose-folder(); }
+        }
+        if MediaWorkflow.folder != "": WorkflowButton {
+            square: true;
+            glyph: Glyph.reset;
+            label: I18n.t("mediaBin.incomingRefresh");
+            tip: I18n.t("mediaBin.incomingRefreshHint");
+            clicked => { MediaWorkflow.refresh-inbox(); }
+        }
+    }
+
+    if MediaWorkflow.folder != "": Text {
+        text: MediaWorkflow.folder;
+        color: Theme.fg-muted;
+        font-size: Theme.fs-sm;
+        overflow: elide;
+    }
+
+    if MediaWorkflow.folder == "": WorkflowNote {
+        text: I18n.t("mediaBin.incomingChoosePrompt");
+    }
+    if MediaWorkflow.loading: WorkflowNote { text: I18n.t("mediaBin.incomingLoading"); }
+    if MediaWorkflow.scan-error: WorkflowNote { text: I18n.t("mediaBin.incomingReadError"); }
+    if MediaWorkflow.folder != "" && !MediaWorkflow.loading && !MediaWorkflow.scan-error
+        && MediaWorkflow.incoming-files.length == 0: WorkflowNote {
+        text: I18n.t("mediaBin.incomingEmpty");
+    }
+
+    PaneScroll {
+        vertical-stretch: 1;
+        for file in MediaWorkflow.incoming-files: IncomingFileRow {
+            file: file;
+        }
+    }
+
+    if MediaWorkflow.folder != "": WorkflowButton {
+        block: true;
+        primary: true;
+        label: I18n.t("mediaBin.importSelectedIncoming");
+        tip: I18n.t("mediaBin.incomingImportHint");
+        enabled: MediaWorkflow.selected-count > 0;
+        clicked => { MediaWorkflow.import-selected(); }
+    }
+}
+
+component MediaUseRow inherits Rectangle {
+    in property <MediaUseData> usage;
+    height: 46px;
+    border-radius: Theme.r;
+    background: hit.has-hover ? Theme.field-hover : Colors.transparent;
+    accessible-role: button;
+    accessible-label: root.usage.timeline-name + " · " + root.usage.timecode;
+    accessible-description: I18n.t("mediaBin.whereUsedJumpHint");
+    accessible-action-default => { MediaWorkflow.jump-to-use(root.usage.timeline-id, root.usage.clip-id); }
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 8px;
+        spacing: 6px;
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 3px;
+
+            Text {
+                text: root.usage.clip-id == "" ? I18n.t("mediaBin.timelineBackground")
+                    : root.usage.label == "" ? MediaWorkflow.uses-name : root.usage.label;
+                color: Theme.fg;
+                font-size: Theme.fs;
+                overflow: elide;
+            }
+            Text {
+                text: root.usage.timeline-name + " · " + root.usage.timecode;
+                color: Theme.fg-muted;
+                font-size: Theme.fs-sm;
+                overflow: elide;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                glyph: Glyph.chevron-right;
+                size: 12px;
+                tint: Theme.fg-muted;
+            }
+        }
+    }
+
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { MediaWorkflow.jump-to-use(root.usage.timeline-id, root.usage.clip-id); }
+    }
+
+    Tip {
+        active: hit.has-hover;
+        text: root.usage.timeline-name + " · " + root.usage.timecode + "\n"
+            + I18n.t("mediaBin.whereUsedJumpHint");
+    }
+}
+
+export component MediaUsesView inherits VerticalLayout {
+    padding: 8px;
+    spacing: 6px;
+
+    WorkflowHeading { title: I18n.t("mediaBin.whereUsed"); }
+    Text {
+        text: MediaWorkflow.uses-name;
+        color: Theme.fg-muted;
+        font-size: Theme.fs-sm;
+        overflow: elide;
+    }
+
+    if MediaWorkflow.uses.length == 0: WorkflowNote {
+        text: I18n.t("mediaBin.whereUsedEmpty");
+    }
+
+    PaneScroll {
+        vertical-stretch: 1;
+        for item in MediaWorkflow.uses: MediaUseRow { usage: item; }
+    }
+}

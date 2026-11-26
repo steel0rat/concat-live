@@ -33,6 +33,8 @@ export enum PaneKind {
     media,
     /// the monitor
     preview,
+    /// reference video alongside the timeline preview
+    reference,
     /// details, adjust, text, the preset stacks
     inspector,
     /// tabs, tray, lanes
@@ -61,6 +63,7 @@ export global Panes {
     public pure function label(kind: PaneKind) -> string {
         return kind == PaneKind.media ? I18n.t("paneSwitcher.library")
             : kind == PaneKind.preview ? I18n.t("common.preview")
+            : kind == PaneKind.reference ? I18n.t("reference.title")
             : kind == PaneKind.inspector ? I18n.t("paneSwitcher.inspector")
             : kind == PaneKind.keyframes ? I18n.t("common.keyframes")
             : kind == PaneKind.agent ? "Codex"
@@ -73,6 +76,7 @@ export global Panes {
     public pure function id(kind: PaneKind) -> string {
         return kind == PaneKind.media ? "media"
             : kind == PaneKind.preview ? "preview"
+            : kind == PaneKind.reference ? "reference"
             : kind == PaneKind.inspector ? "inspector"
             : kind == PaneKind.keyframes ? "keyframes"
             : kind == PaneKind.agent ? "agent"
@@ -85,7 +89,7 @@ export global Panes {
     /// sliders, and a stack of lanes.
     public pure function glyph(kind: PaneKind) -> Glyph {
         return kind == PaneKind.media ? Glyph.film
-            : kind == PaneKind.preview ? Glyph.image
+            : kind == PaneKind.preview || kind == PaneKind.reference ? Glyph.image
             : kind == PaneKind.inspector ? Glyph.settings
             : kind == PaneKind.keyframes ? Glyph.keyframe
             : kind == PaneKind.agent ? Glyph.sparkle
@@ -260,7 +264,7 @@ export component PaneSwitcher inherits Rectangle {
     /// somewhere to be laid out. When the Keyframes row arrived this still
     /// said four, and the row that removes the panel was the one under the
     /// clip.
-    property <length> list-h: (Panes.agent-enabled ? 6 : 5) * 26px + 9px + 26px + 8px;
+    property <length> list-h: (Panes.agent-enabled ? 7 : 6) * 26px + 9px + 26px + 8px;
     /// The whole list when the window has room for it under the button, and
     /// the room otherwise, with the rest reached by scrolling. Never under
     /// three rows: shorter than that is not a list worth scrolling, and
@@ -391,6 +395,11 @@ export component PaneSwitcher inherits Rectangle {
                         chosen => { menu.close(); root.picked(PaneKind.preview); }
                     }
                     SwitchRow {
+                        kind: PaneKind.reference;
+                        current: root.kind == PaneKind.reference;
+                        chosen => { menu.close(); root.picked(PaneKind.reference); }
+                    }
+                    SwitchRow {
                         kind: PaneKind.inspector;
                         current: root.kind == PaneKind.inspector;
                         chosen => { menu.close(); root.picked(PaneKind.inspector); }
@@ -436,7 +445,7 @@ export component AddPaneButton inherits Rectangle {
     property <length> menu-w: 168px;
     /// View rows and the surface's padding; held to the room under the
     /// button the way the seat's own menu is.
-    property <length> list-h: (Panes.agent-enabled ? 6 : 5) * 26px + 8px;
+    property <length> list-h: (Panes.agent-enabled ? 7 : 6) * 26px + 8px;
     property <length> menu-h: Math.min(root.list-h, Math.max(3 * 26px + 8px,
         Panes.room-below(root.absolute-position.y + root.height + 4px)));
 
@@ -499,6 +508,10 @@ export component AddPaneButton inherits Rectangle {
                     SwitchRow {
                         kind: PaneKind.preview;
                         chosen => { menu.close(); root.added(PaneKind.preview); }
+                    }
+                    SwitchRow {
+                        kind: PaneKind.reference;
+                        chosen => { menu.close(); root.added(PaneKind.reference); }
                     }
                     SwitchRow {
                         kind: PaneKind.inspector;

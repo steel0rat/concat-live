@@ -59,6 +59,7 @@ component SizeMenu inherits Rectangle {
     IconButton {
         glyph: Glyph.rows;
         label: I18n.t("trackHeader.rowHeight");
+        tip: self.label + "\n" + I18n.t("trackActionTips.height");
         icon-size: 12px;
         idle: Theme.fg;
         // Lit only when the lane has been sized by hand: auto is the resting
@@ -143,6 +144,7 @@ component MoreMenu inherits Rectangle {
     IconButton {
         glyph: Glyph.more;
         label: I18n.t("trackHeader.more");
+        tip: self.label + "\n" + I18n.t("trackActionTips.menu");
         icon-size: 14px;
         idle: Theme.fg;
         clicked => { list.show(); }
@@ -261,6 +263,7 @@ component Header inherits Rectangle {
                 IconButton {
                     glyph: root.track.locked ? Glyph.lock : Glyph.unlock;
                     label: root.track.locked ? I18n.t("trackHeader.unlockLane") : I18n.t("trackHeader.lockLane");
+                    tip: self.label + "\n" + I18n.t("trackActionTips.lock");
                     icon-size: 12px;
                     idle: Theme.fg;
                     checked: root.track.locked;
@@ -279,6 +282,7 @@ component Header inherits Rectangle {
                     // announcing.
                     glyph: root.track.visible ? Glyph.eye : Glyph.eye-off;
                     label: root.track.visible ? I18n.t("trackHeader.hideLane") : I18n.t("trackHeader.showLane");
+                    tip: self.label + "\n" + I18n.t("trackActionTips.visibility");
                     icon-size: 12px;
                     idle: Theme.fg;
                     checked: !root.track.visible;
@@ -294,6 +298,7 @@ component Header inherits Rectangle {
                 IconButton {
                     glyph: root.track.muted ? Glyph.volume-off : Glyph.volume;
                     label: root.track.muted ? I18n.t("trackHeader.unmuteLane") : I18n.t("trackHeader.muteLane");
+                    tip: self.label + "\n" + I18n.t("trackActionTips.audio");
                     icon-size: 12px;
                     idle: Theme.fg;
                     checked: root.track.muted;

@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
+
+import { I18n } from "../i18n.slint";
+import { Button, Glyph, Modal, Progress, Theme } from "../primitives/primitives.slint";
+
+export global ReviewCopy {
+    in property <bool> available;
+    in property <bool> open;
+    in property <bool> choosing;
+    in property <bool> busy;
+    in property <bool> cancelling;
+    in property <float> progress;
+    in property <string> status;
+    in property <string> error;
+    callback choose();
+    callback cancel();
+    callback close();
+}
+
+export component ReviewCopyDialog inherits Modal {
+    open: ReviewCopy.open;
+    title: I18n.t("reviewCopy.title");
+    glyph: Glyph.film;
+    surface-width: 464px;
+    dismissable: !ReviewCopy.busy && !ReviewCopy.choosing;
+    closed => { ReviewCopy.close(); }
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 8px;
+
+        Text {
+            text: I18n.t("reviewCopy.contents");
+            color: Theme.fg;
+            wrap: word-wrap;
+        }
+
+        if ReviewCopy.busy: VerticalLayout {
+            spacing: 8px;
+            Text {
+                text: ReviewCopy.status;
+                color: Theme.fg-muted;
+                wrap: word-wrap;
+            }
+            Progress {
+                value: ReviewCopy.progress;
+                live: !ReviewCopy.cancelling;
+            }
+        }
+
+        if !ReviewCopy.busy && ReviewCopy.status != "": Text {
+            text: ReviewCopy.status;
+            color: Theme.fg-muted;
+            wrap: word-wrap;
+        }
+
+        if ReviewCopy.error != "": Text {
+            text: ReviewCopy.error;
+            color: Theme.danger;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 6px;
+
+            if !ReviewCopy.busy: Button {
+                primary: true;
+                enabled: !ReviewCopy.choosing && ReviewCopy.available;
+                label: I18n.t("reviewCopy.choose");
+                tip: I18n.t("reviewCopy.chooseTip");
+                accessible-role: button;
+                accessible-label: self.label;
+                accessible-description: self.tip;
+                accessible-enabled: self.enabled;
+                accessible-action-default => {
+                    if (!ReviewCopy.choosing && ReviewCopy.available) { ReviewCopy.choose(); }
+                }
+                clicked => { ReviewCopy.choose(); }
+            }
+
+            if ReviewCopy.busy: Button {
+                enabled: !ReviewCopy.cancelling;
+                label: I18n.t("reviewCopy.cancel");
+                tip: I18n.t("reviewCopy.cancelTip");
+                accessible-role: button;
+                accessible-label: self.label;
+                accessible-description: self.tip;
+                accessible-enabled: self.enabled;
+                accessible-action-default => { if (!ReviewCopy.cancelling) { ReviewCopy.cancel(); } }
+                clicked => { ReviewCopy.cancel(); }
+            }
+        }
+    }
+}

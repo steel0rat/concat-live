@@ -5,6 +5,8 @@ import { Theme } from "../theme/theme.slint";
 import { Focus, Payload } from "../util.slint";
 import { Glyph, Icon } from "../icons.slint";
 import { TimelineTabData } from "model.slint";
+import { I18n } from "../i18n.slint";
+import { Tip } from "../primitives/tooltip.slint";
 
 // The timeline tabs, one per timeline in the project — sequences, in the
 // vocabulary every other editor uses. Kept above the tool tray so switching
@@ -112,7 +114,13 @@ component Tab inherits Rectangle {
                     root.close-requested();
                 }
             }
+            Tip { text: I18n.t("timelineActionTips.closeTab"); active: shut.has-hover; }
         }
+    }
+
+    Tip {
+        text: I18n.t("timelineActionTips.tab");
+        active: touch.has-hover && !root.renaming && (!root.closable || touch.mouse-x < root.width - 21px);
     }
 
     if root.renaming: Rectangle {
@@ -151,7 +159,9 @@ component Tab inherits Rectangle {
             // the rule every rename-in-place in this app follows.
             changed has-focus => {
                 if (!self.has-focus && root.renaming) {
-                    root.renamed(self.text);
+                    if (self.text != root.name) {
+                        root.renamed(self.text);
+                    }
                     root.renaming = false;
                 }
             }
@@ -409,6 +419,7 @@ export component TimelineTabs inherits Rectangle {
                 mouse-cursor: pointer;
                 clicked => { root.added(); }
             }
+            Tip { text: I18n.t("timelineActionTips.newTab"); active: plus.has-hover; }
         }
     }
 

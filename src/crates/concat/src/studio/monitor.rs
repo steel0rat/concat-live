@@ -13,6 +13,7 @@ impl Studio {
         self.handle(crate::panes::Msg::Monitor(
             crate::panes::monitor::MonitorMsg::Request,
         ));
+        crate::reference::request(self);
     }
 
     /// What the monitor draws at the playhead: the document flattened with
@@ -26,6 +27,9 @@ impl Studio {
         concat_project::DocumentSettings,
     )> {
         let session = self.session.as_ref()?;
+        if let Some(scene) = crate::object_follow::selecting_preview(self) {
+            return Some(scene);
+        }
         // A library file on the monitor: its clip alone, flattened once.
         if let Some(source) = self.source.as_ref() {
             return Some((std::sync::Arc::clone(&source.clips), session.settings()));
@@ -411,11 +415,11 @@ impl Studio {
 
     /// The instant the monitor shows: the pointer's while it crosses the
     /// lanes with the preview axis on, else the playhead's.
-    pub fn preview_time(&self) -> f32 {
+    pub fn preview_time(&self) -> f64 {
         if let Some(source) = self.source.as_ref() {
-            return source.time as f32;
+            return source.time;
         }
-        self.hover.unwrap_or(self.playhead)
+        f64::from(self.hover.unwrap_or(self.playhead))
     }
 
     /// The pointer is over the lanes at `seconds`. Nothing while playing -

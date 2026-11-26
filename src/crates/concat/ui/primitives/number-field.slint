@@ -5,6 +5,7 @@ import { Theme } from "../theme/theme.slint";
 import { Fmt, Focus } from "../util.slint";
 import { Glyph, Icon } from "../icons.slint";
 import { FocusRing } from "focus-ring.slint";
+import { Tip } from "tooltip.slint";
 
 // The workhorse of an inspector: drag left/right anywhere on the field to
 // scrub, click to type. Shift coarsens the scrub 10x, Alt refines it 10x.
@@ -36,6 +37,8 @@ export component NumberField inherits Rectangle {
     in property <bool> keyframe;
     in-out property <bool> keyframed;
     in property <bool> enabled: true;
+    in property <string> accessible-name;
+    in property <string> tip;
     /// The corners, a side at a time; see Field.
     in property <length> radius-left: Theme.r;
     in property <length> radius-right: Theme.r;
@@ -121,6 +124,8 @@ export component NumberField inherits Rectangle {
             font-size: Theme.fs;
             single-line: true;
             enabled: root.enabled;
+            accessible-label: root.accessible-name;
+            accessible-description: root.tip;
             vertical-alignment: center;
             selection-background-color: Theme.accent;
             selection-foreground-color: Theme.on-accent;
@@ -262,6 +267,11 @@ export component NumberField inherits Rectangle {
                     self.alt);
             }
         }
+    }
+
+    if root.tip != "": Tip {
+        text: root.tip;
+        active: scrub.has-hover;
     }
 
     FocusRing {

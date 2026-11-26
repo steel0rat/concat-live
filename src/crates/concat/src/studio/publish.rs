@@ -7,27 +7,31 @@ use super::*;
 impl Studio {
     // ── notices ──
 
-    /// Raises the bottom-right notice. Every caller is some other handler
-    /// that has just done - or refused to do - the thing it is reporting, so
-    /// this only records; the publish that handler was going to make anyway
-    /// is what puts it on screen.
+    /// Raises the bottom-right notice: done, or failed. Every caller is
+    /// some other handler that has just done - or refused to do - the thing
+    /// it is reporting, so this only records; the publish that handler was
+    /// going to make anyway is what puts it on screen. A confirmation over a
+    /// failure still up is dropped; see [`ToastState::raise`].
     pub fn notify(&mut self, message: &str, failed: bool) {
-        self.toast.token += 1;
-        self.toast.message = message.into();
-        self.toast.failed = failed;
+        let kind = if failed {
+            ToastKind::Failed
+        } else {
+            ToastKind::Done
+        };
+        self.toast.raise(message, kind);
+    }
+
+    /// [`Studio::notify`] for something that worked, but not as well as it
+    /// should: the work goes on, and the person may want the log.
+    pub fn warn(&mut self, message: &str) {
+        self.toast.raise(message, ToastKind::Warning);
     }
 
     // ── publishing ──
 
     pub fn publish(&self, app: &App, models: &Models) {
         if self.live_enabled {
-            crate::agent::set_context(
-                self.session
-                    .as_ref()
-                    .map(|session| std::path::PathBuf::from(session.path())),
-                &self.project_name,
-                crate::host::project_epoch(),
-            );
+            crate::agent::set_context(self);
         }
         // The tray's three menu labels and the tooltips' bare-letter
         // hints, spelled from the keymap so a rebind moves the words
@@ -53,6 +57,16 @@ impl Studio {
         editor.set_keys_preview_axis(hint("preview-axis").into());
         self.publish_lanes(app, models);
         self.publish_chrome(app, models);
+        self.publish_media_workflow(app);
+        crate::montage_blocks::publish(self, app);
+        crate::scene_browser::publish(self, app);
+        crate::click_review::publish(self, app);
+        crate::section_pane::publish(self, app);
+        crate::stem_export::publish(self, app);
+        crate::cover_pane::publish(self, app);
+        crate::review_copy::publish(self, app);
+        crate::take_compare::publish(self, app);
+        crate::reference::publish(self, app);
         self.publish_dock(app, models);
     }
 
@@ -60,18 +74,17 @@ impl Studio {
     /// save changes. The autosave publishes only this - a whole publish a
     /// second and a half after every edit was all cost (#622).
     pub fn publish_status(&self, app: &App) {
-        app.set_project_status(
-            if self.dirty {
-                "unsaved changes"
-            } else {
-                "saved"
-            }
-            .into(),
-        );
+        let status = if self.dirty {
+            t("common.unsavedChanges")
+        } else {
+            t("common.saved")
+        };
+        app.set_project_status(status.into());
         app.set_toast(ToastData {
             token: self.toast.token,
             message: self.toast.message.as_str().into(),
-            failed: self.toast.failed,
+            kind: self.toast.kind,
+            hold: self.toast.hold_ms,
         });
     }
 
@@ -202,7 +215,16 @@ impl Studio {
     /// The timeline and the readouts that follow it: what runs on every
     /// event of a scrub, a drag, a trim or a knob.
     pub fn publish_lanes(&self, app: &App, models: &Models) {
+        crate::reference::publish_position(self, app);
+        crate::object_follow::publish(self, app);
+        crate::section_pane::publish_cursor(self, app);
         let editor = app.global::<Editor>();
+        let beats = self.beats_shown();
+        editor.set_beats_shown(beats.shown);
+        editor.set_beats_tempo(beats.tempo.into());
+        editor.set_beats_note(beats.note.into());
+        editor.set_beats_on(beats.on);
+        editor.set_beats_marks(beats.marks);
         let project = self.project();
         sync(
             &models.tabs,
@@ -211,7 +233,7 @@ impl Studio {
                 .iter()
                 .map(|timeline| TimelineTabData {
                     id: timeline.id.as_str().into(),
-                    name: timeline.name.as_str().into(),
+                    name: i18n::timeline_label(&timeline.name).into(),
                 })
                 .collect(),
         );
@@ -263,6 +285,7 @@ impl Studio {
                         } else {
                             Default::default()
                         };
+                    let marks = self.beat_marks(clip);
                     ClipData {
                         id: clip.id.as_str().into(),
                         name: clip.name.as_str().into(),
@@ -292,6 +315,8 @@ impl Studio {
                         wave: wave.0,
                         wave_from: wave.1,
                         wave_span: wave.2,
+                        beats: marks.0,
+                        bars: marks.1,
                         has_audio: self.clip_has_sound(clip),
                         strip: self.strip_of(clip),
                     }

@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Concat Live contributors
+
+import { I18n } from "../i18n.slint";
+import { Theme } from "../theme/theme.slint";
+import { Glyph } from "../icons.slint";
+import { DialogRow, DialogSection, Field, Modal } from "../primitives/modal.slint";
+import { NumberField } from "../primitives/number-field.slint";
+import { ChatAction } from "../workspace/agent.slint";
+
+export global CoverFrameUi {
+    in property <bool> available;
+    in property <bool> open;
+    in property <bool> pending;
+    in property <bool> saving;
+    in property <bool> ready;
+    in property <image> image;
+    in property <string> clock;
+    in property <string> status;
+    in-out property <int> aspect;
+    in-out property <float> horizontal: 50;
+    in-out property <float> vertical: 50;
+    in-out property <float> zoom: 100;
+    in-out property <string> title;
+
+    callback open-panel();
+    callback close();
+    callback capture();
+    callback refresh();
+    callback save();
+}
+
+export component CoverFrameDialog inherits Modal {
+    open: CoverFrameUi.open;
+    title: I18n.t("cover.title");
+    note: CoverFrameUi.clock;
+    glyph: Glyph.film;
+    surface-width: 490px;
+    dismissable: !CoverFrameUi.saving;
+    closed => { CoverFrameUi.close(); }
+
+    VerticalLayout {
+        DialogSection {
+            first: true;
+            title: I18n.t("cover.preview");
+
+            Rectangle {
+                min-height: 160px;
+                preferred-height: 180px;
+                background: Theme.field;
+                border-radius: Theme.r;
+                accessible-role: image;
+                accessible-label: I18n.t("cover.preview");
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: CoverFrameUi.image;
+                    image-fit: contain;
+                }
+            }
+            Text {
+                text: CoverFrameUi.status;
+                color: Theme.fg-muted;
+                font-size: Theme.fs-sm;
+                wrap: word-wrap;
+            }
+            ChatAction {
+                label: I18n.t("cover.capture");
+                tip: I18n.t("cover.captureTip");
+                ghost: false;
+                enabled: !CoverFrameUi.saving;
+                horizontal-stretch: 1;
+                elide-label: true;
+                clicked => { CoverFrameUi.capture(); }
+            }
+        }
+        DialogSection {
+            title: I18n.t("cover.framing");
+
+            DialogRow {
+                label: I18n.t("cover.aspect");
+                label-width: 158px;
+                help: I18n.t("cover.aspectTip");
+                HorizontalLayout {
+                    spacing: 4px;
+                    for ratio[index] in [I18n.t("cover.original"), "16:9", "1:1", "9:16"]: ChatAction {
+                        label: ratio;
+                        tip: I18n.t("cover.aspectTip");
+                        primary: CoverFrameUi.aspect == index;
+                        enabled: !CoverFrameUi.saving;
+                        ghost: false;
+                        horizontal-stretch: 1;
+                        accessible-role: radio-button;
+                        accessible-checkable: true;
+                        accessible-checked: CoverFrameUi.aspect == index;
+                        clicked => {
+                            CoverFrameUi.aspect = index;
+                            CoverFrameUi.refresh();
+                        }
+                    }
+                }
+            }
+            DialogRow {
+                label: I18n.t("cover.horizontal");
+                label-width: 158px;
+                help: I18n.t("cover.horizontalTip");
+                NumberField {
+                    tip: I18n.t("cover.horizontalTip");
+                    value <=> CoverFrameUi.horizontal;
+                    minimum: 0;
+                    maximum: 100;
+                    step: 1;
+                    unit: "%";
+                    enabled: !CoverFrameUi.saving;
+                    changed => { CoverFrameUi.refresh(); }
+                }
+            }
+            DialogRow {
+                label: I18n.t("cover.vertical");
+                label-width: 158px;
+                help: I18n.t("cover.verticalTip");
+                NumberField {
+                    tip: I18n.t("cover.verticalTip");
+                    value <=> CoverFrameUi.vertical;
+                    minimum: 0;
+                    maximum: 100;
+                    step: 1;
+                    unit: "%";
+                    enabled: !CoverFrameUi.saving;
+                    changed => { CoverFrameUi.refresh(); }
+                }
+            }
+            DialogRow {
+                label: I18n.t("cover.zoom");
+                label-width: 158px;
+                help: I18n.t("cover.zoomTip");
+                NumberField {
+                    tip: I18n.t("cover.zoomTip");
+                    value <=> CoverFrameUi.zoom;
+                    minimum: 100;
+                    maximum: 400;
+                    step: 5;
+                    unit: "%";
+                    enabled: !CoverFrameUi.saving;
+                    changed => { CoverFrameUi.refresh(); }
+                }
+            }
+            DialogRow {
+                label: I18n.t("cover.heading");
+                label-width: 158px;
+                help: I18n.t("cover.headingTip");
+                Field {
+                    tip: I18n.t("cover.headingTip");
+                    value: CoverFrameUi.title;
+                    max-length: 120;
+                    placeholder: I18n.t("cover.headingPlaceholder");
+                    edited(value) => { CoverFrameUi.title = value; CoverFrameUi.refresh(); }
+                }
+            }
+            ChatAction {
+                label: I18n.t("cover.save");
+                tip: I18n.t("cover.saveTip");
+                ghost: false;
+                primary: true;
+                enabled: CoverFrameUi.ready && !CoverFrameUi.saving && !CoverFrameUi.pending;
+                horizontal-stretch: 1;
+                elide-label: true;
+                clicked => { CoverFrameUi.save(); }
+            }
+        }
+    }
+}

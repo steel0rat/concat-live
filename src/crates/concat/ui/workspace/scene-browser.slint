@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
+
+import { I18n } from "../i18n.slint";
+import { Button, Glyph, Icon, IconButton, Theme, Tip } from "../primitives/primitives.slint";
+import { PaneScroll } from "pane.slint";
+
+export struct SceneRowData {
+    time-label: string,
+    thumbnail: image,
+    selected: bool,
+}
+
+export global SceneBrowser {
+    in property <bool> open;
+    in property <bool> busy;
+    in property <string> name;
+    in property <[SceneRowData]> rows;
+    in property <int> selected-count;
+    in property <string> error;
+    callback close();
+    callback toggle(row: int);
+    callback preview(row: int);
+    callback insert();
+}
+
+component SceneCard inherits Rectangle {
+    in property <SceneRowData> scene;
+    in property <int> index;
+
+    border-radius: Theme.r;
+    border-width: 1px;
+    border-color: root.scene.selected || keys.has-focus ? Theme.accent
+        : card-touch.has-hover ? Theme.line-strong : Theme.line;
+    background: Theme.field;
+    clip: true;
+    accessible-role: checkbox;
+    accessible-label: root.scene.time-label;
+    accessible-description: I18n.t("sceneBrowser.selectTip");
+    accessible-checkable: true;
+    accessible-checked: root.scene.selected;
+    accessible-action-default => { SceneBrowser.toggle(root.index); }
+    forward-focus: keys;
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                SceneBrowser.toggle(root.index);
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+    }
+
+    photo := Rectangle {
+        x: 1px;
+        y: 1px;
+        width: parent.width - 2px;
+        height: Math.max(0px, parent.height - 29px);
+        background: Theme.well;
+        Image {
+            source: root.scene.thumbnail;
+            width: parent.width;
+            height: parent.height;
+            image-fit: contain;
+        }
+    }
+
+    Rectangle {
+        x: 6px;
+        y: 6px;
+        width: 18px;
+        height: 18px;
+        border-radius: Theme.r-sm;
+        background: Theme.well;
+        border-width: 1px;
+        border-color: root.scene.selected ? Theme.accent : Theme.line-strong;
+
+        if root.scene.selected: Icon {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            glyph: Glyph.check;
+            size: 12px;
+            tint: Theme.accent;
+        }
+    }
+
+    card-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            keys.focus();
+            SceneBrowser.toggle(root.index);
+        }
+    }
+    Tip {
+        text: I18n.t("sceneBrowser.selectTip");
+        active: card-touch.has-hover;
+    }
+    HorizontalLayout {
+        height: 28px;
+        y: parent.height - self.height;
+        padding-left: 6px;
+        padding-right: 2px;
+        Text {
+            text: root.scene.time-label;
+            overflow: elide;
+            min-width: 0px;
+            vertical-alignment: center;
+            color: Theme.fg;
+            font-size: Theme.fs-sm;
+        }
+        IconButton {
+            glyph: Glyph.eye;
+            label: I18n.t("sceneBrowser.previewTip");
+            accessible-role: button;
+            accessible-label: I18n.t("common.preview") + " " + root.scene.time-label;
+            accessible-description: self.label;
+            accessible-action-default => { SceneBrowser.preview(root.index); }
+            clicked => { SceneBrowser.preview(root.index); }
+        }
+    }
+}
+
+component SceneGrid inherits Rectangle {
+    property <length> gap: 8px;
+    property <int> columns: Math.max(1, Math.floor((root.width + root.gap) / (152px + root.gap)));
+    property <length> card-width: (root.width - (root.columns - 1) * root.gap) / root.columns;
+    property <length> card-height: root.card-width * 9 / 16 + 28px;
+    property <int> rows: Math.ceil(SceneBrowser.rows.length / root.columns);
+    height: Math.max(0px, root.rows * (root.card-height + root.gap) - root.gap);
+
+    for row[index] in SceneBrowser.rows: SceneCard {
+        scene: row;
+        index: index;
+        x: Math.mod(index, root.columns) * (root.card-width + root.gap);
+        y: Math.floor(index / root.columns) * (root.card-height + root.gap);
+        width: root.card-width;
+        height: root.card-height;
+    }
+}
+
+export component SceneBrowserPane inherits VerticalLayout {
+    padding: 8px;
+    spacing: 8px;
+
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: I18n.t("sceneBrowser.title");
+            color: Theme.fg;
+            font-size: Theme.fs-lg;
+            font-weight: Theme.weight-title;
+            vertical-alignment: center;
+        }
+        Text {
+            text: SceneBrowser.name;
+            color: Theme.fg-muted;
+            min-width: 0px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        IconButton {
+            glyph: Glyph.close;
+            label: I18n.t("sceneBrowser.closeTip");
+            accessible-role: button;
+            accessible-label: self.label;
+            accessible-action-default => { SceneBrowser.close(); }
+            clicked => { SceneBrowser.close(); }
+        }
+    }
+
+    if SceneBrowser.busy: Text {
+        text: I18n.t("sceneBrowser.scanning");
+        color: Theme.fg-muted;
+        wrap: word-wrap;
+    }
+
+    if SceneBrowser.error != "": Text {
+        text: SceneBrowser.error;
+        color: Theme.danger;
+        wrap: word-wrap;
+    }
+
+    PaneScroll {
+        vertical-stretch: 1;
+        VerticalLayout {
+            padding-right: 8px;
+            SceneGrid {}
+        }
+    }
+
+    if SceneBrowser.rows.length > 0: Button {
+        block: true;
+        primary: true;
+        label: SceneBrowser.selected-count > 0
+            ? I18n.t1("sceneBrowser.insertCount", SceneBrowser.selected-count)
+            : I18n.t("sceneBrowser.insert");
+        tip: I18n.t("sceneBrowser.insertTip");
+        accessible-role: button;
+        accessible-label: self.label;
+        accessible-description: self.tip;
+        accessible-enabled: self.enabled;
+        accessible-action-default => { if (SceneBrowser.selected-count > 0) { SceneBrowser.insert(); } }
+        enabled: SceneBrowser.selected-count > 0;
+        clicked => { SceneBrowser.insert(); }
+    }
+}

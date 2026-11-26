@@ -6,7 +6,8 @@ import { Theme } from "../theme/theme.slint";
 import { NumberField } from "../primitives/number-field.slint";
 import { Glyph, Icon } from "../icons.slint";
 import { Button, DialogSection, Field, Progress, Sheet } from "../primitives/modal.slint";
-import { IconButton } from "../primitives/panel.slint";
+import { FocusRing } from "../primitives/focus-ring.slint";
+import { Tip } from "../primitives/tooltip.slint";
 import { SegmentedControl } from "../primitives/segmented-control.slint";
 import { ColorPicker } from "../primitives/color-picker.slint";
 import { Fmt } from "../util.slint";
@@ -86,6 +87,9 @@ export struct SettingsData {
     gpu: bool,
     /// there is a software rasteriser to draw on instead: Windows, Linux
     gpu-switchable: bool,
+    /// the log goes to the system's share sheet, not to a folder shown:
+    /// Android
+    shares-log: bool,
     /// the magnetic timeline: deleting and trimming close the gap
     magnetic: bool,
     /// where model downloads look first: automatic, Concat's mirror,
@@ -134,6 +138,54 @@ export struct SettingsData {
     /// is. A key pressed while this is set binds instead of dispatching,
     /// and Escape puts it back to "".
     capturing: string,
+}
+
+component SettingsFocus inherits FocusScope {
+    callback activate();
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            root.activate();
+            return EventResult.accept;
+        }
+        return EventResult.reject;
+    }
+}
+
+component SettingsButton inherits Button {
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.tip;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) { root.clicked(); }
+    }
+    forward-focus: focus;
+
+    focus := SettingsFocus {
+        enabled: root.enabled;
+        activate => { root.clicked(); }
+    }
+    FocusRing { active: focus.has-focus; }
+
+    if !root.enabled: TouchArea {
+        Tip { text: root.tip; active: parent.has-hover; }
+    }
+}
+
+component SettingsHelp inherits TouchArea {
+    in property <string> label;
+    in property <string> tip;
+
+    accessible-role: groupbox;
+    accessible-label: root.label;
+    accessible-description: root.tip;
+
+    @children
+    Tip {
+        text: root.tip;
+        active: root.has-hover;
+    }
 }
 
 // Accuracy, as pips rather than a number: five little bars say "third of five"
@@ -187,8 +239,9 @@ component ModelMeta inherits HorizontalLayout {
         alignment: center;
         horizontal-stretch: 0;
 
-        if root.model.downloading: Button {
+        if root.model.downloading: SettingsButton {
             label: I18n.t("common.cancel");
+            tip: I18n.t("settings.modelCancelTip");
             glyph: Glyph.close;
             ghost: true;
             clicked => { root.cancel(); }
@@ -196,16 +249,18 @@ component ModelMeta inherits HorizontalLayout {
 
         // The bin alone, as a file list's delete is: the row already
         // says which model, and the word made the button the row's loudest.
-        if !root.model.downloading && root.model.installed: Button {
+        if !root.model.downloading && root.model.installed: SettingsButton {
             label: I18n.t("common.delete");
+            tip: I18n.t("settings.modelRemoveTip");
             glyph: Glyph.trash;
             square: true;
             danger: true;
             clicked => { root.remove(); }
         }
 
-        if !root.model.downloading && !root.model.installed: Button {
+        if !root.model.downloading && !root.model.installed: SettingsButton {
             label: I18n.t("settings.download");
+            tip: I18n.t("settings.modelDownloadTip");
             glyph: Glyph.import;
             clicked => { root.download(); }
         }
@@ -233,6 +288,21 @@ component ModelRow inherits Rectangle {
     // An absent model is dimmer than an installed one, but not so dim it
     // stops being readable — it is a thing you can have, not a thing denied.
     opacity: (root.model.installed || root.model.downloading) ? 1.0 : 0.86;
+
+    property <string> choice-tip: root.model.installed ? I18n.t("settings.modelUseHint")
+        : root.model.downloading ? I18n.t("settings.modelDownloadingHint")
+        : I18n.t("settings.modelInstallHint");
+
+    accessible-role: groupbox;
+    accessible-label: root.model.name;
+    accessible-description: root.choice-tip;
+    forward-focus: focus;
+
+    focus := SettingsFocus {
+        enabled: root.model.installed;
+        activate => { root.activated(); }
+    }
+    FocusRing { active: focus.has-focus; }
 
     animate background, border-color { duration: 120ms; easing: cubic-bezier(0.4, 0, 0.2, 1); }
 
@@ -271,6 +341,16 @@ component ModelRow inherits Rectangle {
                         duration: 120ms;
                         easing: cubic-bezier(0.4, 0, 0.2, 1);
                     }
+
+                    if root.model.installed: Rectangle {
+                        accessible-role: radio-button;
+                        accessible-label: root.model.name;
+                        accessible-description: root.choice-tip;
+                        accessible-checkable: true;
+                        accessible-checked: root.model.active;
+                        accessible-action-default => { root.activated(); }
+                        forward-focus: focus;
+                    }
                 }
             }
 
@@ -282,13 +362,24 @@ component ModelRow inherits Rectangle {
                     spacing: 6px;
                     alignment: start;
 
-                    Text {
-                        text: root.model.name;
-                        color: Theme.fg;
-                        font-size: Theme.fs;
-                        font-weight: Theme.weight-title;
-                        vertical-alignment: center;
-                        overflow: elide;
+                    SettingsHelp {
+                        preferred-width: model-name.preferred-width;
+                        min-height: model-name.preferred-height;
+                        label: root.model.name;
+                        tip: root.choice-tip;
+                        mouse-cursor: root.model.installed ? pointer : default;
+                        clicked => {
+                            if (root.model.installed) { root.activated(); }
+                        }
+
+                        model-name := Text {
+                            text: root.model.name;
+                            color: Theme.fg;
+                            font-size: Theme.fs;
+                            font-weight: Theme.weight-title;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
                     }
 
                     if root.model.active: Rectangle {
@@ -383,15 +474,17 @@ component ModelRow inherits Rectangle {
                 spacing: 6px;
                 alignment: start;
 
-                Button {
+                SettingsButton {
                     label: I18n.t("settings.downloadInBrowser");
+                    tip: I18n.t("settings.modelBrowserTip");
                     glyph: Glyph.arrow-up-right;
                     ghost: true;
                     clicked => { root.open-link(); }
                 }
 
-                Button {
+                SettingsButton {
                     label: I18n.t("settings.chooseFile");
+                    tip: I18n.t("settings.modelFileTip");
                     glyph: Glyph.folder;
                     ghost: true;
                     clicked => { root.choose-file(); }
@@ -410,6 +503,7 @@ component AccentSwatch inherits Rectangle {
     in property <color> colour;
     /// The colour's name, for whoever cannot see it.
     in property <string> label;
+    in property <string> tip;
     in property <bool> chosen;
     /// Not a colour yet: the dot wears a plus, cut out in the panel's
     /// colour, to say it is where a colour would go.
@@ -427,6 +521,14 @@ component AccentSwatch inherits Rectangle {
 
     accessible-role: button;
     accessible-label: root.label;
+    accessible-description: root.tip;
+    accessible-checkable: true;
+    accessible-checked: root.chosen;
+    accessible-action-default => { root.clicked(); }
+    forward-focus: focus;
+
+    focus := SettingsFocus { activate => { root.clicked(); } }
+    FocusRing { active: focus.has-focus; radius: 13px; }
 
     animate border-color { duration: 120ms; easing: cubic-bezier(0.4, 0, 0.2, 1); }
 
@@ -450,14 +552,26 @@ component AccentSwatch inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
+    Tip { text: root.tip; active: touch.has-hover; }
 }
 
 component PageTab inherits Rectangle {
     in property <string> label;
+    in property <string> tip;
     in property <Glyph> glyph;
     in property <bool> current;
 
     callback clicked();
+
+    accessible-role: tab;
+    accessible-label: root.label;
+    accessible-description: root.tip;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.current;
+    accessible-action-default => { root.clicked(); }
+    forward-focus: focus;
+    focus := SettingsFocus { activate => { root.clicked(); } }
+    FocusRing { active: focus.has-focus; radius: Theme.r-sm; }
 
     height: 30px;
     border-radius: Theme.r-sm;
@@ -495,6 +609,7 @@ component PageTab inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
+    Tip { text: root.tip; active: touch.has-hover; }
 }
 
 // One system fact: muted label left, value right. Lifted from the Details
@@ -553,6 +668,18 @@ component ShortcutRow inherits Rectangle {
 
     callback pressed();
     callback reset();
+    property <bool> reset-hovered;
+    property <string> tip: I18n.t("shortcuts.rebindHint");
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.tip;
+    accessible-value: root.keys;
+    accessible-action-default => { root.pressed(); }
+    forward-focus: focus;
+
+    focus := SettingsFocus { activate => { root.pressed(); } }
+    FocusRing { active: focus.has-focus; radius: Theme.r-sm; }
 
     height: 30px;
     border-radius: Theme.r-sm;
@@ -630,13 +757,30 @@ component ShortcutRow inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                 }
 
+                accessible-role: button;
+                accessible-label: I18n.t("shortcuts.resetOne");
+                accessible-description: I18n.t("shortcuts.resetOneHint");
+                accessible-action-default => { root.reset(); }
+                forward-focus: reset-focus;
+
+                reset-focus := SettingsFocus { activate => { root.reset(); } }
+                FocusRing { active: reset-focus.has-focus; radius: Theme.r-sm; }
+
                 reset-touch := TouchArea {
                     mouse-cursor: pointer;
                     clicked => { root.reset(); }
+                    changed has-hover => { root.reset-hovered = self.has-hover; }
+                }
+                Tip {
+                    text: I18n.t("shortcuts.resetOneHint");
+                    active: reset-touch.has-hover;
                 }
             }
         }
-
+    }
+    Tip {
+        text: root.tip;
+        active: touch.has-hover && (!root.custom || !root.reset-hovered);
     }
 }
 
@@ -735,18 +879,37 @@ export component SettingsDialog inherits Sheet {
     /// and a model's row puts its controls under its name.
     property <bool> compact: root.width < 600px;
 
+    property <[string]> page-tips: [
+        I18n.t("settings.generalPageHint"),
+        I18n.t("settings.appearancePageHint"),
+        I18n.t("settings.transcriberPageHint"),
+        I18n.t("settings.speechPageHint"),
+        I18n.t("settings.automationPageHint"),
+        I18n.t("settings.aboutPageHint"),
+        I18n.t("settings.versionPageHint"),
+        I18n.t("settings.shortcutsPageHint"),
+    ];
+
     /// Every page, in order; the column and the row of tabs are drawn from
-    /// the same list. `desk` is a page a phone does not show.
-    property <[{label: string, glyph: Glyph, page: int, desk: bool}]> page-list: [
-        {label: I18n.t("settings.general"), glyph: Glyph.settings, page: 0, desk: false},
-        {label: I18n.t("settings.appearance"), glyph: Glyph.sun, page: 1, desk: false},
+    /// the same list. A phone's list leaves out the pages a phone does not
+    /// show, rather than hiding their tabs: a tab that is not `visible`
+    /// still has its place in the row, and the row showed three gaps (#718).
+    property <[{label: string, glyph: Glyph, page: int}]> page-list: root.phone ? [
+        {label: I18n.t("settings.general"), glyph: Glyph.settings, page: 0},
+        {label: I18n.t("settings.appearance"), glyph: Glyph.sun, page: 1},
+        {label: I18n.t("common.transcriber"), glyph: Glyph.waveform, page: 2},
+        {label: I18n.t("common.speech"), glyph: Glyph.music, page: 3},
+        {label: I18n.t("settings.about"), glyph: Glyph.sparkle, page: 5},
+    ] : [
+        {label: I18n.t("settings.general"), glyph: Glyph.settings, page: 0},
+        {label: I18n.t("settings.appearance"), glyph: Glyph.sun, page: 1},
         // The keys: a desk's, since a phone has no keyboard to bind.
-        {label: I18n.t("settings.shortcuts"), glyph: Glyph.keyboard, page: 7, desk: true},
-        {label: I18n.t("common.transcriber"), glyph: Glyph.waveform, page: 2, desk: false},
-        {label: I18n.t("common.speech"), glyph: Glyph.music, page: 3, desk: false},
-        {label: I18n.t("settings.automation"), glyph: Glyph.lock, page: 4, desk: true},
-        {label: I18n.t("settings.version"), glyph: Glyph.tag, page: 6, desk: true},
-        {label: I18n.t("settings.about"), glyph: Glyph.sparkle, page: 5, desk: false},
+        {label: I18n.t("settings.shortcuts"), glyph: Glyph.keyboard, page: 7},
+        {label: I18n.t("common.transcriber"), glyph: Glyph.waveform, page: 2},
+        {label: I18n.t("common.speech"), glyph: Glyph.music, page: 3},
+        {label: I18n.t("settings.automation"), glyph: Glyph.lock, page: 4},
+        {label: I18n.t("settings.version"), glyph: Glyph.tag, page: 6},
+        {label: I18n.t("settings.about"), glyph: Glyph.sparkle, page: 5},
     ];
 
     /// The launch screen is up: no project, so no dispatch. The capture
@@ -856,9 +1019,9 @@ export component SettingsDialog inherits Sheet {
                         alignment: start;
 
                         for entry in root.page-list: PageTab {
-                            visible: !(entry.desk && root.phone);
                             min-width: self.preferred-width;
                             label: entry.label;
+                            tip: root.page-tips[entry.page];
                             glyph: entry.glyph;
                             current: root.data.tab == entry.page;
                             clicked => { root.page-changed(entry.page); }
@@ -882,8 +1045,8 @@ export component SettingsDialog inherits Sheet {
                     alignment: start;
 
                     for entry in root.page-list: PageTab {
-                        visible: !(entry.desk && root.phone);
                         label: entry.label;
+                        tip: root.page-tips[entry.page];
                         glyph: entry.glyph;
                         current: root.data.tab == entry.page;
                         clicked => { root.page-changed(entry.page); }
@@ -922,6 +1085,7 @@ export component SettingsDialog inherits Sheet {
                     ruled: false;
                     first: true;
                     title: I18n.t("settings.language");
+                    hint: I18n.t("settings.languageHint");
                     // Native names: whoever is stranded in a language they
                     // cannot read must still recognise their own in this list.
                     choices: root.languages;
@@ -978,11 +1142,19 @@ export component SettingsDialog inherits Sheet {
                     // folds away for every other choice.
                     open: root.data.download-source == 4;
 
-                    if root.data.download-source == 4: Field {
-                        value: root.data.download-base;
-                        placeholder: "https://models.example.com/concat";
-                        technical: true;
-                        edited(text) => { root.download-base-edited(text); }
+                    if root.data.download-source == 4: SettingsHelp {
+                        label: I18n.t("settings.customUrl");
+                        tip: I18n.t("settings.downloadBaseHint");
+                        min-height: 28px;
+                        max-height: 28px;
+                        horizontal-stretch: 1;
+
+                        Field {
+                            value: root.data.download-base;
+                            placeholder: "https://models.example.com/concat";
+                            technical: true;
+                            edited(text) => { root.download-base-edited(text); }
+                        }
                     }
                 }
 
@@ -1099,11 +1271,23 @@ export component SettingsDialog inherits Sheet {
                     ruled: false;
                     first: root.phone;
                     title: I18n.t("settings.theme");
+                    hint: I18n.t("settings.themeHint");
 
-                    SegmentedControl {
-                        options: [I18n.t("settings.dark"), I18n.t("settings.light")];
-                        current: Theme.dark ? 0 : 1;
-                        changed(index) => { root.theme-changed(index == 0); }
+                    SettingsHelp {
+                        label: I18n.t("settings.theme");
+                        tip: I18n.t("settings.themeHint");
+                        horizontal-stretch: 1;
+                        min-height: theme.preferred-height;
+
+                        theme := SegmentedControl {
+                            accessible-role: radio-group;
+                            accessible-label: I18n.t("settings.theme");
+                            accessible-description: I18n.t("settings.themeHint");
+                            accessible-value: Theme.dark ? I18n.t("settings.dark") : I18n.t("settings.light");
+                            options: [I18n.t("settings.dark"), I18n.t("settings.light")];
+                            current: Theme.dark ? 0 : 1;
+                            changed(index) => { root.theme-changed(index == 0); }
+                        }
                     }
                 }
 
@@ -1117,6 +1301,7 @@ export component SettingsDialog inherits Sheet {
                 DialogSection {
                     ruled: false;
                     title: I18n.t("settings.accent");
+                    hint: I18n.t("settings.accentHint");
 
                     HorizontalLayout {
                         spacing: 6px;
@@ -1125,6 +1310,7 @@ export component SettingsDialog inherits Sheet {
                         for name[index] in Theme.accent-names: AccentSwatch {
                             colour: Theme.accent-of(index);
                             label: root.accent-labels[index];
+                            tip: I18n.t1("settings.accentSwatchTip", root.accent-labels[index]);
                             chosen: Theme.accent-choice == index;
                             clicked => { root.accent-changed(index); }
                         }
@@ -1142,6 +1328,7 @@ export component SettingsDialog inherits Sheet {
                             AccentSwatch {
                                 colour: Theme.accent-is-custom ? Theme.accent-custom : Theme.fg-dim;
                                 label: I18n.t("common.custom");
+                                tip: I18n.t("settings.customAccentTip");
                                 chosen: Theme.accent-is-custom;
                                 blank: !Theme.accent-is-custom;
                                 clicked => { picker.show(); }
@@ -1207,6 +1394,7 @@ export component SettingsDialog inherits Sheet {
                         for name[index] in Theme.accent-names: AccentSwatch {
                             colour: index == 0 ? Theme.playhead-default : Theme.accent-of(index);
                             label: root.accent-labels[index];
+                            tip: I18n.t1("settings.playheadSwatchTip", root.accent-labels[index]);
                             chosen: Theme.playhead-choice == index;
                             clicked => { root.playhead-chosen(index); }
                         }
@@ -1218,6 +1406,7 @@ export component SettingsDialog inherits Sheet {
                             AccentSwatch {
                                 colour: Theme.playhead-is-custom ? Theme.playhead-custom : Theme.fg-dim;
                                 label: I18n.t("common.custom");
+                                tip: I18n.t("settings.customPlayheadTip");
                                 chosen: Theme.playhead-is-custom;
                                 blank: !Theme.playhead-is-custom;
                                 clicked => { playhead-picker.show(); }
@@ -1271,6 +1460,7 @@ export component SettingsDialog inherits Sheet {
                     ruled: false;
                     first: true;
                     title: I18n.t("settings.models");
+                    hint: I18n.t("settings.transcriberPageHint");
 
                     for model in root.transcribers: ModelRow {
                         compact: root.compact;
@@ -1318,6 +1508,7 @@ export component SettingsDialog inherits Sheet {
                     ruled: false;
                     first: true;
                     title: I18n.t("settings.voices");
+                    hint: I18n.t("settings.speechPageHint");
 
                     for model in root.voices: ModelRow {
                         compact: root.compact;
@@ -1403,12 +1594,20 @@ export component SettingsDialog inherits Sheet {
                         HorizontalLayout {
                             spacing: 0;
 
-                            Field {
-                                value: root.data.server-host;
-                                placeholder: "127.0.0.1";
-                                technical: true;
-                                radius-right: 0px;
-                                edited(text) => { root.server-host-edited(text); }
+                            SettingsHelp {
+                                label: I18n.t("settings.serverHost");
+                                tip: I18n.t("settings.serverHostHint");
+                                min-height: 28px;
+                                max-height: 28px;
+                                horizontal-stretch: 1;
+
+                                Field {
+                                    value: root.data.server-host;
+                                    placeholder: "127.0.0.1";
+                                    technical: true;
+                                    radius-right: 0px;
+                                    edited(text) => { root.server-host-edited(text); }
+                                }
                             }
 
                             Text {
@@ -1421,16 +1620,23 @@ export component SettingsDialog inherits Sheet {
                                 vertical-alignment: center;
                             }
 
-                            NumberField {
+                            SettingsHelp {
+                                label: I18n.t("settings.serverPort");
+                                tip: I18n.t("settings.serverPortHint");
+                                min-height: 28px;
+                                max-height: 28px;
                                 width: 72px;
                                 horizontal-stretch: 0;
-                                radius-left: 0px;
-                                value: root.data.server-port;
-                                minimum: 0;
-                                maximum: 65535;
-                                step: 1;
-                                precision: 0;
-                                changed(port) => { root.server-port-edited(port); }
+
+                                NumberField {
+                                    radius-left: 0px;
+                                    value: root.data.server-port;
+                                    minimum: 0;
+                                    maximum: 65535;
+                                    step: 1;
+                                    precision: 0;
+                                    changed(port) => { root.server-port-edited(port); }
+                                }
                             }
                         }
                     }
@@ -1455,8 +1661,9 @@ export component SettingsDialog inherits Sheet {
                             }
                             VerticalLayout {
                                 alignment: center;
-                                Button {
+                                SettingsButton {
                                     label: I18n.t("settings.thisComputerOnly");
+                                    tip: I18n.t("settings.thisComputerOnlyHint");
                                     clicked => { root.server-host-edited("127.0.0.1"); }
                                 }
                             }
@@ -1481,25 +1688,35 @@ export component SettingsDialog inherits Sheet {
                         HorizontalLayout {
                             spacing: 6px;
 
-                            Field {
-                                value: root.data.server-token;
-                                placeholder: I18n.t("common.none");
-                                technical: true;
-                                secret: !root.token-shown;
-                                edited(text) => { root.server-token-edited(text); }
+                            SettingsHelp {
+                                label: I18n.t("settings.token");
+                                tip: I18n.t("settings.tokenEntryHint");
+                                min-height: 28px;
+                                max-height: 28px;
+                                horizontal-stretch: 1;
+
+                                Field {
+                                    value: root.data.server-token;
+                                    placeholder: I18n.t("common.none");
+                                    technical: true;
+                                    secret: !root.token-shown;
+                                    edited(text) => { root.server-token-edited(text); }
+                                }
                             }
 
-                            Button {
+                            SettingsButton {
                                 square: true;
                                 glyph: root.token-shown ? Glyph.eye-off : Glyph.eye;
                                 label: root.token-shown ? I18n.t("settings.hideTheToken") : I18n.t("settings.showTheToken");
+                                tip: I18n.t("settings.tokenVisibilityHint");
                                 clicked => { root.token-shown = !root.token-shown; }
                             }
 
-                            Button {
+                            SettingsButton {
                                 square: true;
                                 glyph: root.token-copied ? Glyph.check : Glyph.copy;
                                 label: I18n.t("settings.copyTheToken");
+                                tip: I18n.t("settings.tokenCopyHint");
                                 enabled: root.data.server-token != "";
                                 clicked => {
                                     token-copy.select-all();
@@ -1508,15 +1725,17 @@ export component SettingsDialog inherits Sheet {
                                 }
                             }
 
-                            Button {
+                            SettingsButton {
                                 glyph: Glyph.reset;
                                 label: I18n.t("settings.newToken");
+                                tip: I18n.t("settings.tokenRotateHint");
                                 clicked => { root.server-token-generated(); }
                             }
                         }
 
                         // What Copy copies from: the token, out of sight.
                         token-copy := TextInput {
+                            accessible-role: none;
                             x: 0;
                             y: 0;
                             width: 1px;
@@ -1544,6 +1763,7 @@ export component SettingsDialog inherits Sheet {
                     ruled: false;
                     first: true;
                     title: I18n.t("settings.version");
+                    hint: I18n.t("settings.versionPageHint");
 
                     VerticalLayout {
                         spacing: 8px;
@@ -1565,10 +1785,11 @@ export component SettingsDialog inherits Sheet {
                         HorizontalLayout {
                             alignment: start;
 
-                            Button {
+                            SettingsButton {
                                 label: root.data.checking
                                     ? I18n.t("settings.checkingForUpdates")
                                     : I18n.t("settings.checkForUpdates");
+                                tip: I18n.t("settings.checkUpdatesHint");
                                 enabled: !root.data.checking;
                                 clicked => { root.check-updates(); }
                             }
@@ -1578,13 +1799,13 @@ export component SettingsDialog inherits Sheet {
 
                 if root.data.auto-updates: DialogSection {
                     ruled: false;
-                    title: "Автоматические обновления";
-                    hint: "Опубликованные версии проверяются при запуске и каждые шесть часов. Приложение перезапускается после сохранения проекта, когда работа завершена.";
+                    title: I18n.t("settings.automaticUpdates");
+                    hint: I18n.t("settings.automaticUpdatesHint");
 
                     VerticalLayout {
                         spacing: 8px;
                         Text {
-                            text: "Навык: " + root.data.skill-version;
+                            text: I18n.t1("settings.skillVersionLine", root.data.skill-version);
                             color: Theme.fg;
                             font-size: Theme.fs;
                             wrap: word-wrap;
@@ -1616,20 +1837,29 @@ export component SettingsDialog inherits Sheet {
                                 details: root.version-details;
                                 current: root.data.version-choice;
                                 placeholder: I18n.t("settings.noReleasesYet");
+                                tip: I18n.t("settings.selectVersionHint");
+                                accessible-role: combobox;
+                                accessible-label: I18n.t("settings.switchVersion");
+                                accessible-description: self.tip;
+                                accessible-value: root.versions[root.data.version-choice];
+                                accessible-enabled: self.enabled;
+                                accessible-action-default => { self.reveal(); }
                                 enabled: root.versions.length > 0 && !root.data.installing;
                                 changed(index) => { root.version-chosen(index); }
                             }
 
-                            if !root.data.installing: Button {
+                            if !root.data.installing: SettingsButton {
                                 label: I18n.t("settings.install");
+                                tip: I18n.t("settings.installVersionHint");
                                 glyph: Glyph.import;
                                 primary: true;
                                 enabled: root.data.can-install;
                                 clicked => { root.install-version(); }
                             }
 
-                            if root.data.installing: Button {
+                            if root.data.installing: SettingsButton {
                                 label: I18n.t("common.cancel");
+                                tip: I18n.t("settings.cancelInstallHint");
                                 glyph: Glyph.close;
                                 ghost: true;
                                 enabled: root.data.can-cancel-install;
@@ -1718,18 +1948,24 @@ export component SettingsDialog inherits Sheet {
                         // The other half of a report: the block says what
                         // this machine is, the log says what the app did on
                         // it. A run writes one file, and the last ten runs
-                        // are in the folder this opens.
-                        IconButton {
-                            glyph: Glyph.folder;
-                            label: I18n.t("settings.showTheLog");
-                            icon-size: 13px;
+                        // are in the folder this opens. Android has no
+                        // folder to show, and hands the log to its share
+                        // sheet instead.
+                        SettingsButton {
+                            glyph: root.data.shares-log ? Glyph.export : Glyph.folder;
+                            label: root.data.shares-log ? I18n.t("settings.shareTheLog") : I18n.t("settings.showTheLog");
+                            tip: root.data.shares-log ? I18n.t("settings.shareLogHint") : I18n.t("settings.showLogHint");
+                            square: true;
+                            ghost: true;
                             clicked => { root.show-log(); }
                         }
 
-                        IconButton {
+                        SettingsButton {
                             glyph: Glyph.copy;
                             label: I18n.t("settings.copySystemInformation");
-                            icon-size: 13px;
+                            tip: I18n.t("settings.copyInfoHint");
+                            square: true;
+                            ghost: true;
                             // Cleared again straight away: the selection is
                             // the mechanism, not something the reader asked
                             // for, and leaving it set would light up a block
@@ -1788,8 +2024,9 @@ export component SettingsDialog inherits Sheet {
                     // Back to how they all ship, in one press: the escape
                     // hatch a page of rebinds needs when the keys have gone
                     // too far to walk back a row at a time.
-                    Button {
+                    SettingsButton {
                         label: I18n.t("shortcuts.resetAll");
+                        tip: I18n.t("shortcuts.resetAllHint");
                         glyph: Glyph.reset;
                         ghost: true;
                         clicked => { root.shortcut-reset-all(); }
@@ -1821,7 +2058,7 @@ export component SettingsDialog inherits Sheet {
             }
             let handled = Editor.key-chord(event.text, event.modifiers.shift,
                 event.modifiers.alt, event.modifiers.control,
-                event.modifiers.meta, root.on-start);
+                event.modifiers.meta, event.repeat, root.on-start);
             if (root.data.capturing == "") {
                 // The key was the one — bound, or Escape declining it —
                 // and the row is no longer listening.

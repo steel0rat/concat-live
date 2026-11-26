@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Concat Live contributors
+
+import { I18n } from "../i18n.slint";
+import { Theme } from "../theme/theme.slint";
+import { Glyph } from "../icons.slint";
+import { DialogSection, Modal } from "../primitives/modal.slint";
+import { ChatAction } from "../workspace/agent.slint";
+
+export struct StemTrackData {
+    id: string,
+    label: string,
+    role: int,
+}
+
+export global StemExport {
+    in property <bool> available;
+    in property <bool> open;
+    in property <bool> busy;
+    in property <bool> cancelled;
+    in property <bool> can-export;
+    in property <string> progress;
+    in property <string> error;
+    in property <[StemTrackData]> tracks;
+    callback open-library();
+    callback close();
+    callback choose-destination();
+    callback assign(track: string, role: int);
+    callback cancel();
+}
+
+export component StemsDialog inherits Modal {
+    open: StemExport.open;
+    title: I18n.t("stems.title");
+    glyph: Glyph.volume;
+    surface-width: 490px;
+    dismissable: !StemExport.busy;
+    closed => { StemExport.close(); }
+
+    property <[string]> role-labels: [
+        I18n.t("stems.skip"),
+        I18n.t("stems.voice"),
+        I18n.t("stems.music"),
+        I18n.t("stems.effects"),
+    ];
+    property <[string]> role-tips: [
+        I18n.t("stems.skipTip"),
+        I18n.t("stems.voiceTip"),
+        I18n.t("stems.musicTip"),
+        I18n.t("stems.effectsTip"),
+    ];
+
+    VerticalLayout {
+        DialogSection {
+            first: true;
+            title: I18n.t("stems.groups");
+            Text {
+                text: StemExport.tracks.length > 0 ? I18n.t("stems.howTo") : I18n.t("stems.empty");
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+            }
+            for track in StemExport.tracks: VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: track.label;
+                    color: Theme.fg-muted;
+                    font-size: Theme.fs;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 4px;
+                    for option[index] in root.role-labels: ChatAction {
+                        label: option;
+                        accessible-name: I18n.t2("stems.assignTrack", track.label, option);
+                        tip: root.role-tips[index];
+                        ghost: false;
+                        primary: track.role == index;
+                        enabled: !StemExport.busy;
+                        horizontal-stretch: 1;
+                        accessible-role: radio-button;
+                        accessible-checkable: true;
+                        accessible-checked: track.role == index;
+                        clicked => { StemExport.assign(track.id, index); }
+                    }
+                }
+            }
+            if StemExport.error != "": Text {
+                text: StemExport.error;
+                color: Theme.danger;
+                font-size: Theme.fs-sm;
+                wrap: word-wrap;
+            }
+            if StemExport.progress != "": Text {
+                text: StemExport.progress;
+                color: Theme.fg;
+                font-size: Theme.fs-sm;
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                if StemExport.busy: ChatAction {
+                    label: I18n.t("common.cancel");
+                    tip: I18n.t("stems.cancelTip");
+                    ghost: false;
+                    enabled: !StemExport.cancelled;
+                    clicked => { StemExport.cancel(); }
+                }
+                if !StemExport.busy: ChatAction {
+                    label: I18n.t("stems.save");
+                    tip: I18n.t("stems.saveTip");
+                    ghost: false;
+                    primary: true;
+                    enabled: StemExport.can-export;
+                    clicked => { StemExport.choose-destination(); }
+                }
+            }
+        }
+    }
+}

@@ -120,21 +120,27 @@ fn locate() -> Result<(SocketAddr, String), String> {
 /// never a mutation whose reply could have been lost after it was applied.
 pub struct Window {
     client: Client,
+    client_id: Option<String>,
 }
 
 impl Window {
     /// Connects to the window's server.
     pub fn find() -> Result<Window, String> {
+        Self::find_as(std::env::var(crate::WINDOW_CLIENT_ID_ENV).ok())
+    }
+
+    fn find_as(client_id: Option<String>) -> Result<Window, String> {
         let (address, token) = locate()?;
-        let client = Client::connect(address, &token, PATIENCE)
+        let client = Client::connect_with_id(address, &token, PATIENCE, client_id.as_deref())
             .map_err(|error| format!("{error} (if the window has closed, its listing is stale)"))?;
-        Ok(Window { client })
+        Ok(Window { client, client_id })
     }
 
     /// Connects to the server at `address` with `token`.
     pub fn connect(address: SocketAddr, token: &str) -> Result<Window, String> {
         Ok(Window {
             client: Client::connect(address, token, PATIENCE)?,
+            client_id: None,
         })
     }
 
@@ -171,7 +177,8 @@ impl Window {
 
 impl Backend for Window {
     fn call(&mut self, request: Request) -> Result<Value, ApiError> {
-        self.call_with_reconnect(request, Window::find)
+        let client_id = self.client_id.clone();
+        self.call_with_reconnect(request, || Self::find_as(client_id))
     }
 
     fn describe(&self) -> Value {

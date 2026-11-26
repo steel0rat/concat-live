@@ -43,8 +43,15 @@ pub struct Source {
 
 /// The project as it is, with its active timeline holding only `media_id`
 /// from zero: what the source preview draws and plays.
-fn scratch(project: &Project, media_id: &str) -> Option<Project> {
+fn scratch(project: &Project, media_id: &str, duration: Option<f64>) -> Option<Project> {
     let mut scratch = project.clone();
+    if let Some(duration) = duration {
+        scratch
+            .media
+            .iter_mut()
+            .find(|item| item.id == media_id)?
+            .duration = Some(duration);
+    }
     let timeline = scratch.active_mut();
     timeline.clips.clear();
     let track_id = timeline.tracks.first()?.id.clone();
@@ -66,9 +73,19 @@ impl Studio {
     /// A card was clicked. A sound plays, or pauses when it is the one
     /// playing; a picture goes on the monitor, paused at its start.
     pub fn preview_media(&mut self, media_id: &str, row: i32) {
+        self.preview_media_with_duration(media_id, row, None);
+    }
+
+    pub(crate) fn preview_media_with_duration(
+        &mut self,
+        media_id: &str,
+        row: i32,
+        duration: Option<f64>,
+    ) {
         if let Some(source) = self.source.as_ref()
             && source.media_id == media_id
             && source.card.is_empty()
+            && duration.is_none_or(|seconds| source.duration == seconds)
         {
             if source.kind == MediaKind::Audio {
                 self.source_toggle();
@@ -85,15 +102,11 @@ impl Studio {
         else {
             return;
         };
-        let Some(scratch) = scratch(self.project(), media_id) else {
+        let Some(scratch) = scratch(self.project(), media_id, duration) else {
             return;
         };
         // The timeline stops: the speakers and the monitor are the
         // source's now.
-        self.pause();
-        if let Some(old) = self.source.take() {
-            old.timer.stop();
-        }
         let clips = Arc::new(concat_export::flatten::flatten_timeline_in(
             &scratch,
             None,
@@ -104,26 +117,22 @@ impl Studio {
             .clips
             .first()
             .map_or(0.0, |clip| clip.duration);
-        self.host
-            .playback
-            .set_clips(project_dir, crate::studio::audio_specs(&clips));
-        self.host.playback.seek(0.0);
-        self.source = Some(Source {
-            media_id: media_id.to_owned(),
-            name: media.name.clone(),
-            kind: media.kind,
-            row,
-            card: String::new(),
-            clips,
-            duration,
-            time: 0.0,
-            playing: false,
-            timer: slint::Timer::default(),
-        });
-        if media.kind == MediaKind::Audio {
-            self.source_toggle();
-        }
-        self.request_preview();
+        self.install_source(
+            project_dir,
+            Source {
+                media_id: media_id.to_owned(),
+                name: media.name.clone(),
+                kind: media.kind,
+                row,
+                card: String::new(),
+                clips,
+                duration,
+                time: 0.0,
+                playing: false,
+                timer: slint::Timer::default(),
+            },
+            media.kind == MediaKind::Audio,
+        );
     }
 
     /// A card on the Audio page was clicked: its sound plays through the
@@ -137,19 +146,32 @@ impl Studio {
             self.source_toggle();
             return;
         }
-        let Some(project_dir) = self
-            .session
-            .as_ref()
-            .map(|session| std::path::PathBuf::from(session.path()))
-        else {
+        if self.session.is_none() {
             return;
-        };
+        }
         let summary = match concat_host::media::probe(&path.to_string_lossy()) {
             Ok(summary) => summary,
             Err(error) => {
                 self.notify(&crate::host::probe_error(&error), true);
                 return;
             }
+        };
+        self.preview_probed_file(card, name, summary, true);
+    }
+
+    pub(crate) fn preview_probed_file(
+        &mut self,
+        card: &str,
+        name: &str,
+        summary: concat_host::media::MediaSummary,
+        autoplay: bool,
+    ) {
+        let Some(project_dir) = self
+            .session
+            .as_ref()
+            .map(|session| std::path::PathBuf::from(session.path()))
+        else {
+            return;
         };
         // The scratch project with the file in its bin, under an id no
         // real item has, and the one clip cut from it.
@@ -167,13 +189,9 @@ impl Studio {
         .map(|outcome| outcome.created_id) else {
             return;
         };
-        let Some(scratch) = self::scratch(&scratch, &media_id) else {
+        let Some(scratch) = self::scratch(&scratch, &media_id, None) else {
             return;
         };
-        self.pause();
-        if let Some(old) = self.source.take() {
-            old.timer.stop();
-        }
         let clips = Arc::new(concat_export::flatten::flatten_timeline_in(
             &scratch,
             None,
@@ -184,23 +202,83 @@ impl Studio {
             .clips
             .first()
             .map_or(0.0, |clip| clip.duration);
+        self.install_source(
+            project_dir,
+            Source {
+                media_id,
+                name: name.to_owned(),
+                kind: summary.kind,
+                row: -1,
+                card: card.to_owned(),
+                clips,
+                duration,
+                time: 0.0,
+                playing: false,
+                timer: slint::Timer::default(),
+            },
+            autoplay,
+        );
+    }
+
+    /// Lends the monitor a clip variant already trimmed to the comparison interval.
+    pub(crate) fn preview_take(
+        &mut self,
+        scratch: &Project,
+        name: &str,
+        card: &str,
+        at: f64,
+        autoplay: bool,
+    ) -> bool {
+        let Some(project_dir) = self
+            .session
+            .as_ref()
+            .map(|session| std::path::PathBuf::from(session.path()))
+        else {
+            return false;
+        };
+        let Some(clip) = scratch.active().clips.first() else {
+            return false;
+        };
+        let Some(media) = scratch.media_by_id(&clip.media_id) else {
+            return false;
+        };
+        let clips = Arc::new(concat_export::flatten::flatten_timeline_in(
+            scratch,
+            None,
+            Some(&project_dir),
+        ));
+        self.install_source(
+            project_dir,
+            Source {
+                media_id: media.id.clone(),
+                name: name.to_owned(),
+                kind: media.kind,
+                row: -1,
+                card: card.to_owned(),
+                clips,
+                duration: clip.duration,
+                time: at.clamp(0.0, clip.duration),
+                playing: false,
+                timer: slint::Timer::default(),
+            },
+            autoplay,
+        );
+        true
+    }
+
+    fn install_source(&mut self, project_dir: std::path::PathBuf, source: Source, autoplay: bool) {
+        self.pause();
+        if let Some(old) = self.source.take() {
+            old.timer.stop();
+        }
         self.host
             .playback
-            .set_clips(project_dir, crate::studio::audio_specs(&clips));
-        self.host.playback.seek(0.0);
-        self.source = Some(Source {
-            media_id,
-            name: name.to_owned(),
-            kind: MediaKind::Audio,
-            row: -1,
-            card: card.to_owned(),
-            clips,
-            duration,
-            time: 0.0,
-            playing: false,
-            timer: slint::Timer::default(),
-        });
-        self.source_toggle();
+            .set_clips(project_dir, crate::studio::audio_specs(&source.clips));
+        self.host.playback.seek(source.time);
+        self.source = Some(source);
+        if autoplay {
+            self.source_toggle();
+        }
         self.request_preview();
     }
 

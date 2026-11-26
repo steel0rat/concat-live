@@ -3,6 +3,8 @@
 
 import { Theme } from "../theme/theme.slint";
 import { Glyph, Icon } from "../icons.slint";
+import { I18n } from "../i18n.slint";
+import { Tip } from "tooltip.slint";
 
 // The right-click menu: an icon slot every row shares, a label, a right-set
 // shortcut hint, checkbox rows, group labels, separators, and one row that may
@@ -59,6 +61,9 @@ export component ContextMenu inherits Rectangle {
     in property <[MenuItemData]> items;
     /// The summed height of `items` plus MenuMetrics.padding.
     in property <length> menu-height;
+    /// Read from the popup rather than tracked here: a click outside closes
+    /// it without telling us, so a hand-rolled flag would go stale.
+    out property <bool> open: surface.is-open;
 
     callback selected(id: string);
     /// Left or right from the keyboard: the menu beside this one, for a
@@ -300,10 +305,14 @@ export component ContextMenu inherits Rectangle {
                             }
                         }
 
+                        Tip {
+                            text: I18n.menu-help(item.id);
+                            active: touch.has-hover;
+                        }
                         touch := TouchArea {
-                            enabled: item.enabled;
-                            mouse-cursor: pointer;
+                            mouse-cursor: item.enabled ? pointer : default;
                             clicked => {
+                                if !item.enabled { return; }
                                 // The id first, while the row still exists;
                                 // the report after the close - see `chosen`.
                                 // The timer is armed before the close, not

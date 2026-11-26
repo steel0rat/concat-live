@@ -44,7 +44,7 @@ pub struct Action {
     pub defaults: &'static [&'static str],
 }
 
-/// Every action the shortcuts page lists, in the order it lists them.
+/// The editor actions the shortcuts page lists, in display order.
 pub const ACTIONS: &[Action] = &[
     // The verbs a project has from the first moment.
     Action {
@@ -183,6 +183,22 @@ pub const ACTIONS: &[Action] = &[
     },
 ];
 
+pub const AGENT_DICTATION: &str = "agent-dictation";
+pub const AGENT_NEW_NOTE: &str = "agent-new-note";
+
+fn is_agent(id: &str) -> bool {
+    matches!(id, AGENT_DICTATION | AGENT_NEW_NOTE) || pinned_id(id).is_some()
+}
+
+fn pinned_id(id: &str) -> Option<&str> {
+    id.strip_prefix("agent-")
+        .filter(|id| id.starts_with("pin-"))
+}
+
+pub fn pinned_name(title: &str) -> String {
+    i18n::tf("shortcuts.agentPin", &[&title])
+}
+
 /// The action a row and a dispatch speak, by its id.
 pub fn action(id: &str) -> Option<&'static Action> {
     ACTIONS.iter().find(|action| action.id == id)
@@ -227,7 +243,16 @@ pub fn name(id: &str) -> String {
         "step-forward" => i18n::t("shortcuts.stepForward"),
         "prev-edit" => i18n::t("shortcuts.prevEdit"),
         "next-edit" => i18n::t("shortcuts.nextEdit"),
-        _ => String::new(),
+        AGENT_DICTATION => i18n::t("shortcuts.agentDictation"),
+        AGENT_NEW_NOTE => i18n::t("shortcuts.agentNewNote"),
+        _ => pinned_id(id)
+            .and_then(|pin| {
+                crate::agent::pinned_shortcuts()
+                    .into_iter()
+                    .find(|(id, _)| id == pin)
+            })
+            .map(|(_, title)| pinned_name(&title))
+            .unwrap_or_default(),
     }
 }
 
@@ -235,11 +260,15 @@ pub fn name(id: &str) -> String {
 /// default when nothing was, and `None` when a rebind took the action's
 /// key away and left it holding none.
 pub fn bound<'a>(prefs: &'a Preferences, id: &str) -> Option<&'a str> {
-    let action = action(id)?;
+    let defaults = if is_agent(id) {
+        &[]
+    } else {
+        action(id)?.defaults
+    };
     match prefs.keybinds.get(id) {
         Some(custom) if custom.is_empty() => None,
         Some(custom) => Some(custom.as_str()),
-        None => action.defaults.first().copied(),
+        None => defaults.first().copied(),
     }
 }
 
@@ -285,6 +314,26 @@ pub fn resolve(prefs: &Preferences, chord: &str) -> Option<&'static str> {
     None
 }
 
+/// Resolves a configured agent action only while its target is available.
+pub fn resolve_agent<'a>(
+    prefs: &'a Preferences,
+    chord: &str,
+    on_start: bool,
+    is_pinned: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    prefs.keybinds.iter().find_map(|(id, custom)| {
+        if custom.is_empty() || custom != chord {
+            return None;
+        }
+        let available = match id.as_str() {
+            AGENT_DICTATION => true,
+            AGENT_NEW_NOTE => !on_start,
+            _ => !on_start && pinned_id(id).is_some_and(&is_pinned),
+        };
+        available.then_some(id.as_str())
+    })
+}
+
 /// Binds `chord` to `id`, taking it from whoever held it: a chord is
 /// one action's, so the loser is left with none — its row reads "—" and
 /// its Reset puts it back. Binding an action to one of its own defaults
@@ -322,6 +371,60 @@ pub fn reset(prefs: &mut Preferences, id: &str) -> Option<&'static str> {
         }
     }
     lost
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct EditorChordInUse;
+
+/// Agent shortcuts never displace editing controls, including the editor's aliases.
+pub fn assign(
+    prefs: &mut Preferences,
+    id: &str,
+    chord: &str,
+) -> Result<Option<String>, EditorChordInUse> {
+    if is_agent(id) {
+        if resolve(prefs, chord).is_some() {
+            return Err(EditorChordInUse);
+        }
+        let mut lost = None;
+        prefs.keybinds.retain(|other, custom| {
+            if other != id && is_agent(other) && custom == chord {
+                lost = Some(other.clone());
+                false
+            } else {
+                true
+            }
+        });
+        prefs.keybinds.insert(id.to_owned(), chord.to_owned());
+        return Ok(lost);
+    }
+
+    let lost = bind(prefs, id, chord).map(str::to_owned);
+    Ok(lost.or(unbind_shadowed_agent_shortcuts(prefs)))
+}
+
+pub fn reset_override(prefs: &mut Preferences, id: &str) -> Option<String> {
+    if is_agent(id) {
+        prefs.keybinds.remove(id);
+        return None;
+    }
+
+    let lost = reset(prefs, id).map(str::to_owned);
+    lost.or(unbind_shadowed_agent_shortcuts(prefs))
+}
+
+// An editor rebind or reset can reclaim more than one chord through aliases.
+fn unbind_shadowed_agent_shortcuts(prefs: &mut Preferences) -> Option<String> {
+    let shadowed = prefs
+        .keybinds
+        .iter()
+        .filter(|(id, chord)| is_agent(id) && resolve(prefs, chord).is_some())
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in &shadowed {
+        prefs.keybinds.remove(id);
+    }
+    shadowed.into_iter().next()
 }
 
 /// Forgets every override: the table as it ships.
@@ -737,6 +840,71 @@ mod tests {
         assert_eq!(bound(&prefs, "mute"), Some("m"));
         reset_all(&mut prefs);
         assert!(prefs.keybinds.is_empty());
+    }
+
+    #[test]
+    fn only_dictation_resolves_on_the_launch_screen() {
+        let mut prefs = Preferences::default();
+        assert_eq!(bound(&prefs, AGENT_DICTATION), None);
+        assert_eq!(bound(&prefs, AGENT_NEW_NOTE), None);
+        assert_eq!(bound(&prefs, "agent-pin-42"), None);
+        assert_eq!(assign(&mut prefs, AGENT_DICTATION, "ctrl+alt+d"), Ok(None));
+        assert_eq!(assign(&mut prefs, AGENT_NEW_NOTE, "ctrl+alt+n"), Ok(None));
+        assert_eq!(assign(&mut prefs, "agent-pin-42", "ctrl+alt+p"), Ok(None));
+        let is_pinned = |id: &str| id == "pin-42";
+        assert_eq!(
+            resolve_agent(&prefs, "ctrl+alt+d", true, is_pinned),
+            Some(AGENT_DICTATION)
+        );
+        assert_eq!(resolve_agent(&prefs, "ctrl+alt+n", true, is_pinned), None);
+        assert_eq!(resolve_agent(&prefs, "ctrl+alt+p", true, is_pinned), None);
+        assert_eq!(
+            resolve_agent(&prefs, "ctrl+alt+n", false, is_pinned),
+            Some(AGENT_NEW_NOTE)
+        );
+        assert_eq!(
+            resolve_agent(&prefs, "ctrl+alt+p", false, is_pinned),
+            Some("agent-pin-42")
+        );
+        assert_eq!(resolve_agent(&prefs, "ctrl+alt+p", false, |_| false), None);
+    }
+
+    #[test]
+    fn editor_chords_take_precedence_over_agent_shortcuts() {
+        let mut prefs = Preferences::default();
+        assert_eq!(
+            assign(&mut prefs, "agent-pin-42", "shift+left"),
+            Err(EditorChordInUse)
+        );
+        assert_eq!(resolve(&prefs, "shift+left"), Some("step-back-10"));
+        assert_eq!(assign(&mut prefs, "agent-pin-42", "ctrl+alt+p"), Ok(None));
+        assert_eq!(
+            assign(&mut prefs, "play", "ctrl+alt+p"),
+            Ok(Some("agent-pin-42".to_owned()))
+        );
+        assert_eq!(resolve(&prefs, "ctrl+alt+p"), Some("play"));
+        assert_eq!(bound(&prefs, "agent-pin-42"), None);
+        assert_eq!(assign(&mut prefs, AGENT_NEW_NOTE, "space"), Ok(None));
+        assert_eq!(
+            reset_override(&mut prefs, "play"),
+            Some(AGENT_NEW_NOTE.to_owned())
+        );
+        assert_eq!(resolve(&prefs, "space"), Some("play"));
+        assert_eq!(bound(&prefs, AGENT_NEW_NOTE), None);
+    }
+
+    #[test]
+    fn agent_shortcuts_can_move_between_rows_and_reset_to_unassigned() {
+        let mut prefs = Preferences::default();
+        assert_eq!(assign(&mut prefs, AGENT_DICTATION, "ctrl+alt+d"), Ok(None));
+        assert_eq!(
+            assign(&mut prefs, AGENT_NEW_NOTE, "ctrl+alt+d"),
+            Ok(Some(AGENT_DICTATION.to_owned()))
+        );
+        assert_eq!(bound(&prefs, AGENT_DICTATION), None);
+        assert_eq!(bound(&prefs, AGENT_NEW_NOTE), Some("ctrl+alt+d"));
+        assert_eq!(reset_override(&mut prefs, AGENT_NEW_NOTE), None);
+        assert!(!prefs.keybinds.contains_key(AGENT_NEW_NOTE));
     }
 
     #[test]

@@ -34,6 +34,8 @@
 mod contract;
 mod job;
 pub mod message;
+#[cfg(test)]
+mod project_close_tests;
 pub mod rpc;
 
 use std::collections::BTreeMap;
@@ -235,6 +237,21 @@ pub trait LiveHandler: Send + Sync {
     /// Runs a project request against the window's session and publishes
     /// the resulting state before returning it.
     fn call(&self, request: Request) -> Result<Reply, ApiError>;
+
+    /// Runs a request from a caller whose transport supplied an identifier.
+    /// The identifier is metadata for attributing changes.
+    fn call_from(&self, request: Request, _client_id: Option<&str>) -> Result<Reply, ApiError> {
+        self.call(request)
+    }
+
+    /// Refuses a request before either the window or the API can change state.
+    fn authorize_request(
+        &self,
+        _request: &Request,
+        _client_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        Ok(())
+    }
 
     /// Captures unsaved state for rendering or saving a template. The
     /// returned session owns no project claim and no editing history.
@@ -462,18 +479,30 @@ impl Api {
     /// Runs one request. The response is what the request is worth; a job
     /// it begins reports through the sink from then on.
     pub fn dispatch(&mut self, request: Request) -> Response {
+        self.dispatch_from(request, None)
+    }
+
+    /// Runs a request with the identifier supplied by its transport, when present.
+    pub fn dispatch_from(&mut self, request: Request, client_id: Option<&str>) -> Response {
         // A transport may have caught a panic in the previous render.
         self.snapshot = None;
         self.jobs.reap(&self.book);
         let result = match self.live.clone() {
-            Some(handler) => self.run_live(request, handler.as_ref()),
+            Some(handler) => self.run_live(request, handler.as_ref(), client_id),
             None => self.run(request),
         };
         self.snapshot = None;
         result.into()
     }
 
-    fn run_live(&mut self, request: Request, handler: &dyn LiveHandler) -> Result<Reply, ApiError> {
+    fn run_live(
+        &mut self,
+        request: Request,
+        handler: &dyn LiveHandler,
+        client_id: Option<&str>,
+    ) -> Result<Reply, ApiError> {
+        handler.authorize_request(&request, client_id)?;
+        let call = |request| handler.call_from(request, client_id);
         match request {
             Request::ProjectCreate {
                 location,
@@ -481,7 +510,7 @@ impl Api {
                 video,
             } => {
                 self.writable(&location)?;
-                handler.call(Request::ProjectCreate {
+                call(Request::ProjectCreate {
                     location,
                     name,
                     video,
@@ -495,12 +524,14 @@ impl Api {
             | Request::ProjectSetVideo { .. }
             | Request::EditApply { .. }
             | Request::EditUndo { .. }
-            | Request::EditRedo { .. }) => handler.call(request),
+            | Request::EditRedo { .. }
+            | Request::PauseReviewSubmit { .. }
+            | Request::TimelineNotesReport { .. }) => call(request),
             Request::MediaImport { path, file } => {
                 let item = media::probe(&file)
                     .map_err(ApiError::failed)?
                     .to_new_media();
-                handler.call(Request::EditApply {
+                call(Request::EditApply {
                     path,
                     command: Box::new(Command::AddMedia { item }),
                 })
@@ -512,7 +543,7 @@ impl Api {
                 fills,
             } => {
                 let info = self.instantiate_project(&template, &location, &name, fills)?;
-                handler.call(Request::ProjectOpen { path: info.path })
+                call(Request::ProjectOpen { path: info.path })
             }
             request @ (Request::PreviewFrame { .. }
             | Request::ExportRun { .. }
@@ -586,6 +617,14 @@ impl Api {
                 Ok(Reply::Done(Done {}))
             }
             Request::ExportStatus { job } => Ok(Reply::Job(self.job_status(&job)?)),
+            Request::PauseReviewSubmit { .. } => Err(ApiError::new(
+                ErrorCode::Refused,
+                "Pause review belongs to an embedded chat in Concat Live",
+            )),
+            Request::TimelineNotesReport { .. } => Err(ApiError::new(
+                ErrorCode::Refused,
+                "Timeline notes belong to an embedded chat in Concat Live",
+            )),
             Request::PreviewFrame {
                 path,
                 time,
@@ -1459,6 +1498,51 @@ mod tests {
             duration: Some(1.0),
             name: "Live shape".to_owned(),
         }
+    }
+
+    #[test]
+    fn live_requests_carry_only_their_own_client_identifier() {
+        #[derive(Default)]
+        struct Window(Mutex<Vec<Option<String>>>);
+
+        impl LiveHandler for Window {
+            fn call(&self, request: Request) -> Result<Reply, ApiError> {
+                self.call_from(request, None)
+            }
+
+            fn call_from(
+                &self,
+                request: Request,
+                client_id: Option<&str>,
+            ) -> Result<Reply, ApiError> {
+                assert!(matches!(request, Request::ProjectSave { .. }));
+                self.0
+                    .lock()
+                    .expect("calls")
+                    .push(client_id.map(str::to_owned));
+                Ok(Reply::Done(Done {}))
+            }
+
+            fn snapshot(&self, _path: &str) -> Result<Session, ApiError> {
+                panic!("a save uses the live session")
+            }
+        }
+
+        let (mut api, scratch, _) = api();
+        let window = Arc::new(Window::default());
+        api.enable_live(window.clone());
+        let request = || Request::ProjectSave {
+            path: scratch.path().to_string_lossy().into_owned(),
+            name: None,
+        };
+        ok(api.dispatch_from(request(), Some("agent-1")));
+        ok(api.dispatch(request()));
+        ok(api.dispatch_from(request(), Some("agent-2")));
+
+        assert_eq!(
+            *window.0.lock().expect("calls"),
+            [Some("agent-1".to_owned()), None, Some("agent-2".to_owned())]
+        );
     }
 
     #[test]

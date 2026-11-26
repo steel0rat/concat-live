@@ -13,10 +13,8 @@
 //! yet reads in English rather than as a key, and adding a language is
 //! adding a file.
 //!
-//! Only the app's own interface is translated. Effects, filters,
-//! transitions and text presets are data: a package's words are the
-//! English its manifest carries, shipped or not, and no locale lists them,
-//! so the locales stay the size of the interface.
+//! Built-in effect and control names use the dictionaries in [`crate::effect_words`].
+//! Third-party packages supply their own labels in their manifests.
 //!
 //! Two places hold locales. The ones the app ships live in `locales/` next
 //! to this crate's `src/` and are compiled in. Anyone can add or correct a
@@ -247,6 +245,90 @@ pub fn t(key: &str) -> String {
         .unwrap_or_else(|| key.to_owned())
 }
 
+pub(crate) fn timeline_label(name: &str) -> String {
+    if current() == "ru" {
+        if name == "Timeline" {
+            return t("paneSwitcher.timeline");
+        }
+        if let Some(number) = name.strip_prefix("Timeline ")
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return format!("{} {number}", t("paneSwitcher.timeline"));
+        }
+    }
+    name.to_owned()
+}
+
+/// Explanations for the commands in the timeline and window menus.
+pub(crate) fn menu_help(id: &str) -> String {
+    match id {
+        "add-selected" => t("menuHelp.addSelected"),
+        "open" => t("menuHelp.open"),
+        "import" => t("menuHelp.import"),
+        "save" => t("menuHelp.save"),
+        "export" => t("menuHelp.export"),
+        "cover-frame" => t("menuHelp.coverFrame"),
+        "review-copy" => t("menuHelp.reviewCopy"),
+        "template" => t("menuHelp.template"),
+        "speech" => t("menuHelp.speech"),
+        "clear-cache" => t("menuHelp.clearCache"),
+        "settings" => t("menuHelp.settings"),
+        "close-project" => t("menuHelp.closeProject"),
+        "close-window" => t("menuHelp.closeWindow"),
+        "undo" => t("menuHelp.undo"),
+        "redo" => t("menuHelp.redo"),
+        "split" => t("menuHelp.split"),
+        "delete" => t("menuHelp.delete"),
+        "click-review" => t("menuHelp.clickReview"),
+        "snap" => t("menuHelp.snap"),
+        "magnetic" => t("menuHelp.magnetic"),
+        "linkage" => t("menuHelp.linkage"),
+        "zoom-in" => t("menuHelp.zoomIn"),
+        "zoom-out" => t("menuHelp.zoomOut"),
+        "sort-added" => t("menuHelp.sortAdded"),
+        "sort-name" => t("menuHelp.sortName"),
+        "sort-kind" => t("menuHelp.sortKind"),
+        "start" => t("menuHelp.start"),
+        "end" => t("menuHelp.end"),
+        "prev-edit" => t("menuHelp.prevEdit"),
+        "next-edit" => t("menuHelp.nextEdit"),
+        "copy" => t("menuHelp.copy"),
+        "duplicate" => t("menuHelp.duplicate"),
+        "paste" => t("menuHelp.paste"),
+        "delete-left" => t("menuHelp.deleteLeft"),
+        "delete-right" => t("menuHelp.deleteRight"),
+        "merge" => t("menuHelp.merge"),
+        "freeze" => t("menuHelp.freeze"),
+        "enhance" => t("menuHelp.enhance"),
+        "compare-takes" => t("menuHelp.compareTakes"),
+        "fit" => t("menuHelp.fit"),
+        "fill" => t("menuHelp.fill"),
+        "reattach" => t("menuHelp.reattach"),
+        "detach" => t("menuHelp.detach"),
+        "export-audio" => t("menuHelp.exportAudio"),
+        "captions" => t("menuHelp.captions"),
+        "voice-keep" => t("menuHelp.voiceKeep"),
+        "voice-remove" => t("menuHelp.voiceRemove"),
+        "mute" => t("menuHelp.mute"),
+        "lock" => t("menuHelp.lock"),
+        "add" => t("menuHelp.add"),
+        "where-used" => t("menuHelp.whereUsed"),
+        "browse-scenes" => t("menuHelp.browseScenes"),
+        "range-auto" => t("menuHelp.rangeAuto"),
+        "range-limited" => t("menuHelp.rangeLimited"),
+        "range-full" => t("menuHelp.rangeFull"),
+        "axis-audio" => t("menuHelp.scrubWithAudio"),
+        "axis-video" => t("menuHelp.scrubVideoOnly"),
+        "mirror" => t("menuHelp.mirror"),
+        "rotate" => t("menuHelp.rotate"),
+        "reverse" => t("menuHelp.reverse"),
+        "save-frame" => t("menuHelp.saveFrame"),
+        "remove" => t("menuHelp.removeMedia"),
+        _ => String::new(),
+    }
+}
+
 /// The active language's line for `key`, if it has one.
 fn translated(key: &str) -> Option<String> {
     active()
@@ -425,6 +507,18 @@ mod tests {
         assert_eq!(t("common.export"), "Ausgabe");
         select(ENGLISH, &dirs);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn russian_labels_for_default_timeline_names() {
+        let _language = language();
+        let dirs = AppDirs::under(&std::env::temp_dir().join("concat-i18n-timeline-test"));
+        select("ru", &dirs);
+        assert_eq!(timeline_label("Timeline"), "Таймлайн");
+        assert_eq!(timeline_label("Timeline 12"), "Таймлайн 12");
+        assert_eq!(timeline_label("Timeline test"), "Timeline test");
+        select(ENGLISH, &dirs);
+        assert_eq!(timeline_label("Timeline 12"), "Timeline 12");
     }
 
     #[test]

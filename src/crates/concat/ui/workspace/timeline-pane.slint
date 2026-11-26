@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 import { Theme } from "../theme/theme.slint";
+import { ChatAction } from "agent.slint";
+import { MontageBlocks } from "../dialogs/montage-blocks.slint";
+import { SectionPlanning } from "../dialogs/sections.slint";
 import { Pane } from "pane.slint";
 import { PaneKind, PaneSwitcher } from "pane-switcher.slint";
 import { I18n } from "../i18n.slint";
@@ -10,7 +13,7 @@ import { ContextMenu, MenuItemData, MenuMetrics, MenuRow } from "../primitives/c
 import { HairlineSplitter } from "splitter.slint";
 import { ThinHScrollbar, ThinScrollbar } from "../primitives/scrollbar.slint";
 import {
-    ClipData, DropData, TimelineTabData, TimelineTool, TrackData, TrackSize,
+    ClipData, DropData, PauseCutData, TimelineNoteData, TimelineTabData, TimelineTool, TrackData, TrackSize,
 } from "../timeline/model.slint";
 import { TimelineTabs } from "../timeline/tabs.slint";
 import { TimelineTray } from "../timeline/tray.slint";
@@ -28,6 +31,10 @@ export component TimelinePane inherits Rectangle {
     // ── the tabs ─────────────────────────────────────────────────────────
     in property <[TimelineTabData]> tabs;
     in property <int> current-tab;
+    in property <bool> notes-available;
+    in property <bool> notes-open;
+    in property <bool> notes-enabled;
+    callback toggle-notes();
 
     callback tab-selected(index: int);
     callback tab-renamed(index: int, name: string);
@@ -94,6 +101,8 @@ export component TimelinePane inherits Rectangle {
     // ── the grid ─────────────────────────────────────────────────────────
     in property <[TrackData]> tracks;
     in property <[ClipData]> clips;
+    in property <[PauseCutData]> pause-cuts;
+    in property <[TimelineNoteData]> notes;
     in property <float> playhead;
     in property <[float]> key-marks;
     in property <float> frame-rate: 30;
@@ -315,12 +324,39 @@ export component TimelinePane inherits Rectangle {
             added => { root.tab-added(); }
             moved(from, to) => { root.tab-moved(from, to); }
 
-            PaneSwitcher {
-                kind: PaneKind.timeline;
-                seat: root.pane-seat;
-                removable: root.pane-removable;
-                picked(kind) => { root.pane-picked(kind); }
-                removed => { root.pane-removed(); }
+            HorizontalLayout {
+                spacing: 5px;
+                if SectionPlanning.available: ChatAction {
+                    label: I18n.t("sections.title");
+                    tip: I18n.t("sections.openTip");
+                    glyph: Glyph.clock;
+                    square: true;
+                    primary: SectionPlanning.open;
+                    clicked => { SectionPlanning.toggle(); }
+                }
+                if root.notes-available: ChatAction {
+                    label: I18n.t("chatUi.notesButton");
+                    tip: I18n.t("chatUi.notesButtonTip");
+                    primary: root.notes-open;
+                    ghost: !root.notes-open;
+                    enabled: root.notes-enabled;
+                    clicked => { root.toggle-notes(); }
+                }
+                if MontageBlocks.available: ChatAction {
+                    label: I18n.t("blocks.open");
+                    tip: I18n.t("blocks.openTip");
+                    square: true;
+                    glyph: Glyph.shapes;
+                    primary: MontageBlocks.open;
+                    clicked => { MontageBlocks.open-library(); }
+                }
+                PaneSwitcher {
+                    kind: PaneKind.timeline;
+                    seat: root.pane-seat;
+                    removable: root.pane-removable;
+                    picked(kind) => { root.pane-picked(kind); }
+                    removed => { root.pane-removed(); }
+                }
             }
         }
 
@@ -436,6 +472,8 @@ export component TimelinePane inherits Rectangle {
 
                 tracks: root.tracks;
                 clips: root.clips;
+                pause-cuts: root.pause-cuts;
+                notes: root.notes;
                 duration-seconds: root.duration-seconds;
                 key-marks: root.key-marks;
                 tool: root.tool;

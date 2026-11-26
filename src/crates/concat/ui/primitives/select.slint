@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
+import { I18n } from "../i18n.slint";
 import { Theme } from "../theme/theme.slint";
 import { Glyph, Icon } from "../icons.slint";
 import { FocusRing } from "focus-ring.slint";
@@ -20,7 +21,7 @@ export component Select inherits Rectangle {
     /// the list to compare.
     in property <[string]> details;
     in-out property <int> current;
-    in property <string> placeholder: "Select";
+    in property <string> placeholder: I18n.t("common.chooseOption");
     /// leading adornment on the trigger
     in property <Glyph> glyph: Glyph.none;
     /// One mark per option, in the same order. Set it and the trigger shows
@@ -38,6 +39,8 @@ export component Select inherits Rectangle {
     /// is fine; a row past its end simply has none.
     in property <[AvatarData]> avatars;
     in property <bool> enabled: true;
+    /// Explanatory text for the trigger, when the currently shown option needs context.
+    in property <string> tip;
     /// Rows that are shown and cannot be picked, by index: greyed, and a
     /// press or Enter on one does nothing. Shorter than `options` leaves
     /// the rest pickable.
@@ -144,10 +147,11 @@ export component Select inherits Rectangle {
         fs.focus();
     }
 
-    function reveal() {
+    public function reveal() {
         if (!root.enabled) {
             return;
         }
+        fs.focus();
         root.active = Math.max(root.current, 0);
         // Opened on the current row: a list of twelve languages that
         // opened at the top hid whichever was chosen past the ninth.
@@ -253,10 +257,7 @@ export component Select inherits Rectangle {
     trigger := TouchArea {
         enabled: root.enabled;
         mouse-cursor: pointer;
-        clicked => {
-            fs.focus();
-            root.reveal();
-        }
+        clicked => { root.reveal(); }
     }
 
     FocusRing {
@@ -264,10 +265,9 @@ export component Select inherits Rectangle {
         radius: Theme.r;
     }
 
-    // Only where the mark replaced the words. A trigger showing its label is
-    // already saying what a tip would say, and the open list says it too.
+    // A marked trigger can use its current option as a fallback.
     Tip {
-        text: root.marked ? root.label : "";
+        text: root.tip != "" ? root.tip : root.marked ? root.label : "";
         active: trigger.has-hover && root.enabled && !root.open;
     }
 

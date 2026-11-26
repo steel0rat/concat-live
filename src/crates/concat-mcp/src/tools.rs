@@ -232,6 +232,20 @@ pub fn catalogue() -> Vec<Tool> {
         )
         .reading(),
         method(
+            "pause_review_submit",
+            "Submit suggested pause cuts",
+            "Select candidate IDs supplied by the current Trim pauses request in Concat Live. Stages the selection for the user to review; changes no clips. An empty list proposes no cuts.",
+            "pause.reviewSubmit",
+            Raw,
+        ),
+        method(
+            "timeline_notes_report",
+            "Report completed timeline notes",
+            "In the current Concat Live timeline notes request, report only the supplied IDs for work that has been completed and is ready for review. Pass the given batchId. The user approves each note in the editor.",
+            "timeline.notesReport",
+            Raw,
+        ),
+        method(
             "project_set_video",
             "Set frame size and rate",
             "Sets the active timeline's frame (width, height in pixels) and rate (rateNum/rateDen frames a second, e.g. 30000/1001 for 29.97) as one undoable edit.",
@@ -399,7 +413,7 @@ pub fn catalogue() -> Vec<Tool> {
         command(
             "keyframe_set",
             "Set a keyframe",
-            "Animates a clip: puts a key on `property` (scale, offsetX, offsetY, rotation, opacity, volume; a mask's numbers are `mask_key_set`'s) at `at`, a fraction of the clip's length from 0 (its start) to 1 (its end), holding `value` in the property's own units - the number the inspector shows. A key already within a hair of `at` is replaced. `ease` is how the value is approached: [x1, y1, x2, y2] like a CSS cubic-bezier, linear when absent.",
+            "Animates a clip: puts a key on `property` (scale, offsetX, offsetY, rotation, stretchX, stretchY, opacity, volume; a mask's numbers are `mask_key_set`'s) at `at`, a fraction of the clip's length from 0 (its start) to 1 (its end), holding `value` in the property's own units - the number the inspector shows. A key already within a hair of `at` is replaced. `ease` is how the value is approached: [x1, y1, x2, y2] like a CSS cubic-bezier, linear when absent.",
             "setClipKey",
         ),
         command(
@@ -990,6 +1004,14 @@ mod tests {
             ("project_close", json!({ "path": "/tmp/Cut", "save": true })),
             ("timeline_read", json!({ "path": "/tmp/Cut" })),
             ("project_get", json!({ "path": "/tmp/Cut" })),
+            (
+                "pause_review_submit",
+                json!({ "path": "/tmp/Cut", "ids": [1, 2] }),
+            ),
+            (
+                "timeline_notes_report",
+                json!({ "path": "/tmp/Cut", "batchId": "notes-1", "ids": [1] }),
+            ),
             (
                 "project_set_video",
                 json!({ "path": "/tmp/Cut", "video": { "width": 1920, "height": 1080, "rateNum": 30000, "rateDen": 1001 } }),

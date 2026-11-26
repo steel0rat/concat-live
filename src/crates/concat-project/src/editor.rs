@@ -189,31 +189,90 @@ impl Editor {
         gesture: Option<&str>,
         command: Command,
     ) -> Result<Outcome, CommandError> {
-        if command.is_view_state() {
-            return apply(&mut self.project, &mut self.mint, command);
+        let before = (!command.is_view_state()).then(|| self.project.clone());
+        let outcome =
+            Self::apply_to_project(&mut self.project, &mut self.mint, command, before.as_ref())?;
+        if let Some(before) = before
+            && outcome.applied
+        {
+            self.finish_edit(before, gesture);
         }
-        let before = self.project.clone();
-        let outcome = apply(&mut self.project, &mut self.mint, command)?;
-        if !outcome.applied {
-            return Ok(outcome);
+        Ok(outcome)
+    }
+
+    /// Applies a command after checking its normalized result against the
+    /// live project. A refusal leaves the project, mint and history intact.
+    pub fn apply_checked(
+        &mut self,
+        command: Command,
+        check: impl FnOnce(&Project, &Project) -> Result<(), String>,
+    ) -> Result<Outcome, String> {
+        let mut project = self.project.clone();
+        let mut mint = self.mint.clone();
+        let is_edit = !command.is_view_state();
+        let outcome = Self::apply_to_project(
+            &mut project,
+            &mut mint,
+            command,
+            is_edit.then_some(&self.project),
+        )
+        .map_err(|error| error.to_string())?;
+        check(&self.project, &project)?;
+
+        let before = std::mem::replace(&mut self.project, project);
+        self.mint = mint;
+        if is_edit && outcome.applied {
+            self.finish_edit(before, None);
         }
-        self.tidy_touched(&before);
-        self.follow_first_hdr(&before);
+        Ok(outcome)
+    }
+
+    fn apply_to_project(
+        project: &mut Project,
+        mint: &mut IdMint,
+        command: Command,
+        before: Option<&Project>,
+    ) -> Result<Outcome, CommandError> {
+        let outcome = apply(project, mint, command)?;
+        if let Some(before) = before
+            && outcome.applied
+        {
+            Self::tidy_touched(project, before);
+            Self::follow_first_hdr(project, before);
+        }
+        Ok(outcome)
+    }
+
+    fn finish_edit(&mut self, before: Project, gesture: Option<&str>) {
         let continues = match (gesture, self.undo.back()) {
             (Some(gesture), Some(last)) => last.gesture.as_deref() == Some(gesture),
             _ => false,
         };
         if !continues {
-            self.undo.push_back(Snapshot {
-                before,
-                gesture: gesture.map(str::to_owned),
-            });
-            if self.undo.len() > UNDO_DEPTH {
-                self.undo.pop_front();
-            }
+            self.record(before, gesture);
         }
         self.redo.clear();
-        Ok(outcome)
+    }
+
+    fn record(&mut self, before: Project, gesture: Option<&str>) {
+        self.undo.push_back(Snapshot {
+            before,
+            gesture: gesture.map(str::to_owned),
+        });
+        if self.undo.len() > UNDO_DEPTH {
+            self.undo.pop_front();
+        }
+    }
+
+    /// Restores a project captured from this editor as one new history step.
+    /// The mint retains the ids used by the edit being replaced.
+    pub fn restore_project(&mut self, project: Project) {
+        if project != self.project {
+            self.mint.adopt_project(&project);
+            let before = std::mem::replace(&mut self.project, project);
+            self.record(before, None);
+            self.redo.clear();
+        }
     }
 
     /// Runs [`Clip::tidy`] over every clip the command wrote, so the clamps
@@ -221,7 +280,7 @@ impl Editor {
     /// after a save and a reopen (audit 2026-09-23, #13). Only a clip
     /// whose `Arc` the command replaced is looked at: the rest are still
     /// the snapshot's, and were tidy already.
-    fn tidy_touched(&mut self, before: &Project) {
+    fn tidy_touched(project: &mut Project, before: &Project) {
         use std::collections::HashSet;
         use std::sync::Arc;
         let previous: std::collections::HashMap<&str, &Arc<crate::model::Timeline>> = before
@@ -229,7 +288,7 @@ impl Editor {
             .iter()
             .map(|timeline| (timeline.id.as_str(), timeline))
             .collect();
-        for timeline in &mut self.project.timelines {
+        for timeline in &mut project.timelines {
             let old = previous.get(timeline.id.as_str()).copied();
             if old.is_some_and(|old| Arc::ptr_eq(old, timeline)) {
                 continue;
@@ -256,7 +315,7 @@ impl Editor {
     /// back to SDR with HDR clips already on it stays SDR (decided 26 Sept:
     /// the Modify sheet can change it back), and only a timeline the
     /// command wrote, and did not make, is looked at.
-    fn follow_first_hdr(&mut self, before: &Project) {
+    fn follow_first_hdr(project: &mut Project, before: &Project) {
         use std::collections::HashSet;
         use std::sync::Arc;
         let hdr = |project: &Project| -> HashSet<String> {
@@ -267,7 +326,7 @@ impl Editor {
                 .map(|media| media.id.clone())
                 .collect()
         };
-        let now = hdr(&self.project);
+        let now = hdr(project);
         if now.is_empty() {
             return;
         }
@@ -277,7 +336,7 @@ impl Editor {
             .iter()
             .map(|timeline| (timeline.id.as_str(), timeline))
             .collect();
-        for timeline in &mut self.project.timelines {
+        for timeline in &mut project.timelines {
             if timeline.video.color_space.is_hdr() {
                 continue;
             }
@@ -368,4 +427,131 @@ pub struct RetiredFields {
     pub reversed: Vec<String>,
     /// Clips an earlier version moved with a preset animation.
     pub animated: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ColorSpace, MediaItem, MediaKind};
+
+    #[test]
+    fn refusing_a_checked_batch_preserves_project_mint_and_history() {
+        let mut editor = Editor::new();
+        let first = editor.project.active_timeline_id.clone();
+        editor.apply(Command::AddTimeline).unwrap();
+        editor.apply(Command::AddTrack { bottom: false }).unwrap();
+        assert!(editor.undo());
+        let before = editor.project.clone();
+        let redo = editor.redo.clone();
+        let steps = editor.undo.len();
+        let next = editor.mint.clone().next("t");
+
+        let command = Command::Batch {
+            commands: vec![
+                Command::AddTrack { bottom: false },
+                Command::SelectTimeline {
+                    timeline_id: first.clone(),
+                },
+            ],
+        };
+        let result = editor.apply_checked(command, |original, proposed| {
+            assert_eq!(original, &before);
+            assert_eq!(proposed.active_timeline_id, first);
+            assert!(
+                proposed
+                    .timelines
+                    .iter()
+                    .any(|timeline| { timeline.tracks.iter().any(|track| track.id == next) })
+            );
+            Err("outside the chosen tracks".into())
+        });
+
+        assert_eq!(result, Err("outside the chosen tracks".into()));
+        assert_eq!(editor.project(), &before);
+        assert_eq!(editor.undo.len(), steps);
+        assert_eq!(editor.redo, redo);
+        let accepted = editor
+            .apply_checked(Command::AddTrack { bottom: false }, |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(accepted.created_id.as_deref(), Some(next.as_str()));
+        assert_eq!(editor.undo.len(), steps + 1);
+        assert!(!editor.can_redo());
+        assert!(editor.undo());
+        assert_eq!(editor.project(), &before);
+    }
+
+    #[test]
+    fn checked_edit_validates_implicit_hdr_change_before_recording_it() {
+        let mut editor = Editor::new();
+        editor.project_mut().media.push(MediaItem {
+            id: "hdr".into(),
+            duration: Some(2.0),
+            kind: MediaKind::Video,
+            color_space: ColorSpace::Hlg,
+            ..Default::default()
+        });
+        let before = editor.project.clone();
+        let command = Command::AddClip {
+            media_id: "hdr".into(),
+            track_id: before.active().tracks[0].id.clone(),
+            start: 0.0,
+            ripple: false,
+        };
+        let check = |original: &Project, proposed: &Project| {
+            assert_eq!(original, &before);
+            assert_eq!(proposed.active().video.color_space, ColorSpace::Hlg);
+            assert_eq!(proposed.active().clips.len(), 1);
+        };
+
+        let result = editor.apply_checked(command.clone(), |original, proposed| {
+            check(original, proposed);
+            Err("keep the timeline in SDR".into())
+        });
+        assert_eq!(result, Err("keep the timeline in SDR".into()));
+        assert_eq!(editor.project(), &before);
+        assert!(!editor.can_undo());
+
+        editor
+            .apply_checked(command, |original, proposed| {
+                check(original, proposed);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(editor.project().active().video.color_space, ColorSpace::Hlg);
+        assert!(editor.undo());
+        assert_eq!(editor.project(), &before);
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn checked_view_state_change_keeps_existing_history() {
+        let mut editor = Editor::new();
+        let first = editor.project.active_timeline_id.clone();
+        editor.apply(Command::AddTimeline).unwrap();
+        editor.apply(Command::AddTrack { bottom: false }).unwrap();
+        assert!(editor.undo());
+        let before = editor.project.clone();
+        let steps = editor.undo.len();
+        let redo = editor.redo.clone();
+        let command = Command::SelectTimeline {
+            timeline_id: first.clone(),
+        };
+
+        let result = editor.apply_checked(command.clone(), |_, proposed| {
+            assert_eq!(proposed.active_timeline_id, first);
+            Err("keep the current timeline".into())
+        });
+        assert_eq!(result, Err("keep the current timeline".into()));
+        assert_eq!(editor.project(), &before);
+
+        editor
+            .apply_checked(command, |_, proposed| {
+                assert_eq!(proposed.active_timeline_id, first);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(editor.project().active_timeline_id, first);
+        assert_eq!(editor.undo.len(), steps);
+        assert_eq!(editor.redo, redo);
+    }
 }

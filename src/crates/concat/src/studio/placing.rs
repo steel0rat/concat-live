@@ -454,7 +454,7 @@ impl Studio {
             return;
         }
         if !video && first.kind == model::ClipKind::Image {
-            self.notify("A still has no sound to filter", true);
+            self.notify(&t("studio.stillHasNoAudio"), true);
             return;
         }
         let mut commands: Vec<Command> = ids
@@ -578,7 +578,10 @@ impl Studio {
     pub fn apply_transition(&mut self, id: &str) {
         let label = Catalogue::builtin()
             .get(id)
-            .map(|package| package.manifest.effect.name.clone())
+            .map(|package| {
+                let meta = &package.manifest.effect;
+                crate::effect_words::name(&meta.id, &meta.name).to_owned()
+            })
             .unwrap_or_default();
         let duration = f64::from(TRANSITION_DURATION);
         let at = match self.transition_cut() {

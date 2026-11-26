@@ -69,7 +69,9 @@ pub fn apply_ui_scale(window: &slint::Window) {
         if TRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
             reapply_ui_scale(std::time::Duration::from_millis(50));
         } else {
-            log::warn!("interface scale: no window to scale; giving up");
+            log::warn!(
+                "display: wanted the chosen interface scale applied, but the window never came up to take it; it waits for the next pick in Settings"
+            );
         }
         return;
     };
@@ -83,7 +85,9 @@ pub fn apply_ui_scale(window: &slint::Window) {
     if (window.scale_factor() - factor).abs() < 1e-3 {
         return;
     }
-    log::info!("interface scale: the display's {native} times {chosen} is {factor}");
+    log::info!(
+        "display: interface scale {factor:.2} · the display's {native:.2} times the chosen {chosen:.2}"
+    );
     let physical = window.size();
     window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
         scale_factor: factor,
@@ -108,6 +112,9 @@ fn reapply_ui_scale(delay: std::time::Duration) {
         });
     });
 }
+
+type DropPosition = Option<(f32, f32)>;
+
 /// The window's raw events, seen before Slint routes them. Two jobs:
 ///
 /// Dropped files. winit reports one path per event, in a burst, and the
@@ -134,7 +141,8 @@ fn reapply_ui_scale(delay: std::time::Duration) {
 #[cfg(not(target_os = "android"))]
 struct DropHandler {
     pending: Vec<PathBuf>,
-    on_dropped: Box<dyn Fn(Vec<PathBuf>)>,
+    drop_position: DropPosition,
+    on_dropped: Box<dyn Fn(Vec<PathBuf>, DropPosition)>,
     /// Paths a Wayland drop delivered, from the listener's thread.
     arrived: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
     /// The Wayland listener, once the window is up and is a Wayland one;
@@ -207,13 +215,14 @@ fn edge_cursor(edge: ResizeDirection) -> CursorIcon {
 #[cfg(not(target_os = "android"))]
 impl DropHandler {
     fn new(
-        on_dropped: impl Fn(Vec<PathBuf>) + 'static,
+        on_dropped: impl Fn(Vec<PathBuf>, DropPosition) + 'static,
         on_pressed_away: impl Fn() + 'static,
         on_focused: impl Fn() + 'static,
         on_exiting: impl Fn() + 'static,
     ) -> Self {
         Self {
             pending: Vec::new(),
+            drop_position: None,
             on_dropped: Box::new(on_dropped),
             arrived: Default::default(),
             wayland: None,
@@ -231,6 +240,66 @@ impl DropHandler {
             edge: None,
         }
     }
+}
+
+/// Winit's Finder drop event carries the paths. Sample the mouse in the
+/// AppKit content view as the event arrives.
+#[cfg(target_os = "macos")]
+fn macos_drop_position(window: &WinitWindow, slint_window: &slint::Window) -> DropPosition {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::ffi::{c_char, c_void};
+
+    // NSPoint has two CGFloats, both doubles on the supported Mac targets.
+    #[repr(C)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn sel_registerName(name: *const c_char) -> *const c_void;
+        fn objc_msgSend();
+    }
+
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return None;
+    };
+    let view = handle.ns_view.as_ptr();
+    // SAFETY: the event loop is on AppKit's main thread and the window
+    // handle keeps the NSView live. Each send uses the selector's signature.
+    let point = unsafe {
+        let send = objc_msgSend as unsafe extern "C" fn();
+        let get_window: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
+            std::mem::transmute(send);
+        let get_location: unsafe extern "C" fn(*mut c_void, *const c_void) -> Point =
+            std::mem::transmute(send);
+        let convert: unsafe extern "C" fn(
+            *mut c_void,
+            *const c_void,
+            Point,
+            *const c_void,
+        ) -> Point = std::mem::transmute(send);
+        let ns_window = get_window(view, sel_registerName(c"window".as_ptr()));
+        if ns_window.is_null() {
+            return None;
+        }
+        let point = get_location(
+            ns_window,
+            sel_registerName(c"mouseLocationOutsideOfEventStream".as_ptr()),
+        );
+        convert(
+            view,
+            sel_registerName(c"convertPoint:fromView:".as_ptr()),
+            point,
+            std::ptr::null(),
+        )
+    };
+    // winit's view is flipped to match Slint's top-left origin. AppKit
+    // points follow the display's scale, while Slint can apply UI zoom too.
+    let scale = window.scale_factor() / f64::from(slint_window.scale_factor());
+    Some(((point.x * scale) as f32, (point.y * scale) as f32))
 }
 
 /// Whether a press at (`x`, `y`), in logical pixels of `window`, lands
@@ -282,9 +351,34 @@ impl CustomApplicationHandler for DropHandler {
             self.wayland_tried = true;
             self.wayland = listen_for_wayland_drops(window, &self.arrived);
         }
+        // Safe start's two signs that the launch got its window: Slint
+        // draws the frame as it handles this redraw, and a person presses
+        // only what they can see. Before the match, whose arms may return.
+        match event {
+            WindowEvent::RedrawRequested => crate::window_drew(),
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            }
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::Touch(..)
+            | WindowEvent::KeyboardInput {
+                is_synthetic: false,
+                ..
+            } => crate::window_touched(),
+            _ => {}
+        }
         match event {
             WindowEvent::ScaleFactorChanged { .. } => reapply_ui_scale(std::time::Duration::ZERO),
-            WindowEvent::DroppedFile(path) => self.pending.push(path.clone()),
+            WindowEvent::DroppedFile(path) => {
+                #[cfg(target_os = "macos")]
+                if self.pending.is_empty() {
+                    self.drop_position = winit_window
+                        .zip(slint_window)
+                        .and_then(|(window, slint)| macos_drop_position(window, slint));
+                }
+                self.pending.push(path.clone());
+            }
             // Back at the front, after Explorer or the file manager: what a
             // dropped file is to an import, a return is to a look for one
             // that went away while the window was open.
@@ -352,7 +446,7 @@ impl CustomApplicationHandler for DropHandler {
             self.pending.append(&mut arrived);
         }
         if !self.pending.is_empty() {
-            (self.on_dropped)(std::mem::take(&mut self.pending));
+            (self.on_dropped)(std::mem::take(&mut self.pending), self.drop_position.take());
         }
         EventResult::Propagate
     }
@@ -399,6 +493,21 @@ fn listen_for_wayland_drops(
 /// Whether the window draws the macOS traffic lights over its own strip.
 pub const MACOS: bool = cfg!(target_os = "macos");
 
+/// Set when the start found only a software adapter (Microsoft Basic
+/// Render Driver, llvmpipe) though nothing asked for one: the machine has
+/// no graphics driver Concat can draw with. A safe start's or the
+/// person's own CONCAT_GPU=software is not this; those have notices of
+/// their own.
+static NO_DRIVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this machine has no graphics driver Concat can use, so
+/// everything draws on the processor (see [`select_backend`]): the window
+/// says so once at the start, with what fixes it, rather than leaving a
+/// slow editor unexplained. Never on a phone, which always has its GPU.
+pub fn no_graphics_driver() -> bool {
+    NO_DRIVER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the window is a phone's: one screen, held upright, driven by a
 /// finger. The editor then wears the phone shell (ui/phone/) rather than
 /// the strip and the dock, whatever the screen's size - a tablet is a big
@@ -419,18 +528,23 @@ pub fn phone() -> bool {
 ///
 /// `on_files_dropped` fires on the event-loop thread with the paths of a
 /// file (or several) dragged in from outside the window - Finder, Explorer,
-/// a file manager - batched into one call per drag. It is taken here,
+/// a file manager - batched into one call per drag with the logical drop
+/// position when available. It is taken here,
 /// before the window exists, because the backend - and the hook into its
 /// event loop that OS drops arrive through - has to be selected before
 /// anything is built on top of it; see [`DropHandler`]. `on_focused` fires
 /// the same way each time the window is brought back to the front.
 #[cfg(not(target_os = "android"))]
 pub fn select_backend(
-    on_files_dropped: impl Fn(Vec<PathBuf>) + 'static,
+    on_files_dropped: impl Fn(Vec<PathBuf>, DropPosition) + 'static,
     on_pressed_away: impl Fn() + 'static,
     on_focused: impl Fn() + 'static,
     on_exiting: impl Fn() + 'static,
 ) -> Result<Option<Gpu>, PlatformError> {
+    // Software asked for before anything was found - a safe start, or the
+    // person - rather than the only adapter there is.
+    let chosen = std::env::var("CONCAT_GPU")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("software"));
     // The device the renderer and the monitor share. Taken first, because
     // the backend is selected with it.
     let mut gpu = Gpu::acquire();
@@ -453,12 +567,15 @@ pub fn select_backend(
     let software = asked || gpu.as_ref().is_some_and(Gpu::is_software);
     if asked {
         log::warn!(
-            "CONCAT_GPU=software: the window draws on the CPU and the monitor on a Metal device of its own"
+            "gpu: the window draws on the CPU, as asked at start, and the monitor on a Metal device of its own"
         );
     } else if software {
         log::warn!(
-            "the GPU adapter is a software rasteriser; the window draws on the CPU and the monitor on a device of its own"
+            "gpu: wanted a GPU and the adapter is a software rasteriser; the window draws on the CPU and the monitor on a device of its own"
         );
+        if !chosen {
+            NO_DRIVER.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if software {
         // SAFETY: the process is single-threaded at this point - the
@@ -467,7 +584,7 @@ pub fn select_backend(
         unsafe { std::env::set_var("CONCAT_GPU", "software") };
         gpu = None;
     } else if gpu.is_none() {
-        log::warn!("no GPU adapter; the monitor composites on the CPU");
+        log::warn!("gpu: wanted a GPU and found no adapter; the monitor composites on the CPU");
     }
 
     let mut selector = slint::BackendSelector::new()
@@ -648,7 +765,7 @@ fn fit_to_screen(window: &WinitWindow) {
     let room = f64::from(screen.height) * 0.9;
     if size.width > screen.width || f64::from(size.height) > room {
         log::info!(
-            "window: {}x{} does not fit the screen's {}x{}; maximised",
+            "display: the window's {}x{} does not fit the screen's {}x{} · maximised",
             size.width,
             size.height,
             screen.width,
@@ -683,7 +800,7 @@ pub fn is_maximized(window: &slint::Window) -> bool {
 /// desktop's and is never called.
 #[cfg(target_os = "android")]
 pub fn select_backend(
-    on_files_dropped: impl Fn(Vec<PathBuf>) + 'static,
+    on_files_dropped: impl Fn(Vec<PathBuf>, DropPosition) + 'static,
     // Android has no pointer to press away with; the screen's own keyboard
     // dismisses, and the field goes with it.
     _on_pressed_away: impl Fn() + 'static,
@@ -912,6 +1029,78 @@ pub fn install_link_opener(opener: LinkOpener) {
     let _ = LINK_OPENER.set(opener);
 }
 
+/// Hands log files to a phone's share sheet. Installed by the phone's own
+/// crate; see [`install_log_sharer`].
+#[cfg(target_os = "android")]
+pub type LogSharer = Box<dyn Fn(&[PathBuf]) -> Result<(), String> + Send + Sync>;
+
+#[cfg(target_os = "android")]
+static LOG_SHARER: std::sync::OnceLock<LogSharer> = std::sync::OnceLock::new();
+
+/// Installs how a phone shares the log. Once; a second call is ignored.
+#[cfg(target_os = "android")]
+pub fn install_log_sharer(sharer: LogSharer) {
+    let _ = LOG_SHARER.set(sharer);
+}
+
+/// Shares the log from a phone, which has no folder to show it in: the run
+/// before this one, which is the run a report is most often about (the
+/// person opened the app again to send it), and this one, whose first lines
+/// say how that one ended.
+#[cfg(target_os = "android")]
+pub fn share_log() -> Result<(), String> {
+    let files: Vec<PathBuf> = concat_host::logs::previous()
+        .map(|run| run.path.clone())
+        .into_iter()
+        .chain(concat_host::logs::current().map(std::path::Path::to_path_buf))
+        .filter(|path| path.is_file())
+        .collect();
+    log::info!("settings: Share the log · {} file(s)", files.len());
+    match (LOG_SHARER.get(), files.is_empty()) {
+        (_, true) => Err("this run keeps no log file".to_owned()),
+        (Some(share), false) => share(&files),
+        (None, false) => Err("this phone offers no way to share a file".to_owned()),
+    }
+}
+
+/// How the system says the run before this one ended, where it keeps a
+/// record (Android 11 and on): the log file that run was writing, and
+/// whether it died rather than being closed or put away.
+#[cfg(target_os = "android")]
+static LAST_EXIT: std::sync::OnceLock<(String, bool)> = std::sync::OnceLock::new();
+
+/// This run's log file's name, which a phone marks its process with.
+#[cfg(target_os = "android")]
+pub fn log_file_name() -> Option<String> {
+    let name = concat_host::logs::current()?.file_name()?;
+    name.to_str().map(str::to_owned)
+}
+
+/// Tells the window what the system said of the last run; see
+/// [`last_run_died`]. Called by the phone's own crate before the window
+/// runs.
+#[cfg(target_os = "android")]
+pub fn note_last_exit(log: String, died: bool) {
+    let _ = LAST_EXIT.set((log, died));
+}
+
+/// Whether the run before this one died - crashed, hung, or was killed
+/// while on screen - rather than ended. A phone's run almost never ends in
+/// order (it is swiped away, or put down in the background), so the lack
+/// of a last line says nothing there: the system's record of that run
+/// decides, and without one, a crash or a panic in the run's own file.
+#[cfg(target_os = "android")]
+pub fn last_run_died() -> bool {
+    let Some(previous) = concat_host::logs::previous() else {
+        return false;
+    };
+    let name = previous.path.file_name().and_then(|name| name.to_str());
+    match LAST_EXIT.get() {
+        Some((log, died)) if Some(log.as_str()) == name => *died,
+        _ => previous.died(),
+    }
+}
+
 /// Opens a web address in the system's browser: the launch screen's
 /// guides, the repository, the release notes. A desktop hands it to the
 /// platform's opener; Android to an ACTION_VIEW intent through the
@@ -1044,7 +1233,9 @@ pub fn pick_files_async(
         let kinds = PickKinds::of(filter.map(|(_, extensions)| extensions));
         match FILE_PICKER.get() {
             Some(picker) => picker(kinds, Box::new(on_picked)),
-            None => log::warn!("no file picker on this platform yet"),
+            None => log::warn!(
+                "import: wanted the system's file picker and this platform has none yet; nothing was picked"
+            ),
         }
     }
 }

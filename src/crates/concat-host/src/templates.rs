@@ -144,7 +144,7 @@ pub fn save(
 /// Copies one source file into `assets/` and returns its bundle-relative
 /// path. The bundle must be self-contained, so a missing source is an error,
 /// not a warning - a template that cannot find its own music is not one.
-fn bundle_file(assets: &Path, id: &str, source: &str) -> Result<String, String> {
+pub(crate) fn bundle_file(assets: &Path, id: &str, source: &str) -> Result<String, String> {
     if source.is_empty() {
         return Err(
             "a media item has no file behind it; fill or remove it before saving a template"

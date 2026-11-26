@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
+
+import { I18n } from "../i18n.slint";
+import { Button, Fmt, Glyph, Theme, Tip } from "../primitives/primitives.slint";
+import { Pane, PaneHeader } from "pane.slint";
+import { PaneKind, PaneSwitcher } from "pane-switcher.slint";
+
+export global ReferencePreview {
+    in property <bool> has-file;
+    in property <bool> frame-ready;
+    in property <bool> loading;
+    in property <bool> past-end;
+    in property <bool> playing;
+    in property <bool> showing-source;
+    in property <image> frame;
+    in property <string> file-name;
+    in property <string> error;
+    in property <float> time;
+    in property <float> duration;
+    in property <float> rate;
+
+    callback choose(seat: int);
+    callback clear();
+    callback seek(seconds: float);
+    callback toggle-playback();
+}
+
+component ReferenceButton inherits Button {
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.tip;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) { root.clicked(); }
+    }
+}
+
+export component ReferenceOpenButton inherits ReferenceButton {
+    in property <int> pane-seat;
+    square: true;
+    glyph: Glyph.image;
+    label: I18n.t("reference.title");
+    tip: I18n.t("reference.openHint");
+    clicked => { ReferencePreview.choose(root.pane-seat); }
+}
+
+component ReferenceSeekBar inherits Rectangle {
+    in property <bool> enabled;
+    height: 20px;
+    horizontal-stretch: 1;
+    accessible-role: slider;
+    accessible-label: I18n.t("reference.seek");
+    accessible-description: I18n.t("reference.seekHint");
+    accessible-enabled: root.enabled;
+    accessible-value: Fmt.frames-timecode(ReferencePreview.time, ReferencePreview.rate);
+    forward-focus: keys;
+
+    property <float> fraction: Math.max(0.0, Math.min(1.0,
+        ReferencePreview.time / Math.max(0.0001, ReferencePreview.duration)));
+
+    keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.RightArrow || event.text == Key.LeftArrow) {
+                ReferencePreview.seek(ReferencePreview.time
+                    + (event.text == Key.RightArrow ? 1 : -1) / Math.max(1, ReferencePreview.rate));
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+    }
+
+    Rectangle {
+        height: 4px;
+        y: (parent.height - self.height) / 2;
+        border-radius: 2px;
+        background: Theme.line-strong;
+
+        Rectangle {
+            x: 0;
+            width: parent.width * root.fraction;
+            height: parent.height;
+            border-radius: 2px;
+            background: Theme.accent;
+        }
+    }
+
+    Rectangle {
+        width: 8px;
+        height: 8px;
+        x: (parent.width - self.width) * root.fraction;
+        y: (parent.height - self.height) / 2;
+        border-radius: 4px;
+        background: root.enabled ? Theme.accent : Theme.line-strong;
+    }
+
+    function seek-at(x: length) {
+        ReferencePreview.seek(ReferencePreview.duration
+            * Math.max(0.0, Math.min(1.0, x / Math.max(1px, root.width))));
+    }
+
+    track := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                root.seek-at(self.mouse-x);
+            }
+        }
+        moved => { if (self.pressed) { root.seek-at(self.mouse-x); } }
+    }
+
+    Tip {
+        active: track.has-hover;
+        text: I18n.t("reference.seekHint");
+    }
+}
+
+export component ReferencePane inherits Rectangle {
+    in property <int> pane-seat;
+    in property <bool> pane-removable: true;
+    callback pane-picked(PaneKind);
+    callback pane-removed();
+
+    Pane {
+        PaneHeader {
+            title: I18n.t("reference.title");
+
+            VerticalLayout {
+                alignment: center;
+                ReferenceButton {
+                    label: I18n.t("reference.choose");
+                    tip: I18n.t("reference.chooseHint");
+                    square: true;
+                    glyph: Glyph.folder;
+                    clicked => { ReferencePreview.choose(root.pane-seat); }
+                }
+            }
+            if ReferencePreview.has-file: VerticalLayout {
+                alignment: center;
+                ReferenceButton {
+                    label: I18n.t("reference.clear");
+                    tip: I18n.t("reference.clearHint");
+                    square: true;
+                    glyph: Glyph.close;
+                    clicked => { ReferencePreview.clear(); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                PaneSwitcher {
+                    kind: PaneKind.reference;
+                    seat: root.pane-seat;
+                    removable: root.pane-removable;
+                    picked(kind) => { root.pane-picked(kind); }
+                    removed => { root.pane-removed(); }
+                }
+            }
+        }
+
+        if ReferencePreview.has-file: HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            height: 26px;
+            Text {
+                text: ReferencePreview.file-name;
+                color: Theme.fg-muted;
+                font-size: Theme.fs-sm;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            border-radius: Theme.r;
+            background: Theme.well;
+            clip: true;
+
+            if ReferencePreview.has-file && ReferencePreview.frame-ready
+                && !ReferencePreview.past-end && !ReferencePreview.showing-source: Image {
+                source: ReferencePreview.frame;
+                image-fit: contain;
+                width: parent.width;
+                height: parent.height;
+            }
+
+            Text {
+                x: 12px;
+                width: Math.max(0px, parent.width - 24px);
+                height: parent.height;
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+                wrap: word-wrap;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                text: ReferencePreview.loading ? I18n.t("reference.loading")
+                    : ReferencePreview.error != "" ? ReferencePreview.error
+                    : !ReferencePreview.has-file ? I18n.t("reference.empty")
+                    : ReferencePreview.showing-source ? I18n.t("reference.sourceMode")
+                    : ReferencePreview.past-end ? I18n.t("reference.pastEnd")
+                    : !ReferencePreview.frame-ready ? I18n.t("reference.loadingFrame")
+                    : "";
+            }
+        }
+
+        if ReferencePreview.has-file: VerticalLayout {
+            padding: 8px;
+            spacing: 4px;
+
+            ReferenceSeekBar { enabled: !ReferencePreview.showing-source; }
+
+            HorizontalLayout {
+                spacing: 6px;
+
+                ReferenceButton {
+                    square: true;
+                    label: ReferencePreview.playing ? I18n.t("reference.pause") : I18n.t("reference.play");
+                    tip: I18n.t("reference.playHint");
+                    glyph: ReferencePreview.playing ? Glyph.pause : Glyph.play;
+                    enabled: !ReferencePreview.showing-source;
+                    clicked => { ReferencePreview.toggle-playback(); }
+                }
+
+                Text {
+                    text: Fmt.frames-timecode(ReferencePreview.time, ReferencePreview.rate)
+                        + " / " + Fmt.frames-timecode(ReferencePreview.duration, ReferencePreview.rate);
+                    horizontal-stretch: 1;
+                    color: Theme.fg-muted;
+                    font-size: Theme.fs-sm;
+                    font-family: Theme.font-technical;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}

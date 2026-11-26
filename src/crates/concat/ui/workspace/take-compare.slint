@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
+
+import { I18n } from "../i18n.slint";
+import { Button, Glyph, IconButton, NumberField, Select, Theme, Tip } from "../primitives/primitives.slint";
+import { PaneScroll } from "pane.slint";
+
+export global TakeCompare {
+    in property <bool> open;
+    in property <string> slot;
+    in property <string> original;
+    in property <[string]> candidates;
+    in-out property <int> choice: -1;
+    in-out property <float> source-start;
+    in property <float> max-start;
+    in property <bool> ready;
+    in property <bool> showing-alternative;
+    in property <string> error;
+    callback close();
+    callback choose(index: int);
+    callback show(alternative: bool);
+    callback change-start(seconds: float);
+    callback apply();
+}
+
+export component TakeComparePane inherits VerticalLayout {
+    padding: 8px;
+    spacing: 8px;
+
+    HorizontalLayout {
+        spacing: 8px;
+
+        Text {
+            text: I18n.t("takeCompare.title");
+            color: Theme.fg;
+            font-size: Theme.fs-lg;
+            font-weight: Theme.weight-title;
+            vertical-alignment: center;
+            min-width: 0px;
+            overflow: elide;
+        }
+        IconButton {
+            glyph: Glyph.close;
+            label: I18n.t("takeCompare.closeTip");
+            accessible-role: button;
+            accessible-label: self.label;
+            accessible-action-default => { TakeCompare.close(); }
+            clicked => { TakeCompare.close(); }
+        }
+    }
+
+    PaneScroll {
+        vertical-stretch: 1;
+
+        VerticalLayout {
+            padding-right: 8px;
+            spacing: 8px;
+
+            Text {
+                text: TakeCompare.slot;
+                color: Theme.fg;
+                min-width: 0px;
+                overflow: elide;
+            }
+
+            Text {
+                text: I18n.t1("takeCompare.originalFile", TakeCompare.original);
+                color: Theme.fg-muted;
+                min-width: 0px;
+                overflow: elide;
+            }
+
+            if TakeCompare.candidates.length == 0: Text {
+                text: I18n.t("takeCompare.empty");
+                color: Theme.fg-muted;
+                wrap: word-wrap;
+            }
+
+            if TakeCompare.candidates.length > 0: choice := TouchArea {
+                height: Theme.h;
+                Select {
+                    options: TakeCompare.candidates;
+                    current <=> TakeCompare.choice;
+                    placeholder: I18n.t("takeCompare.pick");
+                    changed(index) => { TakeCompare.choose(index); }
+                }
+                Tip {
+                    active: choice.has-hover;
+                    text: I18n.t("takeCompare.pickTip");
+                }
+            }
+
+            if TakeCompare.ready: VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: I18n.t("takeCompare.inPoint");
+                    color: Theme.fg-muted;
+                    wrap: word-wrap;
+                }
+                input := TouchArea {
+                    height: Theme.h;
+                    NumberField {
+                        value <=> TakeCompare.source-start;
+                        minimum: 0;
+                        maximum: TakeCompare.max-start;
+                        precision: 3;
+                        step: 0.01;
+                        changed(value) => { TakeCompare.change-start(value); }
+                    }
+                    Tip {
+                        active: input.has-hover;
+                        text: I18n.t("takeCompare.inPointTip");
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                Button {
+                    block: true;
+                    primary: !TakeCompare.showing-alternative;
+                    label: I18n.t("takeCompare.original");
+                    tip: I18n.t("takeCompare.originalTip");
+                    accessible-role: button;
+                    accessible-label: self.label;
+                    accessible-description: self.tip;
+                    accessible-action-default => { TakeCompare.show(false); }
+                    clicked => { TakeCompare.show(false); }
+                }
+                Button {
+                    block: true;
+                    primary: TakeCompare.showing-alternative;
+                    enabled: TakeCompare.ready;
+                    label: I18n.t("takeCompare.alternative");
+                    tip: I18n.t("takeCompare.alternativeTip");
+                    accessible-role: button;
+                    accessible-label: self.label;
+                    accessible-enabled: self.enabled;
+                    accessible-description: self.tip;
+                    accessible-action-default => { if (TakeCompare.ready) { TakeCompare.show(true); } }
+                    clicked => { TakeCompare.show(true); }
+                }
+            }
+
+            if TakeCompare.error != "": Text {
+                text: TakeCompare.error;
+                color: Theme.danger;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    Button {
+        block: true;
+        primary: true;
+        enabled: TakeCompare.ready;
+        label: I18n.t("takeCompare.apply");
+        tip: I18n.t("takeCompare.applyTip");
+        accessible-role: button;
+        accessible-label: self.label;
+        accessible-enabled: self.enabled;
+        accessible-description: self.tip;
+        accessible-action-default => { if (TakeCompare.ready) { TakeCompare.apply(); } }
+        clicked => { TakeCompare.apply(); }
+    }
+}

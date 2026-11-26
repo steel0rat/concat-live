@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
+
+import { I18n } from "../i18n.slint";
+import { Button, Glyph, Icon, Modal, Theme, Tip } from "../primitives/primitives.slint";
+import { PaneScroll } from "../workspace/pane.slint";
+
+export struct ClickRowData {
+    stamp: string,
+    track: string,
+    clips: string,
+    selected: bool,
+}
+
+export global ClickReview {
+    in property <bool> open;
+    in property <bool> busy;
+    in property <[ClickRowData]> rows;
+    in property <int> chosen;
+    in property <int> active-row: -1;
+    in property <bool> after;
+    in property <string> error;
+    callback close();
+    callback toggle(row: int);
+    callback audition(row: int, after: bool);
+    callback apply();
+}
+
+component ClickToggle inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked();
+
+    min-width: 26px;
+    max-width: 26px;
+    border-radius: Theme.r-sm;
+    border-width: 1px;
+    border-color: key.has-focus || root.selected ? Theme.accent : Theme.line;
+    background: touch.has-hover ? Theme.field-hover : Theme.well;
+    accessible-role: checkbox;
+    accessible-label: root.label;
+    accessible-description: I18n.t("clickReview.selectTip");
+    accessible-checkable: true;
+    accessible-checked: root.selected;
+    accessible-action-default => { root.clicked(); }
+    forward-focus: key;
+
+    key := FocusScope {
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+    }
+    if root.selected: Icon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        glyph: Glyph.check;
+        tint: Theme.accent;
+        size: 14px;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { key.focus(); root.clicked(); }
+    }
+    Tip {
+        text: I18n.t("clickReview.selectTip");
+        active: touch.has-hover;
+    }
+}
+
+component ClickAudition inherits Button {
+    in property <int> index;
+    in property <bool> with-fades;
+    in property <string> stamp;
+    property <bool> active: ClickReview.active-row == root.index
+        && ClickReview.after == root.with-fades;
+
+    glyph: root.active ? Glyph.stop : Glyph.play;
+    label: root.active ? I18n.t("clickReview.stop")
+        : root.with-fades ? I18n.t("clickReview.after") : I18n.t("clickReview.before");
+    tip: root.active ? I18n.t("clickReview.stopTip")
+        : root.with-fades ? I18n.t("clickReview.afterTip") : I18n.t("clickReview.beforeTip");
+    accessible-role: button;
+    accessible-label: root.label + " " + root.stamp;
+    accessible-description: root.tip;
+    accessible-action-default => { ClickReview.audition(root.index, root.with-fades); }
+    clicked => { ClickReview.audition(root.index, root.with-fades); }
+}
+
+export component ClickReviewDialog inherits Modal {
+    open: ClickReview.open;
+    title: I18n.t("clickReview.title");
+    glyph: Glyph.waveform;
+    surface-width: 560px;
+    surface-height: 420px;
+    closed => { ClickReview.close(); }
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        if ClickReview.busy: Text {
+            text: I18n.t("clickReview.scanning");
+            color: Theme.fg-muted;
+            wrap: word-wrap;
+        }
+
+        if ClickReview.error != "": Text {
+            text: ClickReview.error;
+            color: Theme.danger;
+            wrap: word-wrap;
+        }
+
+        if !ClickReview.busy && ClickReview.rows.length == 0 && ClickReview.error == "": Text {
+            text: I18n.t("clickReview.noClicks");
+            color: Theme.fg-muted;
+            wrap: word-wrap;
+        }
+
+        PaneScroll {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 6px;
+                padding-right: 8px;
+                for item[index] in ClickReview.rows: HorizontalLayout {
+                    height: 46px;
+                    spacing: 7px;
+                    ClickToggle {
+                        label: item.track + " · " + item.stamp;
+                        selected: item.selected;
+                        clicked => { ClickReview.toggle(index); }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text {
+                            text: item.track + " · " + item.stamp;
+                            color: Theme.fg;
+                            min-width: 0px;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: item.clips;
+                            color: Theme.fg-muted;
+                            font-size: Theme.fs-sm;
+                            min-width: 0px;
+                            overflow: elide;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        ClickAudition {
+                            index: index;
+                            stamp: item.stamp;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        ClickAudition {
+                            index: index;
+                            stamp: item.stamp;
+                            with-fades: true;
+                        }
+                    }
+                }
+            }
+        }
+
+        Button {
+            block: true;
+            primary: true;
+            enabled: ClickReview.chosen > 0;
+            label: I18n.t("clickReview.apply");
+            tip: I18n.t("clickReview.applyTip");
+            accessible-role: button;
+            accessible-label: self.label;
+            accessible-description: self.tip;
+            accessible-enabled: self.enabled;
+            accessible-action-default => { if (ClickReview.chosen > 0) { ClickReview.apply(); } }
+            clicked => { ClickReview.apply(); }
+        }
+    }
+}

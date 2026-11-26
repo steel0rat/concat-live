@@ -306,6 +306,7 @@ fn pane_name(kind: PaneKind) -> &'static str {
     match kind {
         PaneKind::Media => "media",
         PaneKind::Preview => "preview",
+        PaneKind::Reference => "reference",
         PaneKind::Inspector => "inspector",
         PaneKind::Timeline => "timeline",
         PaneKind::Keyframes => "keyframes",
@@ -317,6 +318,7 @@ fn pane_of(name: &str) -> Option<PaneKind> {
     Some(match name {
         "media" => PaneKind::Media,
         "preview" => PaneKind::Preview,
+        "reference" => PaneKind::Reference,
         "inspector" => PaneKind::Inspector,
         "timeline" => PaneKind::Timeline,
         "keyframes" => PaneKind::Keyframes,

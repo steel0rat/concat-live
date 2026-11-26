@@ -13,16 +13,19 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    AppliedFilter, AudioTrack, Background, Clip, ClipKind, ClipMotion, ColorRange, ColorSpace,
-    Crop, CustomFont, Cutout, CutoutMode, Enhanced, Framing, KeyEase, KeyProperty, Mask, MediaItem,
-    MediaKind, MediaOrigin, Project, RunStyle, ShapeStyle, SpeedPoint, Stabilize, Stroke,
-    TextStyle, Timeline, Track, Transition, VideoSettings, VoiceMix,
+    AppliedFilter, AudioTrack, Background, BeatMarks, Clip, ClipKind, ClipMotion, ColorRange,
+    ColorSpace, Crop, CustomFont, Cutout, CutoutMode, Enhanced, Framing, KeyEase, KeyProperty,
+    Mask, MediaItem, MediaKind, MediaOrigin, Project, RunStyle, ShapeStyle, SpeedPoint, Stabilize,
+    Stroke, TextStyle, Timeline, Track, Transition, VideoSettings, VoiceMix,
 };
 
 mod audio;
+pub mod blocks;
 mod clips;
 pub use clips::{PlayheadSide, consolidation_clips, delete_to_playhead, why_not_merge};
 mod media;
+mod pauses;
+pub use pauses::validate_clip_pauses;
 mod properties;
 mod timelines;
 mod tracks;
@@ -82,6 +85,19 @@ pub struct ClipMove {
     /// Destination track. An unknown id moves the clip in time but leaves it
     /// on its current track.
     pub track_id: String,
+}
+
+/// A proposed removal, in the timeline's original time.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipPause {
+    /// The audio or video clip to shorten.
+    pub clip_id: String,
+    /// The beginning of the cut, in timeline seconds.
+    pub start: f64,
+    /// The end of the cut, in timeline seconds.
+    pub end: f64,
 }
 
 /// A partial update to one clip. Every field optional; `transition_in` and
@@ -311,6 +327,14 @@ pub enum Command {
         /// The commands, applied in order. Nesting is legal.
         commands: Vec<Command>,
     },
+    /// Insert the block that the window has prepared and verified on disk.
+    #[serde(skip)]
+    InsertBlock {
+        /// The window has already verified and rebased its file dependencies.
+        block: Box<blocks::Block>,
+        /// Where the first clip starts on the destination timeline.
+        start: f64,
+    },
     /// Places a clip of `media_id` on a named track, minting a "c" id.
     /// Duration comes from the media (five seconds for a still or unknown
     /// length); errs if the media or track no longer exists.
@@ -355,6 +379,16 @@ pub enum Command {
         /// nearest gap.
         #[serde(default)]
         ripple: bool,
+    },
+    /// Places ranges of one video end to end on the lowest lane free for
+    /// the whole run, opening a lane if needed. The run is one undo step.
+    AddSourceRanges {
+        /// The bin item to cut from.
+        media_id: String,
+        /// Source in and out times in seconds, in order of placement.
+        ranges: Vec<[f64; 2]>,
+        /// Timeline position of the first range in seconds, floored at 0.
+        start: f64,
     },
     /// Places a title: a clip with no media behind it, named after the
     /// text's first line, minting a "c" id.
@@ -463,12 +497,15 @@ pub enum Command {
         /// The clip to retime.
         clip_id: String,
         /// The curve, or None for a constant rate at the current mean.
+        /// Its points are put in order of `at`, held to `0..=1` and to the
+        /// speed range, and reach both ends of the clip, as they will be
+        /// played and saved. A curve with no usable point is None.
+        #[serde(default)]
         curve: Option<Vec<SpeedPoint>>,
-        /// When true - the magnetic timeline - the clips after it on its
-        /// lane move by however far its end moved, either way, so a clip
-        /// sped up closes up behind it as a magnetic trim does. False
-        /// leaves the gap; later clips then only move out of the way of a
-        /// clip that grew over them.
+        /// The magnetic timeline: the clips behind on the lane follow the
+        /// clip's end whether it grows or shrinks, closing up the gap a
+        /// shrink would leave. False moves them only to make room when the
+        /// clip grows over the next.
         #[serde(default)]
         ripple: bool,
     },
@@ -682,6 +719,18 @@ pub enum Command {
         /// The cut point, in timeline seconds.
         time: f64,
     },
+    /// Removes the given intervals and packs the surviving pieces into
+    /// each clip's original slot. Other clips stay where they were. The
+    /// entire operation is one undo step; an invalid cut refuses the edit.
+    TrimClipPauses {
+        /// The active timeline as it was when the cuts were reviewed.
+        timeline_id: String,
+        /// Cuts strictly inside their respective audio or video clips.
+        cuts: Vec<ClipPause>,
+        /// An explicit Out point. Pieces after it keep their timeline position.
+        #[serde(default)]
+        scope_end: Option<f64>,
+    },
     /// Points a clip at another file - the enhanced or reversed copy of
     /// its media - adding the file to the bin first when it is not there.
     /// The clip's length, looks and name are kept, and its in-point unless
@@ -816,12 +865,12 @@ pub enum Command {
         /// The clip to retime. An unknown id is a no-op.
         clip_id: String,
         /// The new rate, clamped into 0.0625..=16 (the engine's range).
+        /// A speed curve the clip had ends: the footage it covered is kept.
         speed: f64,
-        /// When true - the magnetic timeline - the clips after it on its
-        /// lane move by however far its end moved, either way, so a clip
-        /// sped up closes up behind it as a magnetic trim does. False
-        /// leaves the gap; later clips then only move out of the way of a
-        /// clip that grew over them.
+        /// The magnetic timeline: the clips behind on the lane follow the
+        /// clip's end whether it grows or shrinks, closing up the gap a
+        /// shrink would leave. False moves them only to make room when the
+        /// clip grows over the next.
         #[serde(default)]
         ripple: bool,
     },
@@ -849,10 +898,10 @@ pub enum Command {
     /// Sizes a picture to the frame in one step: fitted whole inside it,
     /// or covering it, centred either way and unstretched (see
     /// [`crate::model::framing_scale`]; a turned picture is sized as turned).
-    /// A scale or a position with keys gets a key at `at` rather than a new
-    /// constant, the way every edit of a keyed property lands, so the rest
-    /// of the ride is left as it was. A no-op for a clip that is not a video
-    /// or a still, or whose media's size is unknown.
+    /// A scale, a position or a stretch with keys gets a key at `at` rather
+    /// than a new constant, the way every edit of a keyed property lands, so
+    /// the rest of the ride is left as it was. A no-op for a clip that is
+    /// not a video or a still, or whose media's size is unknown.
     FrameClip {
         /// The clip to size. An unknown id is a no-op.
         clip_id: String,
@@ -935,6 +984,25 @@ pub enum Command {
         /// On: the other lanes follow the main one.
         on: bool,
     },
+    /// Links each translated cue to its original without changing the original text.
+    #[serde(skip)]
+    ImportCaptionTranslation {
+        /// The timeline from which the existing caption cues are read.
+        timeline_id: String,
+        /// Only subtitles on this lane may match the imported cues.
+        track_id: String,
+        /// The name of the version as a standard language tag.
+        language: String,
+        /// SubRip text whose timings identify the original cues.
+        srt: String,
+    },
+    /// Changes the named sections used to plan and publish the timeline.
+    SetTimelineSections {
+        /// The timeline to change.
+        timeline_id: String,
+        /// The complete section list with anchors and planned durations.
+        sections: Vec<crate::sections::Section>,
+    },
     /// Renames a timeline tab. Whitespace-only names are ignored so a tab
     /// can never end up blank; unknown ids are tolerated.
     RenameTimeline {
@@ -993,6 +1061,17 @@ pub enum Command {
         /// own tag.
         range: Option<ColorRange>,
     },
+    /// Asks for a media file's beats - listened to, marked along every
+    /// clip of it on every timeline at the beats `marks` names, snapped to
+    /// when the timeline snaps - or, with None, stops asking. A file of
+    /// its own, not the app's: one song cut to, another only underneath.
+    /// An unknown id is a no-op.
+    SetMediaBeats {
+        /// The bin item.
+        media_id: String,
+        /// Which beats, or None for none.
+        marks: Option<BeatMarks>,
+    },
 }
 
 /// What a command produced, beyond the new state: the ids it minted, so the
@@ -1028,6 +1107,21 @@ pub enum CommandError {
     /// A clip-placing command named media no longer in the bin.
     #[error("That media is no longer in the bin.")]
     MediaGone,
+    /// A source range requires an ordinary video in the media bin.
+    #[error("Source ranges require a video from the media bin.")]
+    NotAVideoSource,
+    /// At least one of the ranges cannot be placed as supplied.
+    #[error("A source range is too short or falls outside the source or timeline.")]
+    InvalidSourceRanges,
+    /// The submitted timeline sections contained invalid text or timing.
+    #[error("A section has an invalid name, duration, anchor or ID.")]
+    InvalidTimelineSections,
+    /// The translated captions did not match the chosen timeline or lane.
+    #[error("The subtitle translation could not be imported: {0:?}")]
+    InvalidCaptionTranslation(crate::caption_translations::Error),
+    /// The prepared fragment could not fit this project.
+    #[error("The montage block could not be inserted: {0:?}")]
+    CannotInsertBlock(blocks::Error),
     /// A clip-placing command named a track no longer on the timeline.
     #[error("That track no longer exists.")]
     TrackGone,
@@ -1040,6 +1134,12 @@ pub enum CommandError {
     CannotMerge {
         /// The [`why_not_merge`] sentence, verbatim.
         reason: String,
+    },
+    /// [`Command::TrimClipPauses`] cannot apply the proposed cut.
+    #[error("{reason}")]
+    CannotTrimPauses {
+        /// The reason to show the person who is reviewing the cuts.
+        reason: &'static str,
     },
     /// [`Command::RemoveTrack`] would have deleted the last track.
     #[error("A timeline needs at least one track.")]
@@ -1098,6 +1198,11 @@ impl IdMint {
             for clip in &timeline.clips {
                 self.adopt(&clip.id);
             }
+        }
+        // And every id in what the read held unread: a clip minted here
+        // must never share an id with one the file still carries.
+        for id in project.unread.ids() {
+            self.adopt(id);
         }
     }
 }
@@ -1170,9 +1275,13 @@ impl Command {
             Command::AddMedia { item }
             | Command::FillSlot { item, .. }
             | Command::ConsolidateClips { item, .. } => bad(item.duration) || bad(item.frame_rate),
-            Command::AddClip { start, .. }
+            Command::InsertBlock { start, .. }
+            | Command::AddClip { start, .. }
             | Command::AddClipAtFirstFree { start, .. }
             | Command::AddClipsInSequence { start, .. } => bad([*start]),
+            Command::AddSourceRanges { ranges, start, .. } => {
+                bad([*start]) || ranges.iter().any(|range| bad(*range))
+            }
             Command::AddShapeClip {
                 start,
                 duration,
@@ -1237,6 +1346,9 @@ impl Command {
             Command::MoveClips { moves } => bad(moves.iter().map(|wanted| wanted.start)),
             Command::TrimClip { delta, .. } => bad([*delta]),
             Command::SplitClips { time, .. } => bad([*time]),
+            Command::TrimClipPauses {
+                cuts, scope_end, ..
+            } => bad(*scope_end) || bad(cuts.iter().flat_map(|cut| [cut.start, cut.end])),
             Command::FreezeFrame { time, duration, .. } => bad([*time]) || bad(*duration),
             Command::ReplaceClipMedia {
                 item,
@@ -1338,6 +1450,16 @@ pub fn apply(
         return Err(CommandError::NotANumber);
     }
     match command {
+        Command::InsertBlock { block, start } => {
+            let created = block
+                .apply(project, mint, start)
+                .map_err(CommandError::CannotInsertBlock)?;
+            Ok(Outcome {
+                created_id: created.into_iter().next(),
+                applied: true,
+            })
+        }
+
         Command::Batch { commands } => {
             // All or nothing: apply to a staged copy and commit only a fully
             // successful run, so one bad command cannot leave a half-applied
@@ -1359,6 +1481,11 @@ pub fn apply(
             })
         }
 
+        Command::TrimClipPauses {
+            timeline_id,
+            cuts,
+            scope_end,
+        } => pauses::apply(project, mint, &timeline_id, &cuts, scope_end),
         command @ (Command::AddMedia { .. }
         | Command::SetMediaPlaceholder { .. }
         | Command::FillSlot { .. }
@@ -1366,10 +1493,12 @@ pub fn apply(
         | Command::AddFont { .. }
         | Command::RemoveFont { .. }
         | Command::UpdateMediaPath { .. }
-        | Command::SetMediaColorRange { .. }) => media::apply(project, mint, command),
+        | Command::SetMediaColorRange { .. }
+        | Command::SetMediaBeats { .. }) => media::apply(project, mint, command),
         command @ (Command::AddClip { .. }
         | Command::AddClipAtFirstFree { .. }
         | Command::AddClipsInSequence { .. }
+        | Command::AddSourceRanges { .. }
         | Command::AddTextClip { .. }
         | Command::AddShapeClip { .. }
         | Command::AddLayerClip { .. }
@@ -1414,6 +1543,8 @@ pub fn apply(
         | Command::SetTimelineVideo { .. }
         | Command::SetTimelineBackground { .. }
         | Command::SetTimelineLinkage { .. }
+        | Command::SetTimelineSections { .. }
+        | Command::ImportCaptionTranslation { .. }
         | Command::RemoveTimeline { .. }
         | Command::RenameTimeline { .. }
         | Command::SelectTimeline { .. }

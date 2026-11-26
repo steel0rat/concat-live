@@ -181,13 +181,14 @@ struct Approval {
 pub(super) struct Protocol {
     context: Context,
     resume: Option<String>,
+    restore_history: bool,
     chat_lookup: Option<ChatLookup>,
     next_id: u64,
     pending: HashMap<u64, (Pending, Instant)>,
     thread: Option<String>,
     turn: Option<String>,
     completed: HashSet<String>,
-    queued: Option<(String, String)>,
+    queued: Option<(String, String, String)>,
     pub(super) selection: ModelSelection,
     unacknowledged_user: Option<String>,
     active: bool,
@@ -197,10 +198,11 @@ pub(super) struct Protocol {
 }
 
 impl Protocol {
-    pub fn new(context: Context, resume: Option<String>) -> Self {
+    pub fn new(context: Context, resume: Option<String>, restore_history: bool) -> Self {
         Self {
             context,
             resume,
+            restore_history,
             chat_lookup: None,
             next_id: 0,
             pending: HashMap::new(),
@@ -336,6 +338,17 @@ impl Protocol {
         Ok(vec![Effect::Write(request)])
     }
 
+    fn chat_open_failed(&self) -> Result<Vec<Effect>, String> {
+        if self.connected() {
+            Ok(vec![Effect::Show(Event::ChatOpenFailed)])
+        } else {
+            Err(
+                "Could not restore the last chat. Reconnect to try again or open a new chat."
+                    .into(),
+            )
+        }
+    }
+
     pub fn older_messages(&mut self, cursor: String) -> Option<Effect> {
         let thread = self.thread.clone()?;
         Some(Effect::Write(self.transcript_page(
@@ -465,14 +478,27 @@ impl Protocol {
         effects
     }
 
+    #[cfg(test)]
     pub fn submit(&mut self, text: String, id: String) -> Result<Vec<Effect>, String> {
+        self.submit_with_detail(text, id, String::new())
+    }
+
+    pub fn submit_with_detail(
+        &mut self,
+        text: String,
+        id: String,
+        detail: String,
+    ) -> Result<Vec<Effect>, String> {
+        if !self.connected() && self.restore_history {
+            return Err("Wait for the last chat to reopen before sending.".into());
+        }
         if self.active || self.queued.is_some() || self.switching_chat() {
             return Err("Codex is already working on a request.".into());
         }
         if self.context.path.to_str().is_none() {
             return Err("The working folder path is not valid UTF-8".into());
         }
-        self.queued = Some((text, id));
+        self.queued = Some((text, id, detail));
         self.interrupt_requested = false;
         Ok(self.begin_turn())
     }
@@ -539,7 +565,7 @@ impl Protocol {
             return self
                 .fail_queued("Codex lost the conversation before the request was sent".into());
         };
-        let Some((text, id)) = self.queued.take() else {
+        let Some((text, id, detail)) = self.queued.take() else {
             return Vec::new();
         };
         self.unacknowledged_user = Some(id.clone());
@@ -549,7 +575,7 @@ impl Protocol {
             "clientUserMessageId": id,
             "input": [
                 {"type": "text", "text": text},
-                {"type": "text", "text": format!("{APPLICATION_CONTEXT}{}. {}", self.context.path.display(), self.context_note())},
+                {"type": "text", "text": format!("{APPLICATION_CONTEXT}{}. {}{detail}", self.context.path.display(), self.context_note())},
                 skill
             ]
         });
@@ -643,7 +669,7 @@ impl Protocol {
         if message.get("error").is_some() || message.get("result").is_none() {
             let failed = match &kind {
                 Pending::OpenTranscript(_) | Pending::ChangeThread { .. } => {
-                    Some(Event::ChatOpenFailed)
+                    return self.chat_open_failed();
                 }
                 Pending::OlderMessages(_) => Some(Event::OlderMessagesFailed),
                 _ => None,
@@ -694,9 +720,13 @@ impl Protocol {
                     return Err("Codex is not signed in. Run codex login, then reconnect.".into());
                 }
                 let resume = self.resume.clone();
-                effects.push(Effect::Write(
-                    self.thread_request(resume.as_deref(), Pending::Thread)?,
-                ));
+                let request = match resume {
+                    Some(id) if self.restore_history => {
+                        self.transcript_page(&id, None, Pending::OpenTranscript(id.clone()))
+                    }
+                    _ => self.thread_request(resume.as_deref(), Pending::Thread)?,
+                };
+                effects.push(Effect::Write(request));
             }
             Pending::Thread => {
                 let id = required(&result["thread"], "id")?.to_owned();
@@ -719,14 +749,14 @@ impl Protocol {
                         },
                     )?));
                 } else {
-                    effects.push(Effect::Show(Event::ChatOpenFailed));
+                    return self.chat_open_failed();
                 }
             }
             Pending::ChangeThread { expected, page } => {
                 let Some(id) = result["thread"]["id"].as_str().filter(|id| {
                     !id.is_empty() && expected.as_deref().is_none_or(|expected| expected == *id)
                 }) else {
-                    return Ok(vec![Effect::Show(Event::ChatOpenFailed)]);
+                    return self.chat_open_failed();
                 };
                 // Wait for the transcript and resume to succeed before switching.
                 // Responses still pending for the previous chat cannot update this one.
@@ -1254,6 +1284,7 @@ mod tests {
                 epoch: 7,
             },
             None,
+            false,
         )
     }
     fn write(effects: &[Effect], method: &str) -> Value {
@@ -2135,6 +2166,59 @@ mod tests {
         let next = submit_turn(&mut p, "Add titles", "next");
         assert_eq!(next["params"]["threadId"], "saved");
         assert_eq!(next["params"]["input"][2]["name"], DEFAULT_SKILL);
+    }
+
+    #[test]
+    fn restoring_a_projects_chat_on_start_opens_the_transcript_before_resuming() {
+        let mut p = protocol();
+        p.resume = Some("remembered".into());
+        p.restore_history = true;
+        let init = p.initialize();
+        let account = write(
+            &p.receive(json!({"id":init["id"],"result":{}})).unwrap(),
+            "account/read",
+        );
+        assert!(p.submit("Wait".into(), "user".into()).is_err());
+        let history = write(
+            &p.receive(json!({"id":account["id"],"result":{"requiresOpenaiAuth":false}}))
+                .unwrap(),
+            "thread/turns/list",
+        );
+        assert_eq!(history["params"]["threadId"], "remembered");
+        let resume = write(
+            &p.receive(json!({"id":history["id"],"result":{"data":[
+                {"id":"turn","items":[{"id":"answer","type":"agentMessage","text":"Previously"}]}
+            ]}}))
+            .unwrap(),
+            "thread/resume",
+        );
+        assert!(!p.connected());
+        assert_eq!(resume["params"]["threadId"], "remembered");
+        let effects = p
+            .receive(json!({"id":resume["id"],"result":{"thread":{"id":"remembered"}}}))
+            .unwrap();
+        let Some(Effect::Show(Event::ChatOpened { id, page })) = effects.first() else {
+            panic!("chat not restored");
+        };
+        assert_eq!(id, "remembered");
+        assert_eq!(page.messages[0].text, "Previously");
+        assert_eq!(
+            submit_turn(&mut p, "Continue", "user")["params"]["threadId"],
+            "remembered"
+        );
+    }
+
+    #[test]
+    fn failing_to_restore_on_start_does_not_create_a_replacement_thread() {
+        let mut p = protocol();
+        let request = p.transcript_page("saved", None, Pending::OpenTranscript("saved".into()));
+        let result = p.receive(json!({"id":request["id"],"error":{"code":-32602}}));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Could not restore the last chat")
+        );
+        assert!(!p.connected());
     }
 
     #[test]

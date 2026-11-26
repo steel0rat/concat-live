@@ -28,6 +28,7 @@ pub type Subscriber = Arc<dyn Fn(&Event) -> bool + Send + Sync>;
 /// One call waiting its turn.
 struct Task {
     request: Request,
+    client_id: Option<String>,
     respond: Box<dyn FnOnce(Response) + Send>,
 }
 
@@ -89,7 +90,7 @@ impl Hub {
                     // CLI's server and the tests, not the window built
                     // with `--profile app`, which aborts on any panic.
                     let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        api.dispatch(task.request)
+                        api.dispatch_from(task.request, task.client_id.as_deref())
                     }))
                     .unwrap_or_else(|panic| {
                         let what = panic
@@ -122,6 +123,10 @@ impl Hub {
 
     /// Runs one request on the API's thread and waits for its response.
     pub fn call(&self, request: Request) -> Response {
+        self.call_from(request, None)
+    }
+
+    pub(crate) fn call_from(&self, request: Request, client_id: Option<&str>) -> Response {
         let gone = || {
             Response::Error(ApiError::new(
                 ErrorCode::Failed,
@@ -131,6 +136,7 @@ impl Hub {
         let (answer, wait) = mpsc::channel::<Response>();
         let task = Task {
             request,
+            client_id: client_id.map(str::to_owned),
             respond: Box::new(move |response| {
                 let _ = answer.send(response);
             }),

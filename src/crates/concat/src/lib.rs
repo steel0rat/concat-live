@@ -34,7 +34,11 @@ mod ui {
 mod agent;
 mod batch_volume;
 mod chips;
+mod click_review;
+mod cover_frame;
+mod cover_pane;
 mod dock;
+mod effect_words;
 mod fonts;
 mod format;
 mod gpu;
@@ -63,15 +67,33 @@ pub use platform::{
 };
 #[cfg(target_os = "android")]
 pub use platform::{LinkOpener, install_link_opener};
+#[cfg(target_os = "android")]
+pub use platform::{LogSharer, install_log_sharer, log_file_name, note_last_exit};
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub use platform::{MicrophoneAccess, install_microphone_access};
+/// What a backend's hooks say of the window, for safe start: it drew a
+/// frame, or the person used it. On a desktop `DropHandler` says it; on
+/// Android, the activity's event listener. See `start_watch`.
+pub use start_watch::{window_drew, window_touched};
+#[cfg(test)]
+mod close_gate_tests;
+mod montage_blocks;
+mod object_follow;
 mod panes;
 mod prefs;
 mod presets;
+mod reference;
+mod review_copy;
+mod scene_browser;
+mod section_pane;
+mod smoke_export;
 mod source;
 mod speed_ramp;
+mod start_watch;
+mod stem_export;
 mod studio;
 mod sysinfo;
+mod take_compare;
 /// Native Wayland file drops, which winit does not report; see the module.
 #[cfg(target_os = "linux")]
 mod wayland_drop;
@@ -103,7 +125,7 @@ use host::{Host, Shell};
 use panes::Msg;
 use panes::captions::CaptionsMsg;
 use panes::export::ExportMsg;
-use panes::media_bin::MediaMsg;
+use panes::media_bin::{MEDIA_EXTENSIONS, MediaMsg};
 use panes::monitor::MonitorMsg;
 use panes::project::ProjectMsg;
 use panes::relink::RelinkMsg;
@@ -133,7 +155,33 @@ pub fn open_logging(extra: Option<Box<dyn log::Log>>) {
         Err(error) => concat_host::logs::open_console(extra).and(Err(error)),
     };
     if let Err(error) = opened {
-        log::warn!("this run is not being written to a file: {error}");
+        log::warn!(
+            "log: wanted a file for this run's log and there is none: {error}; it goes to the console only"
+        );
+    }
+    // The launch, timed from here to the window's first publish.
+    if let Ok(mut slot) = STARTING.lock() {
+        *slot = Some(concat_log::op!("start"));
+    }
+}
+
+/// The launch being timed: opened with the log, done when the window is
+/// first published. A launch that fails before that leaves it unfinished,
+/// which its line says.
+static STARTING: std::sync::Mutex<Option<concat_log::Op>> = std::sync::Mutex::new(None);
+
+/// Whether a way out of the run has said so; see [`closing`].
+static CLOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says, once, how this run is ending: `close: by Quit`. The first road
+/// out to say wins and the rest are detail, since one quit passes through
+/// several of them; a close the project's save refused takes the word back
+/// (see [`close_window`]), so the next try says itself again.
+pub(crate) fn closing(how: &str) {
+    if CLOSING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::debug!("close: {how}");
+    } else {
+        log::info!("close: {how}");
     }
 }
 
@@ -147,7 +195,8 @@ pub fn open_logging(extra: Option<Box<dyn log::Log>>) {
 /// https://github.com/jub0t/Concat/issues/135
 pub fn report_startup_failure(error: &slint::PlatformError) {
     let error = error.to_string();
-    log::error!("could not start: {error}");
+    // "could not start" right after the topic: the smoke scripts look for it.
+    log::error!("start: could not start the window: {error}; Concat says so in a dialog and quits");
     platform::report_startup_failure(&error);
 }
 
@@ -162,7 +211,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
 /// unreadable project leaves the launch screen open with the usual error notice.
 /// Each invocation creates its own window; this does not control another instance.
 pub fn run_with_project(project: Option<std::path::PathBuf>) -> Result<(), slint::PlatformError> {
-    start(project, false, false)
+    start(project, Smoke::No, false)
 }
 
 /// Builds the window with a local Automation server for its shared editing session.
@@ -174,7 +223,7 @@ pub fn run_with_live(project: Option<std::path::PathBuf>) -> Result<(), slint::P
             "live mode is only available on desktop".to_owned(),
         ));
     }
-    start(project, false, true)
+    start(project, Smoke::No, true)
 }
 
 /// Starts the way [`run`] does, as far as the window's first publish, and
@@ -188,7 +237,28 @@ pub fn run_with_live(project: Option<std::path::PathBuf>) -> Result<(), slint::P
 /// No project is opened, so the recents list is not touched; the
 /// preferences are read, and a log file written, as on any launch.
 pub fn smoke() -> Result<(), slint::PlatformError> {
-    start(None, true, false)
+    start(None, Smoke::Start, false)
+}
+
+/// Starts the way [`run`] does and then exports a project of `clip`, made
+/// and exported by the messages the launch screen, the media bin and the
+/// Export sheet send, from inside the window's event loop; the process
+/// exits 0 once the file is written and 1 with the reason in the log when
+/// it is not. For CI, where a launch-only run never reaches an export: an
+/// export that froze the window on every phone shipped twice (#747).
+pub fn smoke_export(clip: std::path::PathBuf) -> Result<(), slint::PlatformError> {
+    start(None, Smoke::Export(clip), false)
+}
+
+/// Which of CI's runs a launch is, if any.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Smoke {
+    /// A person's launch.
+    No,
+    /// [`smoke`]: as far as the first frame.
+    Start,
+    /// [`smoke_export`]: a project of this clip, exported.
+    Export(std::path::PathBuf),
 }
 
 /// Runs one way out of the open project, in the order that keeps the work
@@ -208,6 +278,9 @@ pub(crate) fn close_window(
     let result = close();
     if result.is_ok() {
         leave();
+    } else {
+        // Not closing after all: the next way out says itself.
+        CLOSING.store(false, std::sync::atomic::Ordering::Relaxed);
     }
     result
 }
@@ -219,7 +292,7 @@ const IDLE_FRAMES: usize = 96 * 1024 * 1024;
 
 fn start(
     project: Option<std::path::PathBuf>,
-    smoke: bool,
+    smoke: Smoke,
     live: bool,
 ) -> Result<(), slint::PlatformError> {
     // What Import and a finished export reach on an iPhone. Android's own
@@ -240,17 +313,24 @@ fn start(
 
     // Not for a smoke run: it exits through `leave`, past the mark's drop,
     // and the mark it left put the next real launch in software for nothing.
-    let (startup_mark, safe) = if smoke { (None, false) } else { safe_start() };
+    let (startup_mark, safe) = if smoke == Smoke::No {
+        safe_start()
+    } else {
+        (None, false)
+    };
 
     // The shell doesn't exist yet - it needs the window the backend is about
     // to help create - but `Shell::with` is a no-op until `Shell::install`
-    // runs, and by the time an OS drop can actually happen, it has. Import
-    // goes through the same `Studio::import` the Import menu uses, so a
-    // dropped file gets the same probe, the same failure notice, and the
-    // same "no project open yet" no-op that a picked one does.
+    // runs, and by the time an OS drop can actually happen, it has. A drop
+    // on the chat attaches files. Elsewhere import goes through the same
+    // `Studio::import` the Import menu uses, so a dropped file gets the
+    // same probe, the same failure notice, and the usual launch behavior.
     let gpu = platform::select_backend(
-        |paths| {
+        |paths, point| {
             Shell::with(|shell, app| {
+                if crate::agent::handle_drop(&app, point, &paths) {
+                    return;
+                }
                 {
                     let mut studio = shell.studio.borrow_mut();
                     // Sound files dropped while the library shows its
@@ -302,15 +382,21 @@ fn start(
             let free = std::cell::Cell::new(false);
             Shell::with(|shell, _| {
                 let Ok(mut studio) = shell.studio.try_borrow_mut() else {
-                    log::warn!("close: app terminating mid-edit; project not saved");
+                    closing("by Quit");
+                    log::warn!(
+                        "close: wanted to save the project before quitting, but an edit was under way; it was not saved"
+                    );
                     return;
                 };
                 free.set(true);
                 if studio.session.is_some() {
-                    log::info!("close: app terminating");
+                    closing("by Quit");
                     terminating.set(true);
                     if let Err(error) = studio.close_project() {
-                        log::warn!("close: project could not be saved: {error}");
+                        log::error!(
+                            "close: saving {} before quitting failed: {error}; Concat quits without it",
+                            studio.project_name
+                        );
                     }
                 }
             });
@@ -326,7 +412,8 @@ fn start(
             // ("concat quit unexpectedly"). See `leave`.
             #[cfg(target_os = "macos")]
             {
-                log::info!("close: event loop exiting; leaving");
+                closing("by Quit");
+                log::debug!("close: event loop exiting; leaving");
                 leave(0);
             }
         },
@@ -335,7 +422,7 @@ fn start(
     let host = match Host::start(gpu) {
         Ok(host) => host,
         Err(error) => {
-            log::error!("{error}");
+            log::error!("start: the engine could not start: {error}; the window does not open");
             return Err(slint::PlatformError::Other(error));
         }
     };
@@ -373,6 +460,13 @@ fn start(
         return Err(slint::PlatformError::Other(format!("live mode: {error}")));
     }
     studio.set_phone(phone);
+    // A phone whose last run died says so once, now, and offers its log;
+    // the next launch reads this run, which did not (#560).
+    #[cfg(target_os = "android")]
+    if platform::last_run_died() {
+        log::info!("start: the last run died; offering its log");
+        studio.confirm = Some(studio::Confirm::LastRunClosed);
+    }
     if safe {
         // Each key in a call of its own: scripts/locales.py finds a key by
         // the literal inside `t(...)`, and one held in a variable is lost.
@@ -382,6 +476,10 @@ fn start(
             i18n::t("start.safeMode")
         };
         studio.notify(&notice, false);
+    } else if platform::no_graphics_driver() {
+        // The machine's own state, not a choice: what makes Concat slow
+        // here, and what fixes it, said once.
+        studio.notify(&i18n::t("start.noGraphicsDriver"), false);
     }
     studio.reload_packages(false);
     studio.watch_packages();
@@ -474,6 +572,15 @@ fn start(
         models: Models::new(),
     });
     Shell::install(shell.clone());
+    montage_blocks::bind(&app);
+    panes::captions::bind_translations(&app);
+    scene_browser::bind(&app);
+    click_review::bind(&app);
+    cover_pane::bind(&app);
+    review_copy::bind(&app);
+    stem_export::bind(&app);
+    section_pane::bind(&app);
+    take_compare::bind(&app);
     if live {
         agent::install(&app);
         app.global::<Agent>().set_enabled(true);
@@ -487,6 +594,14 @@ fn start(
         || concat_text::Fonts::new().families(),
         |studio, _, _, families| studio.system_fonts_known(families),
     );
+
+    // Which codecs can be written here, and which by the chip: a phone
+    // finds out only by opening its encoders, two seconds or so on some,
+    // and the export sheet asked on the window's first publish, before
+    // the window answered a touch. Asked on a worker; the sheet offers
+    // what needs no asking meanwhile (H.264, and a desktop's software
+    // encoders), and the publish after this lands brings the rest.
+    host::spawn_long(concat_media::encode::probe_encoders, |_, _, _, ()| {});
 
     // Handed over once, here, and never replaced: a fresh model is a reset,
     // and a reset rebuilds every row that hangs off it.
@@ -505,6 +620,7 @@ fn start(
         editor.set_catalogue_filters(ModelRc::from(models.catalogue_filters.clone()));
         editor.set_catalogue_luts(ModelRc::from(models.catalogue_luts.clone()));
         editor.set_catalogue_audio(ModelRc::from(models.catalogue_audio.clone()));
+        editor.set_catalogue_audio_library(ModelRc::from(models.catalogue_audio_library.clone()));
         editor.set_catalogue_transitions(ModelRc::from(models.catalogue_transitions.clone()));
         editor.set_effect_groups(ModelRc::from(models.effect_groups.clone()));
         editor.set_filter_groups(ModelRc::from(models.filter_groups.clone()));
@@ -528,9 +644,9 @@ fn start(
         app.global::<KeyEditor>()
             .set_rows(ModelRc::from(models.key_editor_rows.clone()));
         let ramp = app.global::<SpeedRamp>();
-        ramp.set_points(ModelRc::from(models.speed_points.clone()));
-        ramp.set_chosen(ModelRc::from(models.speed_chosen.clone()));
-        ramp.set_presets(ModelRc::from(models.speed_presets.clone()));
+        ramp.set_points(ModelRc::from(models.ramp_points.clone()));
+        ramp.set_selected(ModelRc::from(models.curve_selected.clone()));
+        ramp.set_preset_names(ModelRc::from(models.preset_labels.clone()));
         editor.set_key_marks(ModelRc::from(models.key_marks.clone()));
         app.global::<Library>()
             .set_views(ModelRc::from(models.library_views.clone()));
@@ -576,26 +692,7 @@ fn start(
             .set_matches(ModelRc::from(models.caption_styles.clone()));
     }
 
-    // Settings > About's block, gathered once: nothing in it changes while
-    // the process runs.
-    let facts = sysinfo::system_facts();
-    app.set_system_report(
-        facts
-            .iter()
-            .map(|(label, value)| format!("{label}: {value}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .into(),
-    );
-    app.set_system_facts(ModelRc::from(Rc::new(VecModel::from(
-        facts
-            .into_iter()
-            .map(|(label, value)| SystemFactData {
-                label: label.into(),
-                value: value.into(),
-            })
-            .collect::<Vec<_>>(),
-    ))));
+    sysinfo::publish(&app);
 
     // The ladders' labels, handed over once; the index the form reports back
     // is what carries the meaning. The shapes carry their ratio as well,
@@ -646,6 +743,7 @@ fn start(
     {
         let words = app.global::<I18n>();
         words.on_lookup(|_, key| i18n::t(&key).into());
+        words.on_lookup_menu_help(|_, id| i18n::menu_help(&id).into());
         words.on_lookup1(|_, key, a| i18n::tf(&key, &[&a]).into());
         words.on_lookup2(|_, key, a, b| i18n::tf(&key, &[&a, &b]).into());
         // Uppercased here rather than in the tree: Slint has no text
@@ -686,23 +784,23 @@ fn start(
         }
     });
     app.on_titlebar_close(|| {
-        log::info!("close: titlebar X pressed");
+        closing("by the window's close button");
         Shell::with(|shell, app| {
             shell.studio.borrow_mut().save_layout(app.window());
             let outcome = close_window(
                 || shell.studio.borrow_mut().close_project(),
                 || {
-                    log::info!("close: project closed, hiding window");
+                    log::debug!("close: project closed, hiding window");
                     app.window().hide().ok();
                     slint::quit_event_loop().ok();
-                    log::info!("close: quit_event_loop called");
+                    log::debug!("close: quit_event_loop called");
                 },
             );
             if let Err(error) = outcome {
                 // The save failed and `close_project` left the session
                 // open, so the window stays up. Its notice is published
                 // here or nobody would see it.
-                log::warn!("close: not closing, project could not be saved: {error}");
+                log::debug!("close: not closing, project could not be saved: {error}");
                 shell.studio.borrow_mut().offer_quit_without_saving(error);
                 shell.studio.borrow_mut().refresh_art();
                 shell.studio.borrow().publish(&app, &shell.models);
@@ -712,7 +810,7 @@ fn start(
     // System-driven close (Alt+F4, taskbar close): the same road out, and
     // refused the same way when the project cannot be saved.
     app.window().on_close_requested(|| {
-        log::info!("close: system close request (Alt+F4 / taskbar)");
+        closing("by the system");
         let saved = std::cell::Cell::new(true);
         Shell::with(|shell, app| {
             shell.studio.borrow_mut().save_layout(app.window());
@@ -724,7 +822,7 @@ fn start(
             );
             if let Err(error) = outcome {
                 saved.set(false);
-                log::warn!("close: not closing, project could not be saved: {error}");
+                log::debug!("close: not closing, project could not be saved: {error}");
                 shell.studio.borrow_mut().offer_quit_without_saving(error);
                 shell.studio.borrow_mut().refresh_art();
                 shell.studio.borrow().publish(&app, &shell.models);
@@ -956,7 +1054,62 @@ fn start(
         *ratio = (from + delta / extent).clamp(floor, 1.0 - floor);
     }));
 
+    let follow = app.global::<ui::ObjectFollowUi>();
+    follow.on_begin(on_window!(|state| {
+        crate::object_follow::begin(&mut state);
+    }));
+    follow.on_cancel(on_window!(|state| {
+        crate::object_follow::cancel(&mut state);
+    }));
+    follow.on_choose_region(on_window!(|state, x1: f32, y1: f32, x2: f32, y2: f32| {
+        crate::object_follow::choose_region(&mut state, x1, y1, x2, y2);
+    }));
+
+    let reference_preview = app.global::<ui::ReferencePreview>();
+    reference_preview.on_choose(crate::reference::choose);
+    reference_preview.on_clear(on_window!(|state| {
+        crate::reference::clear(&mut state);
+    }));
+    reference_preview.on_seek(on_lanes!(|state, seconds: f32| {
+        crate::reference::seek(&mut state, seconds);
+    }));
+    reference_preview.on_toggle_playback(on_window!(|state| {
+        crate::reference::toggle_playback(&mut state);
+    }));
+
     // ── the bin ──
+    let media_workflow = app.global::<ui::MediaWorkflow>();
+    media_workflow.on_open_inbox(on_window!(|state| {
+        state.open_incoming_media();
+    }));
+    media_workflow.on_close(on_window!(|state| {
+        state.close_media_workflow();
+    }));
+    media_workflow.on_choose_folder(Studio::choose_incoming_folder);
+    media_workflow.on_refresh_inbox(|| {
+        Shell::with(|shell, app| {
+            let mut state = shell.studio.borrow_mut();
+            state.scan_incoming_folder();
+            state.publish_media_workflow(&app);
+        });
+    });
+    media_workflow.on_toggle_file(on_window!(|state, path: SharedString| {
+        state.toggle_incoming_file(path.as_str());
+    }));
+    media_workflow.on_preview_file(on_window!(|state, path: SharedString| {
+        state.preview_incoming_file(path.as_str());
+    }));
+    media_workflow.on_import_selected(on_window!(|state| {
+        state.import_incoming_selection();
+    }));
+    media_workflow.on_open_selected_uses(on_window!(|state| {
+        state.show_selected_media_uses();
+    }));
+    media_workflow.on_jump_to_use(on_window!(
+        |state, timeline: SharedString, clip: SharedString| {
+            state.jump_to_media_use(timeline.as_str(), clip.as_str());
+        }
+    ));
     editor.on_media_filter_changed(on_window!(|state, filter: MediaFilter| {
         state.handle(Msg::Media(MediaMsg::FilterChanged(filter)));
     }));
@@ -1001,14 +1154,7 @@ fn start(
             }
             host::pick_files_then(
                 i18n::t("lib.importMedia"),
-                Some((
-                    i18n::t("common.media"),
-                    &[
-                        "mp4", "mov", "mkv", "webm", "avi", "m4v", "mp3", "wav", "aac", "m4a",
-                        "flac", "ogg", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff",
-                        "svg",
-                    ],
-                )),
+                Some((i18n::t("common.media"), MEDIA_EXTENSIONS)),
                 |studio, _, _, paths| studio.handle(Msg::Media(MediaMsg::Import(paths))),
             );
         });
@@ -1373,24 +1519,32 @@ fn start(
             state.frame_selected(fill);
         }));
     }
-    // The Speed tab's curve. Its own global, like the keyframe cluster's,
-    // since the Speed panel sits in three places; each verb edits the echo
-    // and the panel commits.
+    // The Speed tab's curve: each verb edits the clip as it is previewed,
+    // and the panel's commit lands it.
     {
         let ramp = app.global::<SpeedRamp>();
-        ramp.on_curve(on_lanes!(|state, on: bool| {
-            state.speed_curve_set(on);
+        ramp.on_toggle_curve(on_lanes!(|state, on: bool| {
+            state.speed_curve_mode(on);
         }));
-        ramp.on_point(on_lanes!(|state, index: i32, x: f32, y: f32| {
-            state.speed_curve_point(index, x, y);
+        ramp.on_pick_preset(on_lanes!(|state, index: i32| {
+            state.speed_preset(index);
         }));
-        ramp.on_remove(on_lanes!(|state, index: i32| {
-            state.speed_curve_remove(index);
+        ramp.on_move_point(on_lanes!(|state, index: i32, x: f32, y: f32| {
+            state.speed_point(index, x, y);
         }));
-        ramp.on_choose(on_lanes!(|state, index: i32, add: bool| {
+        ramp.on_remove_point(on_lanes!(|state, index: i32| {
+            state.speed_remove(index);
+        }));
+        ramp.on_set_eased(on_lanes!(|state, smooth: bool| {
+            state.speed_smooth(smooth);
+        }));
+        ramp.on_set_limit(on_lanes!(|state, faster: bool, target: f32| {
+            state.speed_extreme(faster, target);
+        }));
+        ramp.on_select(on_lanes!(|state, index: i32, add: bool| {
             state.speed_choose(index, add);
         }));
-        ramp.on_choose_box(on_lanes!(|state,
+        ramp.on_select_box(on_lanes!(|state,
                                       x0: f32,
                                       y0: f32,
                                       x1: f32,
@@ -1398,26 +1552,17 @@ fn start(
                                       add: bool| {
             state.speed_choose_box([x0, y0, x1, y1], add);
         }));
-        ramp.on_choose_all(on_lanes!(|state, all: bool| {
+        ramp.on_select_all(on_lanes!(|state, all: bool| {
             state.speed_choose_all(all);
         }));
-        ramp.on_grab(on_lanes!(|state| {
+        ramp.on_begin_drag(on_lanes!(|state| {
             state.speed_grab();
         }));
-        ramp.on_drag_chosen(on_lanes!(|state, dx: f32, dy: f32| {
+        ramp.on_drag_selected(on_lanes!(|state, dx: f32, dy: f32| {
             state.speed_drag_chosen(dx, dy);
         }));
-        ramp.on_remove_chosen(on_lanes!(|state| {
+        ramp.on_remove_selected(on_lanes!(|state| {
             state.speed_remove_chosen();
-        }));
-        ramp.on_preset_chosen(on_lanes!(|state, index: i32| {
-            state.speed_curve_preset(index);
-        }));
-        ramp.on_smoothness(on_lanes!(|state, smooth: bool| {
-            state.speed_curve_smooth(smooth);
-        }));
-        ramp.on_extreme(on_lanes!(|state, faster: bool, speed: f32| {
-            state.speed_curve_extreme(faster, speed);
         }));
     }
     // The Keyframes panel's verbs; its rows go out with every publish.
@@ -1511,6 +1656,18 @@ fn start(
     // ── the chains ──
     editor.on_chain_add(on_window!(|state, audio: bool, id: SharedString| {
         state.chain_add(audio, id.as_str());
+    }));
+    // ── Audio › Beats ──
+    // The selected clip's file's own: on, that file is listened to (and
+    // kept, so the next time is instant); every other file is left alone.
+    editor.on_beats_on_changed(on_window!(|state, on: bool| {
+        state.set_beats_on(on);
+    }));
+    editor.on_beats_marks_changed(on_window!(|state, index: i32| {
+        state.set_beat_marks(index);
+    }));
+    editor.on_beats_cut(on_window!(|state| {
+        state.cut_on_beats();
     }));
     editor.on_chain_toggle(on_window!(|state, audio: bool, index: i32| {
         state.chain_toggle(audio, index);
@@ -1870,16 +2027,18 @@ fn start(
     // dispatching while a row holds the next key. True means the key
     // was used and the scope keeps it; false lets it go on up, to a
     // popup's Escape or to nothing at all.
-    editor.on_key_chord(move |text, shift, alt, control, meta, on_start| {
+    editor.on_key_chord(move |text, shift, alt, control, meta, repeat, on_start| {
         let chord = keymap::chord(text.as_str(), shift, alt, control, meta);
         let mut handled = false;
         Shell::with(|shell, app| {
             // ── the capture field ──
             if shell.studio.borrow().settings.capturing.is_some() {
-                // Every key while a row listens goes to the row. A
-                // modifier on its own is not a chord: it waits for the
-                // key it is holding out for, which is swallowed here.
+                // A capture waits for a fresh chord. The held key and
+                // modifiers never escape to the window's shortcuts.
                 handled = true;
+                if repeat {
+                    return;
+                }
                 let Some(chord) = chord else {
                     return;
                 };
@@ -1904,16 +2063,27 @@ fn start(
                 let Some(id) = state.settings.capturing.clone() else {
                     return;
                 };
+                let lost = match keymap::assign(&mut state.prefs, &id, &chord) {
+                    Ok(lost) => lost,
+                    Err(keymap::EditorChordInUse) => {
+                        state.notify(&i18n::t("shortcuts.agentChordInUse"), true);
+                        state.publish(&app, &shell.models);
+                        return;
+                    }
+                };
                 state.settings.capturing = None;
-                // The chord is one action's: whoever held it loses it,
-                // and the toast says which row is now unbound.
-                let lost = keymap::bind(&mut state.prefs, &id, &chord);
+                match &lost {
+                    Some(lost) => {
+                        log::info!("settings: Shortcuts {id} {chord} · taken from {lost}")
+                    }
+                    None => log::info!("settings: Shortcuts {id} {chord}"),
+                }
                 state.prefs.save(&state.host.dirs);
                 if let Some(lost) = lost {
-                    state.notify(
-                        &i18n::tf("shortcuts.unboundNow", &[&keymap::name(lost)]),
-                        false,
-                    );
+                    let name = keymap::name(&lost);
+                    if !name.is_empty() {
+                        state.notify(&i18n::tf("shortcuts.unboundNow", &[&name]), false);
+                    }
                 }
                 state.publish(&app, &shell.models);
                 return;
@@ -1930,16 +2100,27 @@ fn start(
                 shell.studio.borrow().publish(&app, &shell.models);
                 return;
             }
-            if on_start {
-                // The launch screen has no project to act on. Capture
-                // is handled above, so its keys work there too.
-                return;
-            }
-            let action = {
-                let state = shell.studio.borrow();
-                keymap::resolve(&state.prefs, &chord)
+            let action = if on_start {
+                None
+            } else {
+                keymap::resolve(&shell.studio.borrow().prefs, &chord)
             };
             let Some(action) = action else {
+                let agent_action = {
+                    let state = shell.studio.borrow();
+                    if !state.live_enabled || state.sheet_open() || typing(&app) {
+                        return;
+                    }
+                    keymap::resolve_agent(&state.prefs, &chord, on_start, |pin| {
+                        crate::agent::pinned_shortcuts()
+                            .iter()
+                            .any(|(id, _)| id == pin)
+                    })
+                    .map(str::to_owned)
+                };
+                if let Some(action) = agent_action {
+                    handled = repeat || crate::agent::handle_shortcut(&action);
+                }
                 return;
             };
             // Save is the one chord that means the same in a field, under a
@@ -1985,11 +2166,13 @@ fn start(
                 "save" | "undo" | "redo" | "import" | "export" | "settings" | "zoom-in"
                 | "zoom-out" | "start" | "end" | "prev-edit" | "next-edit" | "snap" | "pan"
                 | "preview-axis" | "delete" => {
+                    let _asked = studio::Asked::by("shortcut");
                     app.invoke_app_menu_selected(SharedString::from(action));
                 }
                 // The rest: the editor's own table, the way the phone's
                 // buttons and the tray reach it.
                 _ => {
+                    let _asked = studio::Asked::by("shortcut");
                     shell.studio.borrow_mut().shortcut(action);
                     shell.studio.borrow_mut().refresh_art();
                     shell.studio.borrow().publish(&app, &shell.models);
@@ -2070,7 +2253,7 @@ fn start(
     // tree is a binding away from it; it is also remembered.
     app.on_settings_theme_changed({
         move |dark| {
-            log::info!("settings: theme {}", if dark { "dark" } else { "light" });
+            log::info!("settings: Theme {}", if dark { "Dark" } else { "Light" });
             Shell::with(|shell, app| {
                 app.global::<Theme>().set_dark(dark);
                 let mut studio = shell.studio.borrow_mut();
@@ -2083,7 +2266,6 @@ fn start(
     // remembered under the name the global lists it by.
     app.on_settings_accent_changed({
         move |index| {
-            log::info!("settings: accent {index}");
             Shell::with(|shell, app| {
                 let theme = app.global::<Theme>();
                 let names = theme.get_accent_names();
@@ -2093,6 +2275,7 @@ fn start(
                 else {
                     return;
                 };
+                log::info!("settings: Accent {name}");
                 theme.set_accent_choice(index);
                 let mut studio = shell.studio.borrow_mut();
                 studio.prefs.accent = Some(prefs::Preferences::accent_id(&name));
@@ -2108,6 +2291,8 @@ fn start(
             Shell::with(|shell, app| {
                 let theme = app.global::<Theme>();
                 let count = slint::Model::row_count(&theme.get_accent_names());
+                // Every drag on the picker lands here: detail, not story.
+                log::debug!("settings: Accent {}", format::hex_of(colour));
                 theme.set_accent_custom(colour);
                 theme.set_accent_choice(count as i32);
                 let mut studio = shell.studio.borrow_mut();
@@ -2131,6 +2316,11 @@ fn start(
                 else {
                     return;
                 };
+                if index > 0 {
+                    log::info!("settings: Playhead colour {name}");
+                } else {
+                    log::info!("settings: Playhead colour the theme's own");
+                }
                 theme.set_playhead_choice(index);
                 let mut studio = shell.studio.borrow_mut();
                 studio.prefs.playhead = (index > 0).then(|| prefs::Preferences::accent_id(&name));
@@ -2143,6 +2333,7 @@ fn start(
             Shell::with(|shell, app| {
                 let theme = app.global::<Theme>();
                 let count = slint::Model::row_count(&theme.get_accent_names());
+                log::debug!("settings: Playhead colour {}", format::hex_of(colour));
                 theme.set_playhead_custom(colour);
                 theme.set_playhead_choice(count as i32);
                 let mut studio = shell.studio.borrow_mut();
@@ -2161,9 +2352,12 @@ fn start(
     // https://github.com/jub0t/Concat/issues/320
     app.on_settings_scale_changed({
         move |index| {
-            log::info!("settings: ui scale {index}");
             Shell::with(|shell, app| {
                 let percent = prefs::Preferences::scale_at(usize::try_from(index).unwrap_or(0));
+                match percent {
+                    Some(percent) => log::info!("settings: Scale {percent}%"),
+                    None => log::info!("settings: Scale System"),
+                }
                 {
                     let mut studio = shell.studio.borrow_mut();
                     studio.prefs.ui_scale = percent;
@@ -2230,6 +2424,12 @@ fn start(
     app.on_settings_shortcut_reset_all(on_window!(|state| {
         state.handle(Msg::Settings(SettingsMsg::ShortcutResetAll));
     }));
+    // The notice says when it has gone, which is what lets a failure stand
+    // against a confirmation until it has been seen. Nothing on screen
+    // changes, so nothing is published.
+    app.on_toast_gone(|token| {
+        Shell::with(|shell, _app| shell.studio.borrow_mut().toast.gone(token));
+    });
     app.on_settings_show_log(on_window!(|state| {
         state.handle(Msg::Settings(SettingsMsg::ShowLog));
     }));
@@ -2338,7 +2538,7 @@ fn start(
             "retake" => VoiceoverMsg::Retake,
             "retry" => VoiceoverMsg::Retry,
             other => {
-                log::warn!("voiceover: no such action {other:?}");
+                log::warn!("voice: the voiceover panel asked for {other:?}, which it has no action called; nothing happened");
                 return;
             }
         };
@@ -2487,9 +2687,12 @@ fn start(
     }));
     app.on_app_menu_selected({
         move |action| {
-            log::info!("menu: {action}");
+            log::debug!("menu: {action}");
             Shell::with(|shell, app| {
                 {
+                    // The edits a row makes say they were asked from the
+                    // menu, unless a shortcut came in through here first.
+                    let _asked = studio::Asked::by("menu");
                     let mut state = shell.studio.borrow_mut();
                     state.open_menu = -1;
                     match action.as_str() {
@@ -2511,6 +2714,8 @@ fn start(
                             },
                         ),
                         "export" => state.handle(Msg::Export(ExportMsg::Open)),
+                        "review-copy" => review_copy::open(&state),
+                        "cover-frame" => cover_pane::open(&mut state, &app),
                         "template" => state.save_template(),
                         "speech" => state.handle(Msg::Speech(SpeechMsg::Open)),
                         "clear-cache" => state.clear_project_cache(),
@@ -2521,6 +2726,7 @@ fn start(
                             // the notice below lands it on screen.
                             let _ = state.close_project();
                         }
+                        "click-review" => click_review::open(&mut state),
                         "undo" => state.undo(),
                         "redo" => state.redo(),
                         "snap" => state.handle(Msg::Timeline(TimelineMsg::SnapToggled)),
@@ -2568,7 +2774,7 @@ fn start(
                     }
                 }
                 if action == "close-window" {
-                    log::info!("close: File > Close Window");
+                    closing("by Close Window");
                     shell.studio.borrow_mut().save_layout(app.window());
                     let outcome = close_window(
                         || shell.studio.borrow_mut().close_project(),
@@ -2580,13 +2786,13 @@ fn start(
                     if let Err(error) = outcome {
                         // Unsaved work is worth more than the window: the
                         // project stays open and the reason is shown.
-                        log::warn!("close: not closing, project could not be saved: {error}");
+                        log::debug!("close: not closing, project could not be saved: {error}");
                         shell.studio.borrow_mut().offer_quit_without_saving(error);
                         shell.studio.borrow_mut().refresh_art();
                         shell.studio.borrow().publish(&app, &shell.models);
                         return;
                     }
-                    log::info!("close: quit_event_loop called (menu)");
+                    log::debug!("close: quit_event_loop called (menu)");
                     return;
                 }
                 shell.studio.borrow_mut().refresh_art();
@@ -2717,7 +2923,9 @@ fn start(
                     .peaks
                     .get(&plan.media)
                     .filter(|_| plan.kind == ClipKind::Audio)
-                    .map(|peaks| format::wave_path(peaks, 0.0, plan.duration, 32, 0.75))
+                    .map(|peaks| {
+                        format::wave_path(peaks, 0.0, plan.duration, 32, 0.75, format::WAVE_FLOOR)
+                    })
                     .unwrap_or_default();
                 let document = chips::drag_chip_svg(
                     chips::chip_glyph(plan.kind),
@@ -2760,11 +2968,10 @@ fn start(
                 let path = path
                     .to_str()
                     .ok_or_else(|| "project directory is not valid Unicode".to_string())?;
-                concat_host::projects::open(path)
-            })
-            .and_then(|info| shell.studio.borrow_mut().open_project(info));
+                shell.studio.borrow_mut().open_project_at(path)
+            });
         if let Err(error) = opened {
-            log::error!("could not open launch project: {error}");
+            log::debug!("start: the project it was launched with did not open: {error}");
             shell.studio.borrow_mut().notify(&error, true);
         }
     }
@@ -2773,12 +2980,15 @@ fn start(
         shell.studio.borrow_mut().refresh_art();
         shell.studio.borrow().publish(&app, &shell.models);
     }
+    if let Some(op) = STARTING.lock().ok().and_then(|mut slot| slot.take()) {
+        op.done("the window is up");
+    }
 
     // As far as a smoke run goes: everything the first frame needs exists
     // and has been handed to the window. The exit is the one the event
     // loop's end takes below, for the same reason - the engine's threads
     // are not waited on.
-    if smoke {
+    if smoke == Smoke::Start {
         // whisper's CPU kernels, which the x86_64 Windows and Linux bundles
         // carry as modules beside the program, one per CPU generation, for
         // ggml to choose from (#388). A bundle without them starts and
@@ -2790,15 +3000,23 @@ fn start(
             any(target_os = "windows", target_os = "linux")
         ))]
         match concat_speech::transcribe::cpu_backend() {
-            Ok(cpu) => log::info!("smoke: whisper runs on {cpu}"),
+            Ok(cpu) => log::info!("smoke: speech to text runs on {cpu}"),
             Err(error) => {
-                log::error!("smoke: {error}");
+                log::error!(
+                    "smoke: loading speech to text's CPU kernels failed: {error}; the smoke run fails"
+                );
                 leave(1);
             }
         }
         log::info!("smoke: ok");
         leave(0);
     }
+    // An export run goes on into the loop, where its steps run on a timer
+    // held for the loop's life.
+    let _smoke_export = match smoke {
+        Smoke::Export(clip) => Some(smoke_export::drive(clip)),
+        Smoke::No | Smoke::Start => None,
+    };
 
     // Decoders nobody has asked a frame of for ten seconds are closed,
     // looked at every five: each holds buffers of its own, and the playhead
@@ -2839,14 +3057,13 @@ fn start(
         },
     );
 
-    // A launch that has run this long was not killed by its start; the
-    // mark goes, so the next one is not started safe for nothing.
-    let started = startup_mark.as_ref().map(|mark| mark.path().to_owned());
-    slint::Timer::single_shot(SAFE_AFTER, move || {
-        if let Some(path) = started {
-            let _ = std::fs::remove_file(path);
-        }
-    });
+    // A launch whose window drew, or was used, was not killed by its
+    // start: the mark goes then, so the next one is not started safe for
+    // nothing. See `start_watch`.
+    let startup_mark = startup_mark.map(|mark| Rc::new(start_watch::StartWatch::new(mark)));
+    if let Some(watch) = &startup_mark {
+        start_watch::install(watch);
+    }
 
     // The chosen interface scale, as soon as the window is up.
     slint::Timer::single_shot(std::time::Duration::ZERO, || {
@@ -2855,15 +3072,23 @@ fn start(
 
     let result = app.run();
     drop(reader_sweep);
-    log::info!("close: event loop exited (ok={})", result.is_ok());
+    if result.is_ok() {
+        log::debug!("close: event loop exited (ok={})", result.is_ok());
+    } else {
+        log::error!("close: event loop exited (ok={})", result.is_ok());
+    }
     // The loop failing is the window never having run at all - on a phone
     // whose Vulkan driver wgpu will not take, it is the whole launch, and
     // the person sees the app vanish. Its reason goes in the log before
     // anything else can end the process, and the exit says it failed.
     if let Err(error) = &result {
-        log::error!("close: the window could not run: {error}");
+        log::error!(
+            "close: the window could not run: {error}; Concat quits, and the next launch starts safe"
+        );
         // The mark stays: the next launch starts safe.
-        std::mem::forget(startup_mark);
+        if let Some(watch) = &startup_mark {
+            watch.keep();
+        }
         leave(1);
     }
     // Android ends the loop when it destroys the activity - Back on the
@@ -2874,10 +3099,14 @@ fn start(
     #[cfg(target_os = "android")]
     Shell::with(|shell, _| {
         let mut studio = shell.studio.borrow_mut();
+        closing("by the system");
         if studio.session.is_some()
             && let Err(error) = studio.close_project()
         {
-            log::warn!("close: the activity ended and the project could not be saved: {error}");
+            log::error!(
+                "close: saving {} as the system ended the app failed: {error}; it closes without it",
+                studio.project_name
+            );
         }
     });
     stop_exports();
@@ -2951,7 +3180,7 @@ fn stop_exports() {
     // The server first: it cancels its own jobs, so each ends as a cancel
     // its caller can tell apart from a failure.
     if let Some(server) = server {
-        log::info!("close: stopping the API's server");
+        log::debug!("close: stopping the API's server");
         if live_enabled {
             // A live request may still be waiting for this event loop.
             server.stop_detached();
@@ -2971,12 +3200,12 @@ fn stop_exports() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     if exporter.is_busy() {
-        log::warn!("close: the export did not stop in time; leaving anyway");
+        log::warn!(
+            "close: wanted the export stopped before quitting, but it ran on past {}; Concat quits anyway",
+            concat_log::span(EXPORT_PATIENCE)
+        );
     }
 }
-
-/// How long a launch runs before it counts as having started.
-const SAFE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Safe start: whether this launch draws on the software rasteriser
 /// because the last one died while starting, and the mark that says this
@@ -2985,8 +3214,9 @@ const SAFE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 /// Every recent release met a Windows driver that closed the app in its
 /// first seconds - a new one each time (#339, #378, #389, #242) - and a
 /// launch check on a CI machine meets none of them. A launch that dies
-/// before [`SAFE_AFTER`] leaves its mark; the next one finds it, draws on
-/// WARP or lavapipe instead of the GPU, and keeps doing so for that build -
+/// before it counts as started - its window drawing for a few seconds, or
+/// used; see `start_watch` - leaves its mark; the next one finds it, draws
+/// on WARP or lavapipe instead of the GPU, and keeps doing so for that build -
 /// a driver that killed one launch kills the next, and starting on the GPU
 /// every other time would crash every other time. Slower, and it opens.
 /// The next build tries the GPU again: 0.2.8 kept the CPU for good, and a
@@ -3015,8 +3245,46 @@ fn safe_start() -> (Option<concat_host::jobs::Tripwire>, bool) {
     let mark = dirs.data.join("startup");
     let mut preferences = prefs::Preferences::load(&dirs);
     let died = concat_host::jobs::Tripwire::tripped(&mark);
-    if preferences.settle_start(died, &concat_host::machine::build()) {
+    let changed = preferences.settle_start(died, &concat_host::machine::build());
+    if changed {
         preferences.save(&dirs);
+    }
+    // Who asked for software, said once: the window's and the compositor's
+    // own lines only say that it is so. A person on a fast GPU drawing on
+    // the CPU, and nothing in the log saying why, could not be told apart
+    // from a driver that would not open.
+    // On Android "software" is OpenGL ES in place of Vulkan, not the CPU.
+    let how = if cfg!(target_os = "android") {
+        "drawing on OpenGL ES in place of Vulkan"
+    } else {
+        "drawing in software"
+    };
+    match std::env::var("CONCAT_GPU") {
+        // Set before Concat started: it wins over the setting either way.
+        Ok(value) if value.trim().eq_ignore_ascii_case("software") => {
+            log::info!("start: {how} · CONCAT_GPU=software was set in the environment");
+        }
+        Ok(value) => {
+            if preferences.draws_in_software() {
+                log::info!(
+                    "start: CONCAT_GPU={} set in the environment wins over the setting that would draw in software",
+                    value.trim()
+                );
+            }
+        }
+        // The setting does not record who turned it off: the switch in
+        // Settings, `--software`, or Concat 0.2.8, which turned it off for
+        // good after any start that failed. So the line says all three.
+        Err(_) if preferences.software_gpu => {
+            log::info!(
+                "start: {how} · the setting that draws on the GPU is off (turned off in Settings, by --software, or by Concat 0.2.8 after a start that failed)"
+            );
+        }
+        // The launch that set it has said so in `settle_start` already.
+        Err(_) if preferences.software_after_crash.is_some() && !changed => {
+            log::warn!("start: {how} · the last launch of this build closed while starting");
+        }
+        Err(_) => {}
     }
     if preferences.draws_in_software() && std::env::var_os("CONCAT_GPU").is_none() {
         // SAFETY: on a desk the process is single-threaded here, as for the
@@ -3039,7 +3307,9 @@ fn safe_start() -> (Option<concat_host::jobs::Tripwire>, bool) {
 /// back on. Nothing where [`safe_start`] has no software rasteriser.
 pub fn draw_in_software() {
     if !cfg!(any(windows, target_os = "linux", target_os = "macos")) {
-        log::warn!("start: --software has no software rasteriser to draw on here");
+        log::warn!(
+            "start: --software asked to draw in software, but there is no software rasteriser here; nothing changed"
+        );
         return;
     }
     let Ok(dirs) = concat_host::AppDirs::locate() else {
@@ -3047,7 +3317,7 @@ pub fn draw_in_software() {
     };
     let mut preferences = prefs::Preferences::load(&dirs);
     if !preferences.software_gpu {
-        log::warn!("start: --software; drawing in software from now on");
+        log::warn!("start: drawing in software from now on, as --software asks");
         preferences.software_gpu = true;
         preferences.save(&dirs);
     }
@@ -3073,10 +3343,22 @@ pub fn draw_in_software() {
 /// rest of the run - so a quit after any transcription died of SIGABRT in
 /// `exit`, and macOS said Concat had quit unexpectedly. macOS ends an app
 /// that way itself when it opts into sudden termination.
+///
+/// And on Android, which Rust does not count as Linux. There `exit`
+/// destroys the system libraries' static mutexes while the runtime's own
+/// threads - binder's, and any thread in Java's file I/O - still take
+/// them: the mutex of libandroidio's AsynchronousCloseMonitor, which every
+/// blocking Java read and write locks, and one of libgui's. The thread
+/// that took one next aborted ("FORTIFY: pthread_mutex_lock called on a
+/// destroyed mutex"), after the export had finished. Those threads are the
+/// system's, not ours to stop first, and Android ends an app's process
+/// with a kill, never an `exit`, so nothing on a phone needs the handlers.
 fn leave(code: i32) -> ! {
     agent::shutdown();
-    log::logger().flush();
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // The log's last line: a run that got here ended in order, whatever
+    // its code, and the next run reads the lack of this line as a crash.
+    concat_host::logs::end();
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
     {
         use std::io::Write;
         let _ = std::io::stdout().flush();
@@ -3085,7 +3367,7 @@ fn leave(code: i32) -> ! {
         // this one's is touched after it.
         unsafe { libc::_exit(code) }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
     std::process::exit(code);
 }
 

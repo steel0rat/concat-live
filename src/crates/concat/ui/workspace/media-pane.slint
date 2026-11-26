@@ -4,6 +4,9 @@
 import { I18n } from "../i18n.slint";
 import { Theme, Fmt, Glyph, Icon, Payload, Tip } from "../primitives/primitives.slint";
 import { Pane, PaneScroll } from "pane.slint";
+import { InboxView, MediaUsesView, MediaWorkflow, WorkflowButton } from "media-workflow.slint";
+import { SceneBrowser, SceneBrowserPane } from "scene-browser.slint";
+import { TakeCompare, TakeComparePane } from "take-compare.slint";
 import { HairlineSplitter } from "splitter.slint";
 import { PaneKind, PaneSwitcher } from "pane-switcher.slint";
 import { TextAlignment } from "../timeline/model.slint";
@@ -1717,6 +1720,8 @@ component Empty inherits VerticalLayout {
 }
 
 export component MediaPane inherits Rectangle {
+    property <bool> show-media-detail: TakeCompare.open || (root.tab == 0
+        && (MediaWorkflow.inbox-open || MediaWorkflow.uses-open || SceneBrowser.open));
     /// The bin, already narrowed to `filter`. Filtering happens on the Rust
     /// side because a Slint model cannot be filtered in the language, and
     /// filtering inside the `for` would leave holes in the grid's indices.
@@ -2091,6 +2096,7 @@ export component MediaPane inherits Rectangle {
             // name — so it was also the one most likely to be wrong for a
             // given page at a given window width.
             HairlineSplitter {
+                visible: !root.show-media-detail;
                 x: root.sidebar;
                 y: 0;
                 height: parent.height;
@@ -2117,6 +2123,7 @@ export component MediaPane inherits Rectangle {
                 x: 0;
                 width: root.sidebar;
                 height: parent.height;
+                visible: !root.show-media-detail;
 
                 // One group per page, each behind its own `if`.
                 //
@@ -2451,10 +2458,32 @@ export component MediaPane inherits Rectangle {
                 }
             }
 
+            if TakeCompare.open: TakeComparePane {
+                x: 0;
+                width: parent.width;
+                height: parent.height;
+            }
+            if !TakeCompare.open && root.tab == 0 && SceneBrowser.open: SceneBrowserPane {
+                x: 0;
+                width: parent.width;
+                height: parent.height;
+            }
+            if !TakeCompare.open && root.tab == 0 && !SceneBrowser.open && MediaWorkflow.inbox-open: InboxView {
+                x: 0;
+                width: parent.width;
+                height: parent.height;
+            }
+            if !TakeCompare.open && root.tab == 0 && !SceneBrowser.open && MediaWorkflow.uses-open: MediaUsesView {
+                x: 0;
+                width: parent.width;
+                height: parent.height;
+            }
+
             pages := PaneScroll {
                 x: root.sidebar + 1px;
                 width: Math.max(0px, parent.width - root.sidebar - 1px);
                 height: parent.height;
+                visible: !root.show-media-detail;
 
                 if root.tab == 0: HorizontalLayout {
                     padding: 8px;
@@ -2490,6 +2519,28 @@ export component MediaPane inherits Rectangle {
                         icons: [Glyph.clock, Glyph.text-mark, Glyph.tag];
                         current: 0;
                         changed(index) => { root.sort-changed(index); }
+                    }
+                }
+
+                if root.tab == 0: HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-bottom: 8px;
+                    spacing: 4px;
+
+                    WorkflowButton {
+                        block: true;
+                        glyph: Glyph.folder;
+                        label: I18n.t("mediaBin.incoming");
+                        tip: I18n.t("mediaBin.incomingHint");
+                        clicked => { MediaWorkflow.open-inbox(); }
+                    }
+                    if MediaWorkflow.can-show-uses: WorkflowButton {
+                        square: true;
+                        glyph: Glyph.search;
+                        label: I18n.t("mediaBin.whereUsed");
+                        tip: I18n.t("mediaBin.whereUsedHint");
+                        clicked => { MediaWorkflow.open-selected-uses(); }
                     }
                 }
 
@@ -2571,7 +2622,7 @@ export component MediaPane inherits Rectangle {
                         // Counted rather than measured, because reading a
                         // sibling's laid-out height from inside the layout
                         // that assigns it is a binding loop waiting to happen.
-                        page-floor: Math.max(0px, pages.height - 52px
+                        page-floor: Math.max(0px, pages.height - 52px - 36px
                             - (root.selected-count > 1 ? 36px : 0px) - 8px);
 
                         menu-items: root.menu-items;

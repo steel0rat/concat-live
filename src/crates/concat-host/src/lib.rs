@@ -20,10 +20,13 @@
 //! and cancels through flags, and the caller decides which thread it runs on.
 
 pub mod awake;
+pub mod blocks;
 pub mod brush;
 pub mod capcut;
 pub mod cards;
 pub mod consolidate;
+#[cfg(test)]
+mod consolidate_tests;
 pub mod crash;
 pub mod cutout;
 pub mod dirs;
@@ -37,13 +40,17 @@ pub mod media;
 pub mod memory;
 pub mod models;
 pub mod net;
+pub mod object_follow;
 pub mod playback;
 pub mod preview;
+#[cfg(test)]
+mod project_save_tests;
 pub mod projects;
 pub mod proxy;
 pub mod record;
 pub mod reverse;
 mod route;
+pub mod scenes;
 pub mod session;
 pub mod sounds;
 pub mod stabilize;

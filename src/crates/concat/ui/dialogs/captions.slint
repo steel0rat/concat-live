@@ -5,10 +5,12 @@ import { ResizeBox } from "../primitives/resize-box.slint";
 import { I18n } from "../i18n.slint";
 import { Theme } from "../theme/theme.slint";
 import { Glyph, Icon } from "../icons.slint";
-import { Button, CopyChip, DialogRow, DialogSection, Modal, Progress } from "../primitives/modal.slint";
+import { Button, CopyChip, DialogRow, DialogSection, Field, Modal, Progress } from "../primitives/modal.slint";
 import { SegmentedControl } from "../primitives/segmented-control.slint";
 import { Select } from "../primitives/select.slint";
 import { StylePicker, TextPresetData } from "../inspector/style-picker.slint";
+import { ChatAction } from "../workspace/agent.slint";
+import { Focus } from "../util.slint";
 
 /// The captions' look: a text preset, searched for in the list the Text
 /// page's Styles and Languages draw from. A global, as the font picker's
@@ -21,6 +23,18 @@ export global CaptionStyles {
     in property <TextPresetData> current;
     callback query-changed(text: string);
     callback picked(id: string);
+}
+
+/// SubRip language versions shared by the desktop and phone caption tools.
+export global CaptionTranslationControls {
+    in property <bool> available;
+    in property <bool> can-export: true;
+    in property <[string]> options;
+    in property <int> current;
+    in property <string> coverage;
+    in-out property <string> language;
+    callback choose(index: int);
+    callback import-translation(language: string);
 }
 
 // Captions: what the tray's Captions tool opens.
@@ -84,6 +98,18 @@ export struct CaptionsSheetData {
     message: string,
 }
 
+component SrtLanguagePicker inherits Select {
+    options: CaptionTranslationControls.options;
+    current <=> CaptionTranslationControls.current;
+    tip: I18n.t("captionTranslations.chooseTip");
+    accessible-role: combobox;
+    accessible-label: I18n.t("captionTranslations.language");
+    accessible-value: CaptionTranslationControls.options[CaptionTranslationControls.current];
+    accessible-description: self.tip;
+    accessible-action-default => { self.reveal(); }
+    changed(index) => { CaptionTranslationControls.choose(index); }
+}
+
 /// The sheet's body on its own: the Library's Text page shows it in place
 /// on a desk, and the phone's sheet wraps it in a Modal. One body, so the
 /// two never drift apart.
@@ -107,6 +133,8 @@ export component CaptionsForm inherits VerticalLayout {
     callback import-srt();
     callback export-srt();
 
+    min-width: 0px;
+    property <bool> narrow: root.width < 300px;
     property <bool> from-voice: root.data.from-voice;
 
     // The script being typed, held apart from `data.text` the way the Field
@@ -184,15 +212,16 @@ export component CaptionsForm inherits VerticalLayout {
                 focused: script.has-focus;
 
                 script := TextInput {
+                    x: script-box.pad-x;
                     y: script-box.pad-y;
-                    width: parent.width;
+                    width: parent.width - self.x - 2 * script-box.pad-x;
                     height: Math.max(self.preferred-height, script-box.view-height);
                     cursor-position-changed(at) => { script-box.reveal(at.y, self.font-size * 1.4); }
                     text <=> root.draft;
                     color: Theme.fg;
                     font-size: Theme.fs-lg;
                     single-line: false;
-                    wrap: word-wrap;
+                    wrap: char-wrap;
                     selection-background-color: Theme.accent;
                     selection-foreground-color: Theme.on-accent;
                     changed has-focus => { root.typing = self.has-focus; }
@@ -272,6 +301,7 @@ export component CaptionsForm inherits VerticalLayout {
         }
 
         VerticalLayout {
+            min-width: 0px;
             padding: 14px;
             spacing: 10px;
 
@@ -365,28 +395,88 @@ export component CaptionsForm inherits VerticalLayout {
                 clicked => { root.begin(); }
             }
 
+            if !root.data.running && CaptionTranslationControls.available: DialogSection {
+                min-width: 0px;
+                title: I18n.t("captionTranslations.title");
+
+                if root.narrow: VerticalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: I18n.t("captionTranslations.language");
+                        wrap: word-wrap;
+                        color: Theme.fg-muted;
+                        font-size: Theme.fs;
+                    }
+                    SrtLanguagePicker { min-width: 0px; }
+                }
+                if !root.narrow: DialogRow {
+                    label: I18n.t("captionTranslations.language");
+                    SrtLanguagePicker { }
+                }
+
+                if CaptionTranslationControls.coverage != "": Text {
+                    text: CaptionTranslationControls.coverage;
+                    color: CaptionTranslationControls.can-export ? Theme.fg-muted : Theme.danger;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+
+                Field {
+                    value: CaptionTranslationControls.language;
+                    placeholder: I18n.t("captionTranslations.code");
+                    accessible-role: text-input;
+                    accessible-label: I18n.t("captionTranslations.code");
+                    accessible-description: I18n.t("captionTranslations.codeTip");
+                    accessible-value: CaptionTranslationControls.language;
+                    edited(text) => { CaptionTranslationControls.language = text; }
+                }
+                ChatAction {
+                    label: I18n.t("captionTranslations.import");
+                    tip: I18n.t("captionTranslations.importTip");
+                    ghost: false;
+                    elide-label: true;
+                    horizontal-stretch: 1;
+                    enabled: CaptionTranslationControls.language != "";
+                    clicked => {
+                        Focus.release();
+                        CaptionTranslationControls.import-translation(CaptionTranslationControls.language);
+                    }
+                }
+            }
+
             // Captions as a SubRip file: one read in as titles with the
             // look above, timed as the file says; or a lane of titles
             // written out: the selected title's lane, or with none
             // selected the lane with the most titles, the captions'.
-            if !root.data.running: HorizontalLayout {
-                spacing: 8px;
+            if !root.data.running: Rectangle {
+                property <length> gap: 8px;
+                property <length> actions-height: root.narrow ? 2 * Theme.h + self.gap : Theme.h;
+                property <length> action-width: root.narrow ? self.width : Math.max(0px, (self.width - self.gap) / 2);
+                min-height: self.actions-height;
+                max-height: self.actions-height;
 
-                Button {
-                    horizontal-stretch: 1;
-                    block: true;
-                    ghost: true;
-                    glyph: Glyph.import;
+                ChatAction {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.action-width;
+                    height: Theme.h;
+                    elide-label: root.narrow;
+                    glyph: root.narrow ? Glyph.none : Glyph.import;
                     label: I18n.t("captions.importSrt");
+                    tip: I18n.t("captions.importSrtTip");
                     clicked => { root.import-srt(); }
                 }
 
-                Button {
-                    horizontal-stretch: 1;
-                    block: true;
-                    ghost: true;
-                    glyph: Glyph.export;
+                ChatAction {
+                    x: root.narrow ? 0px : parent.action-width + parent.gap;
+                    y: root.narrow ? Theme.h + parent.gap : 0px;
+                    width: parent.action-width;
+                    height: Theme.h;
+                    elide-label: root.narrow;
+                    glyph: root.narrow ? Glyph.none : Glyph.export;
                     label: I18n.t("captions.exportSrt");
+                    enabled: !CaptionTranslationControls.available || CaptionTranslationControls.can-export;
+                    tip: I18n.t("captionTranslations.exportTip");
                     clicked => { root.export-srt(); }
                 }
             }

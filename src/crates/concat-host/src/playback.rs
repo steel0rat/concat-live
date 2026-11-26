@@ -513,11 +513,37 @@ fn gain_at(clip: &ActiveClip, local: f64) -> f32 {
     gain.max(0.0) as f32
 }
 
+struct Audition {
+    id: u64,
+    samples: Arc<[[i16; 2]]>,
+    frame: f64,
+}
+
+impl Audition {
+    /// Advance on the device's sample grid, independently of the transport.
+    fn next_frame(&mut self, step: f64) -> Option<[f32; 2]> {
+        let index = self.frame as usize;
+        let current = self.samples.get(index)?;
+        let next = self.samples.get(index + 1).unwrap_or(current);
+        let fraction = (self.frame - index as f64) as f32;
+        self.frame += step;
+        Some(std::array::from_fn(|channel| {
+            (f32::from(current[channel]) * (1.0 - fraction) + f32::from(next[channel]) * fraction)
+                / 32768.0
+        }))
+    }
+
+    fn finished(&self) -> bool {
+        self.frame >= self.samples.len() as f64
+    }
+}
+
 enum Msg {
     SetClips(Vec<ActiveClip>),
     Play(f64),
     Pause,
     Seek(f64),
+    Audition(Audition),
 }
 
 struct Shared {
@@ -531,6 +557,9 @@ struct Shared {
     origin_micros: AtomicI64,
     epoch: std::time::Instant,
     playing: AtomicBool,
+    /// The current listening request, or zero. An old callback must not
+    /// clear a newer request when its own excerpt ends.
+    audition: AtomicU64,
     /// Silent while set: the clock runs on, the speakers say nothing. A
     /// voiceover takes the picture without the timeline's sound, so the
     /// speakers do not bleed into the microphone.
@@ -554,10 +583,17 @@ impl Shared {
             origin_micros: AtomicI64::new(0),
             epoch: std::time::Instant::now(),
             playing: AtomicBool::new(false),
+            audition: AtomicU64::new(0),
             muted: AtomicBool::new(false),
             peak_left: AtomicU32::new(0),
             peak_right: AtomicU32::new(0),
         }
+    }
+
+    fn finish_audition(&self, id: u64) {
+        let _ = self
+            .audition
+            .compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// Lands the clock at `seconds`, now.
@@ -639,6 +675,9 @@ struct Reach {
     /// runs - the file, the stream, the speed and the filters - so that two
     /// spans with the same one are the same sound at the same instant.
     source: String,
+    /// The same but for the filters: a span under another treatment of the
+    /// same file at the same speed is the same instant, sounding otherwise.
+    file: String,
     /// Source seconds the span starts and ends at.
     from: f64,
     to: f64,
@@ -661,15 +700,16 @@ impl Reach {
             return None;
         }
         let speed = concat_media::audio::clamp_speed(spec.speed);
+        let file = format!(
+            "{}\0{:?}\0{:016x}\0{}",
+            spec.path,
+            spec.audio_stream,
+            speed.to_bits(),
+            spec.preserve_pitch,
+        );
         Some(Reach {
-            source: format!(
-                "{}\0{:?}\0{:016x}\0{}\0{}",
-                spec.path,
-                spec.audio_stream,
-                speed.to_bits(),
-                spec.preserve_pitch,
-                spec.chain
-            ),
+            source: format!("{file}\0{}", spec.chain),
+            file,
             from: spec.source_start,
             to: spec.source_start + spec.duration * speed,
             speed,
@@ -694,24 +734,32 @@ const HAIR: f64 = 0.5 / PCM_RATE as f64;
 ///
 /// Any span from the same file under the same treatment will do: what is
 /// left of a clip after a split, a trim inwards, an undo, a second use of
-/// the same recording - each is a stretch of a span already mapped. Of
-/// those, the one that covers most of `spec`; past where it reaches, the
-/// stand-in is silent until the decode lands. None for a span already
-/// decoded, a mixed span, or one nothing decoded overlaps.
+/// the same recording - each is a stretch of a span already mapped. Failing
+/// that, a span of the same file at the same speed under another treatment:
+/// a treatment switched on, off or turned is the sound it was until the new
+/// one is decoded, never silence. Of those, the same treatment first, then
+/// the one that covers most of `spec`; past where it reaches, the stand-in
+/// is silent until the decode lands. None for a span already decoded, a
+/// mixed span, or one nothing decoded overlaps.
 fn stand_in<'a>(cache: &'a HashMap<String, CacheEntry>, spec: &ClipSpec) -> Option<(&'a str, i64)> {
     let wanted = Reach::of(spec)?;
     cache
         .iter()
         .filter_map(|(key, entry)| {
             let reach = entry.reach.as_ref()?;
-            if reach.source != wanted.source {
+            if reach.file != wanted.file {
                 return None;
             }
+            let same = reach.source == wanted.source;
             let covered = reach.to.min(wanted.to) - reach.from.max(wanted.from);
-            (covered > HAIR).then_some((key, entry, reach, covered))
+            (covered > HAIR).then_some((key, entry, reach, same, covered))
         })
-        .max_by(|a, b| a.3.total_cmp(&b.3).then(a.1.last_used.cmp(&b.1.last_used)))
-        .map(|(key, _, reach, _)| (key.as_str(), reach.lead_of(&wanted)))
+        .max_by(|a, b| {
+            a.3.cmp(&b.3)
+                .then(a.4.total_cmp(&b.4))
+                .then(a.1.last_used.cmp(&b.1.last_used))
+        })
+        .map(|(key, _, reach, _, _)| (key.as_str(), reach.lead_of(&wanted)))
 }
 
 /// The decoded span whose samples `spec`'s decode would be, stretch for
@@ -737,6 +785,7 @@ fn copy_source(cache: &HashMap<String, CacheEntry>, spec: &ClipSpec) -> Option<(
 pub struct Playback {
     tx: mpsc::Sender<Msg>,
     shared: Arc<Shared>,
+    next_audition: AtomicU64,
     /// For surfacing failures; a mute app must never be a mystery.
     events: Arc<dyn PlaybackEvents>,
     /// Decoded clips by decode key. Bounded: see [`MEMORY_CACHE_CAP`].
@@ -818,6 +867,7 @@ impl Playback {
             tx,
             shared,
             events,
+            next_audition: AtomicU64::new(1),
             cache: Mutex::new(HashMap::new()),
             tick: AtomicU64::new(0),
             decoding: Mutex::new(HashSet::new()),
@@ -845,6 +895,7 @@ impl Playback {
 
     /// Starts playing from `position` seconds.
     pub fn play(&self, position: f64) {
+        self.stop_audition();
         if !self.fine.swap(true, Ordering::Relaxed) {
             fine_timer(true);
         }
@@ -855,6 +906,7 @@ impl Playback {
 
     /// Stops playing; the position holds.
     pub fn pause(&self) {
+        self.stop_audition();
         self.shared.playing.store(false, Ordering::Relaxed);
         if self.fine.swap(false, Ordering::Relaxed) {
             fine_timer(false);
@@ -864,12 +916,41 @@ impl Playback {
 
     /// Moves the playhead, playing or paused.
     pub fn seek(&self, position: f64) {
+        self.stop_audition();
         let clamped = position.max(0.0);
         // The callback owns the clock while playing, but a paused callback
         // returns before storing - so a paused seek must land the shared
         // position itself, or the atomic keeps serving the pre-seek time.
         self.shared.stamp(clamped);
         let _ = self.tx.send(Msg::Seek(clamped));
+    }
+
+    /// Play one 48 kHz stereo PCM excerpt while the transport is stopped.
+    /// The excerpt belongs to its own clock and leaves the timeline in place.
+    pub fn play_audition(&self, samples: Arc<[[i16; 2]]>) {
+        if samples.is_empty() || self.is_playing() {
+            return;
+        }
+        let id = self.next_audition.fetch_add(1, Ordering::Relaxed);
+        self.shared.audition.store(id, Ordering::Relaxed);
+        let audition = Audition {
+            id,
+            samples,
+            frame: 0.0,
+        };
+        if self.tx.send(Msg::Audition(audition)).is_err() {
+            self.shared.finish_audition(id);
+        }
+    }
+
+    /// Interrupts an excerpt independently of ordinary playback.
+    pub fn stop_audition(&self) {
+        self.shared.audition.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether an excerpt is queued for the device or currently audible.
+    pub fn is_auditioning(&self) -> bool {
+        self.shared.audition.load(Ordering::Relaxed) != 0
     }
 
     /// The clock: timeline seconds, from the device's own sample counter.
@@ -1062,17 +1143,20 @@ fn decode_worker(playback: &Arc<Playback>) {
                 // Newest first: pop from the back where set_clips pushes.
                 match jobs.pop_back() {
                     Some(job) => break job,
-                    None => jobs = playback.queue.available.wait(jobs).unwrap(),
+                    None => {
+                        jobs = playback
+                            .queue
+                            .available
+                            .wait(jobs)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    }
                 }
             }
         };
 
         // A span queued by an edit that has since been edited again is dead
         // weight; skip it before paying for FFmpeg.
-        let wanted = playback
-            .specs
-            .lock()
-            .unwrap()
+        let wanted = locked(&playback.specs)
             .iter()
             .any(|spec| decode_key(spec) == job.key);
         if !wanted {
@@ -1505,7 +1589,9 @@ fn supervise_stream(
                         break;
                     }
                 }
-                // `_stream` drops here, releasing the device before rebuild.
+                let audition = shared.audition.load(Ordering::Relaxed);
+                drop(_stream);
+                shared.finish_audition(audition);
             }
             Err(error) => {
                 // Once, not every retry: a machine with no sound card would
@@ -1532,6 +1618,7 @@ fn supervise_stream(
                             }
                             Msg::Pause => shared.playing.store(false, Ordering::Relaxed),
                             Msg::Seek(at) => shared.stamp(at),
+                            Msg::Audition(item) => shared.finish_audition(item.id),
                         }
                     }
                 }
@@ -1600,6 +1687,7 @@ where
     let mut clips: Vec<ActiveClip> = locked(last_active).clone();
     let mut playing = shared.playing.load(Ordering::Relaxed);
     let mut position = shared.position();
+    let mut audition: Option<Audition> = None;
 
     let failed = Arc::new(AtomicBool::new(false));
     let rx = Arc::clone(rx);
@@ -1620,11 +1708,21 @@ where
                             Msg::Play(at) => {
                                 position = at;
                                 playing = true;
+                                audition = None;
                             }
                             Msg::Pause => playing = false,
                             Msg::Seek(at) => {
                                 position = at;
                                 sought = true;
+                            }
+                            Msg::Audition(item) => {
+                                if shared.audition.load(Ordering::Relaxed) == item.id {
+                                    if playing {
+                                        shared.finish_audition(item.id);
+                                    } else {
+                                        audition = Some(item);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1639,6 +1737,28 @@ where
                         shared.stamp(position);
                     }
                     data.fill(T::from_sample(0.0));
+                    if let Some(item) = audition.as_mut() {
+                        if shared.audition.load(Ordering::Relaxed) == item.id {
+                            let sample_step = step * f64::from(concat_media::audio::MIX_RATE);
+                            let muted = shared.muted.load(Ordering::Relaxed);
+                            for frame in data.chunks_mut(channels) {
+                                let Some([left, right]) = item.next_frame(sample_step) else {
+                                    break;
+                                };
+                                if !muted {
+                                    frame[0] = T::from_sample(left);
+                                    if channels > 1 {
+                                        frame[1] = T::from_sample(right);
+                                    }
+                                }
+                            }
+                            if !item.finished() {
+                                return;
+                            }
+                            shared.finish_audition(item.id);
+                        }
+                        audition = None;
+                    }
                     return;
                 }
 
@@ -1729,8 +1849,36 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{COAST, Shared, sweep_plan, wav_data_range};
+    use super::{Audition, COAST, Shared, sweep_plan, wav_data_range};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn audition_follows_its_own_resampled_clock() {
+        let mut audition = Audition {
+            id: 1,
+            samples: std::sync::Arc::from([[0, -16_384], [16_384, 0]]),
+            frame: 0.0,
+        };
+
+        assert_eq!(audition.next_frame(0.5), Some([0.0, -0.5]));
+        assert_eq!(audition.next_frame(0.5), Some([0.25, -0.25]));
+        assert_eq!(audition.next_frame(0.5), Some([0.5, 0.0]));
+        assert_eq!(audition.next_frame(0.5), Some([0.5, 0.0]));
+        assert!(audition.finished());
+        assert_eq!(audition.next_frame(0.5), None);
+    }
+
+    #[test]
+    fn an_old_audition_cannot_clear_the_next_request_or_move_the_clock() {
+        let shared = Shared::new();
+        shared.stamp(42.0);
+        shared.audition.store(2, Ordering::Relaxed);
+        shared.finish_audition(1);
+        assert_eq!(shared.audition.load(Ordering::Relaxed), 2);
+        shared.finish_audition(2);
+        assert_eq!(shared.audition.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.position_now(), 42.0);
+    }
 
     #[test]
     fn the_clock_runs_on_between_buffers_but_not_past_a_stall() {
@@ -2006,6 +2154,7 @@ mod tests {
             tx,
             shared: std::sync::Arc::new(super::Shared::new()),
             events: std::sync::Arc::new(Quiet),
+            next_audition: std::sync::atomic::AtomicU64::new(1),
             cache: std::sync::Mutex::new(cache),
             tick: std::sync::atomic::AtomicU64::new(0),
             decoding: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2053,14 +2202,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A treatment switched on under a playing clip: the clip plays on, from
+    /// the sound it had, the moment the change is handed over, while the
+    /// treated sound is decoded - never a stretch of silence until it lands.
+    #[test]
+    fn a_changed_treatment_plays_the_sound_it_had_until_its_own_lands() {
+        let dir = std::env::temp_dir().join(format!("concat-engine-treat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a folder");
+        let source = rising_tone(&dir);
+        let plain = tone_spec(&source, 0.0, 3.0);
+        let playback = std::sync::Arc::new(idle(cached(&plain, &dir)));
+        playback.set_clips(dir.clone(), vec![plain.clone()]);
+
+        let mut treated = plain.clone();
+        treated.chain = "afftdn=nf=-25".to_owned();
+        playback.set_clips(dir.clone(), vec![treated.clone()]);
+        let playing = super::locked(&playback.last_active).clone();
+        assert_eq!(playing.len(), 1, "the clip still plays");
+        let had = super::locked(&playback.cache)
+            .get(&super::decode_key(&plain))
+            .map(|entry| std::sync::Arc::as_ptr(&entry.pcm));
+        assert_eq!(
+            Some(std::sync::Arc::as_ptr(&playing[0].pcm)),
+            had,
+            "from the sound it had"
+        );
+        assert_eq!(playing[0].lead, 0);
+        assert_eq!(
+            super::locked(&playback.queue.jobs).len(),
+            1,
+            "the treated sound is decoded all the same"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// What may stand in, and what may be copied. The same file under a
     /// filter is the same sound under that filter, so it stands in, but a
     /// filter carries what came before the cut into the stretch after it,
-    /// so it is decoded all the same; another filter, another speed or a
-    /// stretch the span never reached is another sound. A span reaching
-    /// only part of the way plays where it reaches.
+    /// so it is decoded all the same. The same file under another filter
+    /// stands in too - a treatment changed plays the sound it had until the
+    /// new one is decoded, never silence - but the same treatment comes
+    /// first, and neither is copied. Another speed or a stretch the span
+    /// never reached is another instant. A span reaching only part of the
+    /// way plays where it reaches.
     #[test]
-    fn only_the_same_sound_stands_in_and_only_a_plain_one_is_copied() {
+    fn the_same_instant_stands_in_and_only_a_plain_one_is_copied() {
         let dir = std::env::temp_dir().join(format!("concat-stand-in-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a folder");
         let source = rising_tone(&dir);
@@ -2082,7 +2268,25 @@ mod tests {
 
         let mut other = half.clone();
         other.chain = "highpass=f=2000".to_owned();
-        assert!(super::stand_in(&cache, &other).is_none(), "another filter");
+        assert_eq!(
+            super::stand_in(&cache, &other).map(|(_, lead)| lead),
+            Some(48_000),
+            "another filter: the sound it had, not silence"
+        );
+        assert!(
+            super::copy_source(&cache, &other).is_none(),
+            "another filter: decoded"
+        );
+        let mut both = cached(&filtered, &dir);
+        let mut highpassed = filtered.clone();
+        highpassed.chain = other.chain.clone();
+        both.extend(cached(&highpassed, &dir));
+        let own = super::decode_key(&highpassed);
+        assert_eq!(
+            super::stand_in(&both, &other).map(|(key, _)| key.to_owned()),
+            Some(own),
+            "its own treatment first"
+        );
         let mut faster = half.clone();
         faster.speed = 2.0;
         assert!(super::stand_in(&cache, &faster).is_none(), "another speed");

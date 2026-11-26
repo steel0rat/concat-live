@@ -15,7 +15,9 @@ use concat_api::{ApiError, Done, ErrorCode, LiveHandler, Reply, Request};
 use concat_host::{Session, projects};
 use concat_project::Command;
 
+use crate::agent::{LiveEditScope, TurnAccess, turn_access};
 use crate::host::{self, Shell};
+use crate::i18n::t;
 use crate::studio::{Gesture, Studio};
 
 const QUEUED: u8 = 0;
@@ -54,12 +56,69 @@ pub(crate) struct SaveSnapshot {
 
 impl LiveHandler for Window {
     fn call(&self, request: Request) -> Result<Reply, ApiError> {
+        self.call_from(request, None)
+    }
+
+    fn authorize_request(
+        &self,
+        request: &Request,
+        client_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let access = registered_access(client_id)?;
+        allow_read_only(request, access.read_only)?;
+        if crate::agent::is_pause_review_client(client_id)
+            && !is_read_request(request)
+            && !matches!(request, Request::PauseReviewSubmit { .. })
+        {
+            return Err(ApiError::new(
+                ErrorCode::Refused,
+                "This chat turn is reviewing pauses. Use Apply cuts in Concat Live to edit.",
+            ));
+        }
+        allow_scoped_request(request, access.scope.is_some())
+    }
+
+    fn call_from(&self, request: Request, client_id: Option<&str>) -> Result<Reply, ApiError> {
+        self.authorize_request(&request, client_id)?;
+        let accepted = registered_access(client_id)?;
+        allow_read_only(&request, accepted.read_only)?;
+        let client_id = client_id.map(str::to_owned);
+        if let Request::PauseReviewSubmit { path, ids } = request {
+            return on_window(self.generation, move |studio| {
+                require_writable(registered_access(client_id.as_deref())?.read_only)?;
+                require_path(studio, &path)?;
+                crate::agent::stage_pause_review(studio, client_id.as_deref(), &ids)
+                    .map_err(|error| ApiError::new(ErrorCode::Refused, error))?;
+                Ok(Reply::Done(Done {}))
+            });
+        }
+        if let Request::TimelineNotesReport {
+            path,
+            batch_id,
+            ids,
+        } = request
+        {
+            return on_window(self.generation, move |studio| {
+                require_writable(registered_access(client_id.as_deref())?.read_only)?;
+                require_path(studio, &path)?;
+                crate::agent::stage_note_report(studio, client_id.as_deref(), &batch_id, &ids)
+                    .map_err(|error| ApiError::new(ErrorCode::Refused, error))?;
+                Ok(Reply::Done(Done {}))
+            });
+        }
         if let Request::ProjectSave { path, name } = request {
             let snapshot = on_window(self.generation, move |studio| {
+                let current = registered_access(client_id.as_deref())?;
+                require_writable(current.read_only)?;
+                if name.is_some() && (accepted.scope.is_some() || current.scope.is_some()) {
+                    return Err(scope_refused());
+                }
                 require_path(studio, &path)?;
-                studio
-                    .live_prepare_save(name.as_deref())
-                    .map_err(ApiError::failed)
+                crate::agent::observe_edit(studio, client_id.as_deref(), |studio| {
+                    studio
+                        .live_prepare_save(name.as_deref())
+                        .map_err(ApiError::failed)
+                })
             })?;
             let result =
                 projects::save_ordered(&snapshot.path, &snapshot.document, snapshot.ticket)
@@ -71,7 +130,26 @@ impl LiveHandler for Window {
             result.map_err(ApiError::failed)?;
             return Ok(Reply::Done(Done {}));
         }
-        on_window(self.generation, move |studio| dispatch(studio, request))
+        on_window(self.generation, move |studio| {
+            let current = registered_access(client_id.as_deref())?;
+            allow_read_only(&request, current.read_only)?;
+            let scope = accepted.scope.as_deref().or(current.scope.as_deref());
+            allow_scoped_request(&request, scope.is_some())?;
+            if matches!(
+                &request,
+                Request::ProjectCreate { .. }
+                    | Request::ProjectSetVideo { .. }
+                    | Request::EditApply { .. }
+                    | Request::EditUndo { .. }
+                    | Request::EditRedo { .. }
+            ) {
+                crate::agent::observe_edit(studio, client_id.as_deref(), |studio| {
+                    dispatch(studio, request, scope)
+                })
+            } else {
+                dispatch(studio, request, scope)
+            }
+        })
     }
 
     fn snapshot(&self, path: &str) -> Result<Session, ApiError> {
@@ -81,6 +159,62 @@ impl LiveHandler for Window {
             Ok(session(studio)?.snapshot())
         })
     }
+}
+
+fn registered_access(client_id: Option<&str>) -> Result<TurnAccess, ApiError> {
+    turn_access(client_id).map_err(|error| ApiError::new(ErrorCode::Refused, error))
+}
+
+fn is_read_request(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Version
+            | Request::ProjectList
+            | Request::ProjectGet { .. }
+            | Request::ProjectDocument { .. }
+            | Request::MediaProbe { .. }
+            | Request::CatalogueList { .. }
+            | Request::TemplateList
+            | Request::ExportStatus { .. }
+            | Request::PreviewFrame { output: None, .. }
+    )
+}
+
+fn require_writable(read_only: bool) -> Result<(), ApiError> {
+    if read_only {
+        return Err(ApiError::new(
+            ErrorCode::Refused,
+            t("agent.cutawaysReadOnly"),
+        ));
+    }
+    Ok(())
+}
+
+fn allow_read_only(request: &Request, read_only: bool) -> Result<(), ApiError> {
+    require_writable(read_only && !is_read_request(request))
+}
+
+fn allow_scoped_request(request: &Request, scoped: bool) -> Result<(), ApiError> {
+    if scoped
+        && matches!(
+            request,
+            Request::ProjectCreate { .. }
+                | Request::ProjectOpen { .. }
+                | Request::ProjectClose { .. }
+                | Request::ProjectSetVideo { .. }
+                | Request::ProjectSave { name: Some(_), .. }
+                | Request::EditUndo { .. }
+                | Request::EditRedo { .. }
+                | Request::TemplateInstantiate { .. }
+        )
+    {
+        return Err(scope_refused());
+    }
+    Ok(())
+}
+
+fn scope_refused() -> ApiError {
+    ApiError::new(ErrorCode::Refused, t("agent.scopeTimeline"))
 }
 
 /// A timed-out queued request is cancelled before it can mutate the window.
@@ -231,7 +365,11 @@ fn view(studio: &Studio) -> Result<Reply, ApiError> {
     Ok(Reply::View(Box::new(session(studio)?.view())))
 }
 
-fn dispatch(studio: &mut Studio, request: Request) -> Result<Reply, ApiError> {
+fn dispatch(
+    studio: &mut Studio,
+    request: Request,
+    scope: Option<&LiveEditScope>,
+) -> Result<Reply, ApiError> {
     match request {
         Request::ProjectCreate {
             location,
@@ -287,9 +425,12 @@ fn dispatch(studio: &mut Studio, request: Request) -> Result<Reply, ApiError> {
         }
         Request::EditApply { path, command } => {
             require_path(studio, &path)?;
-            studio
-                .try_apply(*command)
-                .map(|view| Reply::View(Box::new(view)))
+            let view = if let Some(scope) = scope {
+                scope.apply(studio, *command)
+            } else {
+                studio.try_apply(*command)
+            };
+            view.map(|view| Reply::View(Box::new(view)))
                 .map_err(|error| ApiError::new(ErrorCode::Refused, error))
         }
         Request::EditUndo { path } => {
@@ -329,6 +470,27 @@ mod tests {
         drop(sender);
         let error = receive(receiver, &AtomicU8::new(QUEUED)).unwrap_err();
         assert_eq!(error.code, ErrorCode::Failed);
+    }
+
+    #[test]
+    fn cutaway_turns_can_inspect_but_cannot_edit_or_write() {
+        assert!(allow_read_only(&Request::Version, true).is_ok());
+        let edit = Request::EditUndo {
+            path: "/project".into(),
+        };
+        assert_eq!(
+            allow_read_only(&edit, true).unwrap_err().code,
+            ErrorCode::Refused
+        );
+        assert!(allow_read_only(&edit, false).is_ok());
+        let note = Request::PauseReviewSubmit {
+            path: "/project".into(),
+            ids: Vec::new(),
+        };
+        assert_eq!(
+            allow_read_only(&note, true).unwrap_err().code,
+            ErrorCode::Refused
+        );
     }
 
     #[test]
