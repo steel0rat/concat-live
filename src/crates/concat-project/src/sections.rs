@@ -203,20 +203,22 @@ mod tests {
 
     #[test]
     fn moving_a_clip_changes_timing_and_publishing_together() {
-        let mut timeline = Timeline::default();
-        timeline.clips = vec![
-            Arc::new(Clip {
-                id: "first".into(),
-                duration: 14.0,
-                ..Clip::default()
-            }),
-            Arc::new(Clip {
-                id: "second".into(),
-                start: 14.0,
-                duration: 14.0,
-                ..Clip::default()
-            }),
-        ];
+        let mut timeline = Timeline {
+            clips: vec![
+                Arc::new(Clip {
+                    id: "first".into(),
+                    duration: 14.0,
+                    ..Clip::default()
+                }),
+                Arc::new(Clip {
+                    id: "second".into(),
+                    start: 14.0,
+                    duration: 14.0,
+                    ..Clip::default()
+                }),
+            ],
+            ..Timeline::default()
+        };
         let sections = Section::normalized(vec![
             Section {
                 id: 2,

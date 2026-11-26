@@ -474,7 +474,7 @@ mod tests {
             anchor: SectionAnchor::Time { at: 5.0 },
         });
         active.extra.insert("sourceOnly".into(), true.into());
-        let block = Block::capture(&project, &[first.clone()]).unwrap();
+        let block = Block::capture(&project, std::slice::from_ref(&first)).unwrap();
         let snapshot = block.project().active();
         assert_eq!(snapshot.clips.len(), 1);
         assert!(snapshot.sections.is_empty() && snapshot.extra.is_empty());
