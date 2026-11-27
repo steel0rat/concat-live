@@ -13,6 +13,15 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: The tag or commit to test, or the selected branch when empty
+        type: string
+        default: ""
+      skip_windows:
+        description: Skip Windows tests when preparing a macOS-only release
+        type: boolean
+        default: false
   # release.yml runs this before it builds anything: a tag on a red tree
   # is not a release. It names the tag, because a release started by hand
   # runs on main, and main is not what it builds.
@@ -73,11 +82,12 @@ jobs:
   engine:
     name: Engine tests and lints
     runs-on: ubuntu-24.04
-    # The steps that can run long have timeouts of their own, 180 minutes
-    # between them, so a stuck step is named by its own timeout; this is
-    # for a job stuck anywhere else.
-    timeout-minutes: 200
+    # Allow the separate lint, build and test timeouts, plus setup and
+    # reporting. The test build includes the generated Slint window.
+    timeout-minutes: 260
     env:
+      # Keep one set of dependency build settings across lints and tests.
+      CARGO_PROFILE_DEV_DEBUG: "0"
       # See build-app.yml: the version the ort crate is built against.
       # scripts/ci/deps.lock pins the file.
       ORT_VERSION: 1.28.0
@@ -174,7 +184,8 @@ jobs:
         working-directory: src
         run: |
           set -o pipefail
-          cargo clippy -p concat --lib --profile test -- -D warnings 2>&1 | tee clippy-window.log
+          cargo clippy -p concat --lib --profile test \
+            --config 'profile.test.package.concat.codegen-units=256' -- -D warnings 2>&1 | tee clippy-window.log
       - name: Clippy (the Android shell)
         timeout-minutes: 25
         working-directory: src
@@ -189,17 +200,17 @@ jobs:
       # A cold cache, one build job at a time, has run past 25 minutes.
       # A Linux runner shut down while compiling JNI 0.22.4. The test
       # build omits LLVM optimisation for this dependency. Keep the
-      # override in every workspace test command so Cargo reuses it.
+      # override in every workspace test command so Cargo reuses it. Split
+      # the window's generated code into the app profile's 256 units.
       - name: Build the tests
         id: build-tests
-        timeout-minutes: 50
+        timeout-minutes: 90
         working-directory: src
-        env:
-          CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           set -o pipefail
           cargo nextest run --workspace --no-run --build-jobs 1 \
-            --config 'profile.test.package."jni@0.22.4".opt-level=0' 2>&1 | tee build-tests.log
+            --config 'profile.test.package."jni@0.22.4".opt-level=0' \
+            --config 'profile.test.package.concat.codegen-units=256' 2>&1 | tee build-tests.log
       # CONCAT_REQUIRE_GPU: the GPU tests fail rather than skip when no
       # adapter is usable, so the parity suite is known to have run. The
       # report and the log are kept when it fails (the last step). The
@@ -208,13 +219,13 @@ jobs:
         timeout-minutes: 20
         working-directory: src
         env:
-          CARGO_PROFILE_DEV_DEBUG: "0"
           CONCAT_REQUIRE_GPU: "1"
         run: |
           set -o pipefail
           status=0
           cargo nextest run --workspace --build-jobs 1 --profile ci \
             --config 'profile.test.package."jni@0.22.4".opt-level=0' \
+            --config 'profile.test.package.concat.codegen-units=256' \
             -E 'not package(concat-corpus)' 2>&1 | tee nextest-workspace.log || status=$?
           mv target/nextest/ci/junit.xml target/nextest/ci/junit-workspace.xml 2>/dev/null || true
           exit "$status"
@@ -229,13 +240,12 @@ jobs:
         if: ${{ !cancelled() && steps.build-tests.outcome == 'success' }}
         timeout-minutes: 15
         working-directory: src
-        env:
-          CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           set -o pipefail
           status=0
           cargo nextest run --workspace --build-jobs 1 --profile ci \
             --config 'profile.test.package."jni@0.22.4".opt-level=0' \
+            --config 'profile.test.package.concat.codegen-units=256' \
             -E 'package(concat-corpus)' 2>&1 | tee nextest-corpus.log || status=$?
           mv target/nextest/ci/junit.xml target/nextest/ci/junit-corpus.xml 2>/dev/null || true
           exit "$status"
@@ -243,9 +253,10 @@ jobs:
       - name: Run the documentation's examples
         timeout-minutes: 10
         working-directory: src
-        env:
-          CARGO_PROFILE_DEV_DEBUG: "0"
-        run: cargo test --workspace --doc -j 1 --config 'profile.test.package."jni@0.22.4".opt-level=0'
+        run: |
+          cargo test --workspace --doc -j 1 \
+            --config 'profile.test.package."jni@0.22.4".opt-level=0' \
+            --config 'profile.test.package.concat.codegen-units=256'
       # The gRPC transport is a feature nothing else in the workspace turns
       # on, so it is linted and tested here on its own. See concat-server.
       - name: Clippy (gRPC)
@@ -396,8 +407,8 @@ jobs:
       # second.
       - name: Check
         if: runner.os != 'Windows'
-        # The generated window exceeded 30 minutes on the hosted macOS runner.
-        timeout-minutes: 45
+        # A cold build of the generated window exceeded 45 minutes on macOS.
+        timeout-minutes: 75
         working-directory: src
         run: |
           set -o pipefail
