@@ -80,14 +80,36 @@ jobs:
         if: ${{ !cancelled() }}
 
   engine:
-    name: Engine ${{ matrix.task }}
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    # The combined job repeatedly lost its runner during test compilation.
-    # Run the long Slint lint and the test build on independent runners.
+    # The full workspace build repeatedly lost its Linux runner. Each
+    # test job compiles at most one version of the generated Slint window.
     strategy:
       fail-fast: false
       matrix:
-        task: [lints, tests]
+        include:
+          - task: lints
+            name: Engine lints
+          - task: tests
+            name: Engine tests
+            # The window activates these speech features in a workspace
+            # build. Keep their tests when the window is built separately.
+            packages: >-
+              --workspace --exclude concat --exclude concat-android
+              --features concat-speech/beats,concat-speech/chatterbox,concat-speech/isolate
+          - task: editor-lib
+            name: Editor library tests
+            # Keep the Slint feature selected by the Android shell in
+            # the workspace build.
+            packages: --package concat --features slint/backend-android-activity-06
+            targets: --lib
+          - task: editor-bin
+            name: Editor binary tests
+            packages: --package concat --features slint/backend-android-activity-06
+            targets: --bin concat
+          - task: android-shell
+            name: Android shell tests
+            packages: --package concat-android
     # Allow the per-step timeouts plus setup and reporting.
     timeout-minutes: 260
     env:
@@ -113,7 +135,7 @@ jobs:
       # cargo-nextest runs the tests: each in a process of its own, with a
       # timeout per test and a JUnit report. See src/.config/nextest.toml.
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
-        if: matrix.task == 'tests'
+        if: matrix.task != 'lints'
         with:
           tool: cargo-nextest@0.9.148
       # Saved even when the job fails: a cache saved only by a green run
@@ -207,13 +229,11 @@ jobs:
       # and a slow test are told apart by which step ran out of time. One
       # job at a time and no debug info, to stay inside the runner's
       # memory; the run below finds everything already built.
-      # A cold cache, one build job at a time, has run past 25 minutes.
-      # A Linux runner shut down while compiling JNI 0.22.4. The test
-      # build omits LLVM optimisation for this dependency. Keep the
-      # override in every workspace test command so Cargo reuses it. Split
-      # the window's generated code into the app profile's 256 units.
+      # The test build omits LLVM optimisation for JNI 0.22.4 and splits
+      # the generated window into the app profile's 256 codegen units.
+      # Use the same settings for building and running each test group.
       - name: Build the tests
-        if: matrix.task == 'tests'
+        if: matrix.task != 'lints'
         id: build-tests
         timeout-minutes: 90
         working-directory: src
@@ -230,7 +250,8 @@ jobs:
           ) &
           resources=$!
           trap 'kill "$resources" 2>/dev/null || true' EXIT
-          cargo nextest run --workspace --no-run --build-jobs 1 \
+          cargo nextest run --locked ${{ matrix.packages }} ${{ matrix.targets }} \
+            --no-run --build-jobs 1 \
             --config 'profile.test.package."jni@0.22.4".opt-level=0' \
             --config 'profile.test.package.concat.codegen-units=256' 2>&1 | tee build-tests.log
       # CONCAT_REQUIRE_GPU: the GPU tests fail rather than skip when no
@@ -238,7 +259,7 @@ jobs:
       # report and the log are kept when it fails (the last step). The
       # corpus is left to the step after this one.
       - name: Run the tests
-        if: matrix.task == 'tests'
+        if: matrix.task != 'lints'
         timeout-minutes: 20
         working-directory: src
         env:
@@ -246,9 +267,12 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          cargo nextest run --workspace --build-jobs 1 --profile ci \
+          # The Android shell test target can be empty on Linux.
+          cargo nextest run --locked ${{ matrix.packages }} ${{ matrix.targets }} \
+            --build-jobs 1 --profile ci \
             --config 'profile.test.package."jni@0.22.4".opt-level=0' \
             --config 'profile.test.package.concat.codegen-units=256' \
+            --no-tests ${{ matrix.task == 'android-shell' && 'warn' || 'fail' }} \
             -E 'not package(concat-corpus)' 2>&1 | tee nextest-workspace.log || status=$?
           mv target/nextest/ci/junit.xml target/nextest/ci/junit-workspace.xml 2>/dev/null || true
           exit "$status"
@@ -256,29 +280,29 @@ jobs:
       # through the API, exported through the app's own export and checked
       # frame by frame. In a step of its own, so a red corpus and a red
       # unit test are told apart at a glance, with a timeout of its own;
-      # it runs whether or not the tests above passed. --workspace and a
-      # filter rather than -p concat-corpus: -p resolves the features of
-      # that one package, and the tree built above would be built again.
+      # it runs even when the tests above fail. Reuse the engine group's
+      # build and select the corpus using a nextest filter.
       - name: Run the corpus
-        if: ${{ !cancelled() && steps.build-tests.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.task == 'tests' && steps.build-tests.outcome == 'success' }}
         timeout-minutes: 15
         working-directory: src
         run: |
           set -o pipefail
           status=0
-          cargo nextest run --workspace --build-jobs 1 --profile ci \
+          cargo nextest run --locked ${{ matrix.packages }} --build-jobs 1 --profile ci \
             --config 'profile.test.package."jni@0.22.4".opt-level=0' \
             --config 'profile.test.package.concat.codegen-units=256' \
             -E 'package(concat-corpus)' 2>&1 | tee nextest-corpus.log || status=$?
           mv target/nextest/ci/junit.xml target/nextest/ci/junit-corpus.xml 2>/dev/null || true
           exit "$status"
-      # nextest does not run the examples in the documentation; cargo does.
+      # The engine and editor groups each run their documentation tests.
+      # Reuse the normal editor library compiled for the binary tests.
       - name: Run the documentation's examples
-        if: matrix.task == 'tests'
+        if: matrix.task == 'tests' || matrix.task == 'editor-bin'
         timeout-minutes: 10
         working-directory: src
         run: |
-          cargo test --workspace --doc -j 1 \
+          cargo test --locked ${{ matrix.packages }} --doc -j 1 \
             --config 'profile.test.package."jni@0.22.4".opt-level=0' \
             --config 'profile.test.package.concat.codegen-units=256'
       # The gRPC transport is a feature nothing else in the workspace turns
@@ -309,10 +333,10 @@ jobs:
         run: python3 scripts/ci/annotate.py src/clippy.log src/clippy-window.log src/clippy-shell.log src/build-tests.log src/nextest-workspace.log src/nextest-corpus.log src/clippy-grpc.log src/nextest-grpc.log
 
       - name: Keep the test report (failure only)
-        if: ${{ failure() && matrix.task == 'tests' }}
+        if: ${{ failure() && matrix.task != 'lints' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: test-report-linux
+          name: test-report-linux-${{ matrix.task }}
           path: |
             src/target/nextest/ci/*.xml
             src/nextest-*.log
