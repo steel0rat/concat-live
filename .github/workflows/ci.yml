@@ -231,6 +231,18 @@ jobs:
           set -o pipefail
           cargo clippy -p concat-android --all-targets --no-deps -- -D warnings 2>&1 | tee clippy-shell.log
 
+      # rustc reached about 13 GiB RSS before the hosted runner shut down
+      # compiling Slint. Add swap on the ephemeral runner for these builds.
+      - name: Swap for editor test builds
+        if: matrix.task == 'editor-lib' || matrix.task == 'editor-bin' || matrix.task == 'android-shell'
+        run: |
+          set -euo pipefail
+          swap_file="$(mktemp "$RUNNER_TEMP/concat-ci-swap.XXXXXX")"
+          dd if=/dev/zero of="$swap_file" bs=16M count=1024 status=none
+          sudo mkswap "$swap_file"
+          sudo swapon "$swap_file"
+          free -m
+
       # The tests are compiled in a step of their own, so a slow compile
       # and a slow test are told apart by which step ran out of time. One
       # job at a time and no debug info, to stay inside the runner's
