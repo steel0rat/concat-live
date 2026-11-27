@@ -187,6 +187,9 @@ jobs:
       # job at a time and no debug info, to stay inside the runner's
       # memory; the run below finds everything already built.
       # A cold cache, one build job at a time, has run past 25 minutes.
+      # A Linux runner shut down while compiling JNI 0.22.4. The test
+      # build omits LLVM optimisation for this dependency. Keep the
+      # override in every workspace test command so Cargo reuses it.
       - name: Build the tests
         id: build-tests
         timeout-minutes: 50
@@ -195,7 +198,8 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           set -o pipefail
-          cargo nextest run --workspace --no-run --build-jobs 1 2>&1 | tee build-tests.log
+          cargo nextest run --workspace --no-run --build-jobs 1 \
+            --config 'profile.test.package."jni@0.22.4".opt-level=0' 2>&1 | tee build-tests.log
       # CONCAT_REQUIRE_GPU: the GPU tests fail rather than skip when no
       # adapter is usable, so the parity suite is known to have run. The
       # report and the log are kept when it fails (the last step). The
@@ -210,6 +214,7 @@ jobs:
           set -o pipefail
           status=0
           cargo nextest run --workspace --build-jobs 1 --profile ci \
+            --config 'profile.test.package."jni@0.22.4".opt-level=0' \
             -E 'not package(concat-corpus)' 2>&1 | tee nextest-workspace.log || status=$?
           mv target/nextest/ci/junit.xml target/nextest/ci/junit-workspace.xml 2>/dev/null || true
           exit "$status"
@@ -230,6 +235,7 @@ jobs:
           set -o pipefail
           status=0
           cargo nextest run --workspace --build-jobs 1 --profile ci \
+            --config 'profile.test.package."jni@0.22.4".opt-level=0' \
             -E 'package(concat-corpus)' 2>&1 | tee nextest-corpus.log || status=$?
           mv target/nextest/ci/junit.xml target/nextest/ci/junit-corpus.xml 2>/dev/null || true
           exit "$status"
@@ -239,7 +245,7 @@ jobs:
         working-directory: src
         env:
           CARGO_PROFILE_DEV_DEBUG: "0"
-        run: cargo test --workspace --doc -j 1
+        run: cargo test --workspace --doc -j 1 --config 'profile.test.package."jni@0.22.4".opt-level=0'
       # The gRPC transport is a feature nothing else in the workspace turns
       # on, so it is linted and tested here on its own. See concat-server.
       - name: Clippy (gRPC)
