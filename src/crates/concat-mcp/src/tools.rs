@@ -21,7 +21,7 @@ use concat_api::{ApiError, ErrorCode, Request};
 use serde_json::{Map, Value, json};
 
 use crate::backend::Backend;
-use crate::schema::Schemas;
+use crate::schema::{Schemas, omit_redundant_string_types};
 use crate::summary;
 
 /// The longest preview side handed back when the agent names no size: a
@@ -573,8 +573,9 @@ impl Toolbox {
         let tools = catalogue()
             .into_iter()
             .map(|tool| {
-                let schema = input_schema(&schemas, &tool)
+                let mut schema = input_schema(&schemas, &tool)
                     .unwrap_or_else(|| panic!("the API has nothing for the {} tool", tool.name));
+                omit_redundant_string_types(&mut schema);
                 (tool, schema)
             })
             .collect();

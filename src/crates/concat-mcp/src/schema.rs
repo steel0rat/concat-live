@@ -173,6 +173,52 @@ fn compact(schema: Value) -> Value {
     }
 }
 
+/// Remove a string type when the string-valued constant already requires it.
+///
+/// Walk schema keywords only, so data inside defaults and examples is kept.
+pub(crate) fn omit_redundant_string_types(schema: &mut Value) {
+    let Some(fields) = schema.as_object_mut() else {
+        return;
+    };
+    if fields.get("type").and_then(Value::as_str) == Some("string")
+        && fields.get("const").is_some_and(Value::is_string)
+    {
+        fields.remove("type");
+    }
+    for (keyword, child) in fields {
+        match keyword.as_str() {
+            "$defs" | "properties" | "patternProperties" | "dependentSchemas" => {
+                if let Some(schemas) = child.as_object_mut() {
+                    for schema in schemas.values_mut() {
+                        omit_redundant_string_types(schema);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                if let Some(schemas) = child.as_array_mut() {
+                    for schema in schemas {
+                        omit_redundant_string_types(schema);
+                    }
+                }
+            }
+            "additionalProperties"
+            | "contains"
+            | "contentSchema"
+            | "else"
+            | "if"
+            | "items"
+            | "not"
+            | "propertyNames"
+            | "then"
+            | "unevaluatedItems"
+            | "unevaluatedProperties" => {
+                omit_redundant_string_types(child);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The first sentence of a doc comment, on one line.
 fn first_sentence(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
