@@ -80,10 +80,15 @@ jobs:
         if: ${{ !cancelled() }}
 
   engine:
-    name: Engine tests and lints
+    name: Engine ${{ matrix.task }}
     runs-on: ubuntu-24.04
-    # Allow the separate lint, build and test timeouts, plus setup and
-    # reporting. The test build includes the generated Slint window.
+    # The combined job repeatedly lost its runner during test compilation.
+    # Run the long Slint lint and the test build on independent runners.
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [lints, tests]
+    # Allow the per-step timeouts plus setup and reporting.
     timeout-minutes: 260
     env:
       # Keep one set of dependency build settings across lints and tests.
@@ -108,6 +113,7 @@ jobs:
       # cargo-nextest runs the tests: each in a process of its own, with a
       # timeout per test and a JUnit report. See src/.config/nextest.toml.
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        if: matrix.task == 'tests'
         with:
           tool: cargo-nextest@0.9.148
       # Saved even when the job fails: a cache saved only by a green run
@@ -116,6 +122,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src
+          key: linux-${{ matrix.task }}
           cache-on-failure: true
 
       # Slint's Skia renderer links fontconfig and freetype; cpal links
@@ -174,12 +181,14 @@ jobs:
       # 270 lines. It is still built and its tests run below.
       # The rest of the workspace keeps every core.
       - name: Clippy
+        if: matrix.task == 'lints'
         timeout-minutes: 25
         working-directory: src
         run: |
           set -o pipefail
           cargo clippy --workspace --exclude concat --exclude concat-android --all-targets -- -D warnings 2>&1 | tee clippy.log
       - name: Clippy (the window)
+        if: matrix.task == 'lints'
         timeout-minutes: 30
         working-directory: src
         run: |
@@ -187,6 +196,7 @@ jobs:
           cargo clippy -p concat --lib --profile test \
             --config 'profile.test.package.concat.codegen-units=256' -- -D warnings 2>&1 | tee clippy-window.log
       - name: Clippy (the Android shell)
+        if: matrix.task == 'lints'
         timeout-minutes: 25
         working-directory: src
         run: |
@@ -203,11 +213,23 @@ jobs:
       # override in every workspace test command so Cargo reuses it. Split
       # the window's generated code into the app profile's 256 units.
       - name: Build the tests
+        if: matrix.task == 'tests'
         id: build-tests
         timeout-minutes: 90
         working-directory: src
         run: |
           set -o pipefail
+          # Keep resource measurements in the log if the runner stops
+          # before it can report a compiler result.
+          (
+            while sleep 120 >/dev/null 2>&1; do
+              free -m
+              df -h .
+              ps -e -o comm,etime,rss --sort=-rss | sed -n '1,6p'
+            done
+          ) &
+          resources=$!
+          trap 'kill "$resources" 2>/dev/null || true' EXIT
           cargo nextest run --workspace --no-run --build-jobs 1 \
             --config 'profile.test.package."jni@0.22.4".opt-level=0' \
             --config 'profile.test.package.concat.codegen-units=256' 2>&1 | tee build-tests.log
@@ -216,6 +238,7 @@ jobs:
       # report and the log are kept when it fails (the last step). The
       # corpus is left to the step after this one.
       - name: Run the tests
+        if: matrix.task == 'tests'
         timeout-minutes: 20
         working-directory: src
         env:
@@ -251,6 +274,7 @@ jobs:
           exit "$status"
       # nextest does not run the examples in the documentation; cargo does.
       - name: Run the documentation's examples
+        if: matrix.task == 'tests'
         timeout-minutes: 10
         working-directory: src
         run: |
@@ -260,12 +284,14 @@ jobs:
       # The gRPC transport is a feature nothing else in the workspace turns
       # on, so it is linted and tested here on its own. See concat-server.
       - name: Clippy (gRPC)
+        if: matrix.task == 'lints'
         timeout-minutes: 10
         working-directory: src
         run: |
           set -o pipefail
           cargo clippy -p concat-server -p concat-cli --features grpc --all-targets -- -D warnings 2>&1 | tee clippy-grpc.log
       - name: Run the gRPC tests
+        if: matrix.task == 'tests'
         timeout-minutes: 10
         working-directory: src
         run: |
@@ -283,7 +309,7 @@ jobs:
         run: python3 scripts/ci/annotate.py src/clippy.log src/clippy-window.log src/clippy-shell.log src/build-tests.log src/nextest-workspace.log src/nextest-corpus.log src/clippy-grpc.log src/nextest-grpc.log
 
       - name: Keep the test report (failure only)
-        if: failure()
+        if: ${{ failure() && matrix.task == 'tests' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-report-linux
@@ -294,7 +320,7 @@ jobs:
       # Each corpus case's result.json and the frames that failed it, as
       # PNGs: what a red case looked like, without running it again.
       - name: Keep the corpus report (failure only)
-        if: failure()
+        if: ${{ failure() && matrix.task == 'tests' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: corpus-linux
